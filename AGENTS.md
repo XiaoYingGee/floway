@@ -300,6 +300,12 @@ model-name fallback as Chat Completions: `claude*` models route through
 
 Planning is the only layer allowed to make this routing decision.
 
+Codex auto-review uses Codex's Responses wire API. Until the gateway has a
+general model-alias feature, the Responses source entry hardcodes
+`codex-auto-review` to `gpt-5.4` with Responses reasoning effort `low`. This
+rewrite must happen before model resolution and usage/performance metadata so
+all downstream records use `gpt-5.4`, not the alias name.
+
 Claude compatibility model-name routing happens before account fallback in
 `src/data-plane/llm/shared/models/resolve-model.ts`. The resolver strips Claude
 date aliases, normalizes dashed version aliases to Copilot's dotted upstream
@@ -320,6 +326,10 @@ Current placement:
 - `src/data-plane/llm/shared/models/resolve-model.ts`
   - resolve Claude compatibility aliases and variants before account fallback
   - keep account fallback model-fixed after one final upstream ID is selected
+- `src/data-plane/llm/sources/responses/serve.ts`
+  - rewrite Codex's `codex-auto-review` alias to `gpt-5.4` and force
+    `reasoning.effort = "low"` at the Responses source entry, before model
+    resolution, planning, and usage metadata
 - `src/data-plane/llm/sources/messages/interceptors/`
   - rewrite native Anthropic `web_search_*` server tools into a gateway-executed
     shim that runs once at the source layer, so every Messages routing path

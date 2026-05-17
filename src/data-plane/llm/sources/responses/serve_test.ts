@@ -110,6 +110,88 @@ Deno.test("/v1/responses rejects item_reference at the entrypoint", async () => 
   assertEquals(fetchCalls, 0);
 });
 
+Deno.test("/v1/responses rewrites codex-auto-review to gpt-5.4 low reasoning at the entrypoint", async () => {
+  const { apiKey, repo } = await setupAppTest();
+
+  let upstreamBody: Record<string, unknown> | undefined;
+
+  await withMockedFetch(async (request) => {
+    const url = new URL(request.url);
+
+    if (url.hostname === "update.code.visualstudio.com") {
+      return jsonResponse(["1.110.1"]);
+    }
+    if (url.pathname === "/copilot_internal/v2/token") {
+      return jsonResponse({
+        token: "copilot-access-token",
+        expires_at: 4102444800,
+        refresh_in: 3600,
+      });
+    }
+    if (url.pathname === "/models") {
+      return jsonResponse(copilotModels([
+        {
+          id: "gpt-5.4",
+          supported_endpoints: ["/responses"],
+          reasoningEfforts: ["low", "medium", "high"],
+        },
+      ]));
+    }
+    if (url.pathname === "/responses") {
+      upstreamBody = JSON.parse(await request.text()) as Record<
+        string,
+        unknown
+      >;
+      return sseResponse([
+        {
+          event: "response.completed",
+          data: {
+            type: "response.completed",
+            response: {
+              id: "resp_codex_auto_review",
+              object: "response",
+              model: "gpt-5.4-internal-version",
+              status: "completed",
+              output: [],
+              output_text: "done",
+              usage: { input_tokens: 3, output_tokens: 5, total_tokens: 8 },
+            },
+          },
+        },
+      ]);
+    }
+
+    throw new Error(`Unhandled fetch ${request.url}`);
+  }, async () => {
+    const response = await requestApp("/v1/responses", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": apiKey.key,
+      },
+      body: JSON.stringify({
+        model: "codex-auto-review",
+        input: [{ type: "message", role: "user", content: "Review this" }],
+        reasoning: { effort: "high", summary: "auto" },
+        stream: false,
+      }),
+    });
+
+    assertEquals(response.status, 200);
+    await response.json();
+  });
+
+  assertExists(upstreamBody);
+  assertEquals(upstreamBody.model, "gpt-5.4");
+  assertEquals(upstreamBody.reasoning, { summary: "auto", effort: "low" });
+
+  const usage = await repo.usage.listAll();
+  assertEquals(usage.length, 1);
+  assertEquals(usage[0].model, "gpt-5.4");
+  assertEquals(usage[0].inputTokens, 3);
+  assertEquals(usage[0].outputTokens, 5);
+});
+
 Deno.test("/v1/responses direct mode converts apply_patch and fixes mismatched stream item IDs", async () => {
   const { apiKey } = await setupAppTest();
 

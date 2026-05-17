@@ -109,13 +109,34 @@ const unsupportedResponsesModelResult = (
 const createTranslatedResponseId = (): string =>
   `resp_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
 
+const rewriteResponsesEntryModelAlias = (
+  payload: ResponsesPayload,
+): ResponsesPayload => {
+  if (payload.model !== "codex-auto-review") return payload;
+
+  // TODO: Replace this source-entry hardcode with generic model alias support.
+  // Codex sends auto-review requests over the Responses wire API, so rewriting
+  // here keeps downstream routing, performance telemetry, and usage accounting
+  // on the real model name.
+  // References:
+  // https://github.com/openai/codex/blob/e7bffc5a20e92cbc64d6c16a1b257d0b2e4cd5df/codex-rs/model-provider/src/provider.rs#L73-L96
+  // https://github.com/openai/codex/blob/e7bffc5a20e92cbc64d6c16a1b257d0b2e4cd5df/codex-rs/codex-api/src/endpoint/responses.rs#L102-L134
+  return {
+    ...payload,
+    model: "gpt-5.4",
+    reasoning: { ...(payload.reasoning ?? {}), effort: "low" },
+  };
+};
+
 export const serveResponses = async (
   c: Context,
 ): Promise<Response> => {
   let lastPerformance: PerformanceTelemetryContext | undefined;
   let downstreamAbortController: AbortController | undefined;
   try {
-    const payload = await c.req.json<ResponsesPayload>();
+    const payload = rewriteResponsesEntryModelAlias(
+      await c.req.json<ResponsesPayload>(),
+    );
     // previous_response_id and item_reference require stateful server-side
     // continuation. We cannot reliably preserve that semantic across Copilot
     // account fallback and translated targets, so reject it at the Responses
