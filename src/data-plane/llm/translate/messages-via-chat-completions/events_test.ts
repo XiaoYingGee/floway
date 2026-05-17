@@ -370,3 +370,41 @@ Deno.test("flushChatCompletionsToMessagesEvents emits pending stop when no usage
     { type: "message_stop" },
   ]);
 });
+
+Deno.test("translateChatCompletionsChunkToMessagesEvents ignores empty tool_calls arrays", () => {
+  const state = createChatCompletionsToMessagesStreamState();
+  // First chunk with role: "assistant" and empty tool_calls.
+  // Before the fix (choice.delta.tool_calls), empty [] was truthy and
+  // entered the tool-calls branch, which could close an open text block
+  // prematurely. After the fix (choice.delta.tool_calls?.length), empty
+  // arrays are treated as absent.
+  const events1 = translateChatCompletionsChunkToMessagesEvents(
+    chunk({ role: "assistant", tool_calls: [] }),
+    state,
+  );
+  // First event should be message_start (from role), not any tool-call handling.
+  // No content yet, so no content_block_start.
+  assertEquals(events1.length, 1);
+  assertEquals(events1[0].type, "message_start");
+
+  // Second chunk with content — should start a text block normally.
+  const events2 = translateChatCompletionsChunkToMessagesEvents(
+    chunk({ content: "hello" }),
+    state,
+  );
+  assertEquals(events2.length, 2);
+  assertEquals(events2[0].type, "content_block_start");
+  assertEquals(events2[1].type, "content_block_delta");
+
+  // Finish with stop.
+  const events3 = translateChatCompletionsChunkToMessagesEvents(
+    chunk({}, "stop"),
+    state,
+  );
+  const textBlocks = events3.filter((e) => e.type === "content_block_stop");
+  assertEquals(
+    textBlocks.length,
+    1,
+    "only one text block should have been closed",
+  );
+});

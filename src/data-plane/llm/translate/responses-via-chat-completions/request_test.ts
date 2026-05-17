@@ -1,6 +1,10 @@
 import { assertEquals } from "@std/assert";
 import { translateResponsesToChatCompletions } from "./request.ts";
 import { translateResponsesToChatCompletion } from "../chat-completions-via-responses/result.ts";
+import type {
+  ResponseTool,
+  ResponseToolChoice,
+} from "../../../../lib/responses-types.ts";
 import {
   createResponsesToChatCompletionsStreamState,
   translateResponsesEventToChatCompletionsChunks,
@@ -46,7 +50,12 @@ Deno.test("translateResponsesToChatCompletions merges adjacent assistant reasoni
     store: false,
     parallel_tool_calls: true,
     text: {
-      format: { type: "json_schema", json_schema: { name: "shape" } },
+      format: {
+        type: "json_schema",
+        name: "shape",
+        strict: true,
+        schema: { type: "object" },
+      },
     },
     prompt_cache_key: "cache-key",
     safety_identifier: "safe-id",
@@ -60,7 +69,11 @@ Deno.test("translateResponsesToChatCompletions merges adjacent assistant reasoni
   assertEquals(result.parallel_tool_calls, true);
   assertEquals(result.response_format, {
     type: "json_schema",
-    json_schema: { name: "shape" },
+    json_schema: {
+      name: "shape",
+      strict: true,
+      schema: { type: "object" },
+    },
   });
   assertEquals(result.prompt_cache_key, "cache-key");
   assertEquals(result.safety_identifier, "safe-id");
@@ -264,6 +277,63 @@ Deno.test("translateResponsesToChatCompletions preserves explicit null text form
   });
 
   assertEquals(result.response_format, null);
+});
+
+Deno.test("translateResponsesToChatCompletions reshapes flat json_schema text format into Chat Completions shape", () => {
+  const schema = {
+    type: "object",
+    properties: { ok: { type: "boolean" } },
+    required: ["ok"],
+  };
+  const result = translateResponsesToChatCompletions({
+    model: "gpt-test",
+    input: "Hi",
+    text: {
+      format: {
+        type: "json_schema",
+        name: "review_output",
+        strict: true,
+        schema,
+      },
+    },
+  });
+
+  assertEquals(result.response_format, {
+    type: "json_schema",
+    json_schema: {
+      name: "review_output",
+      strict: true,
+      schema,
+    },
+  });
+});
+
+Deno.test("translateResponsesToChatCompletions passes through plain text format without wrapping", () => {
+  const result = translateResponsesToChatCompletions({
+    model: "gpt-test",
+    input: "Hi",
+    text: { format: { type: "text" } },
+  });
+
+  assertEquals(result.response_format, { type: "text" });
+});
+
+Deno.test("translateResponsesToChatCompletions does not double-wrap an already-wrapped json_schema", () => {
+  const result = translateResponsesToChatCompletions({
+    model: "gpt-test",
+    input: "Hi",
+    text: {
+      format: {
+        type: "json_schema",
+        json_schema: { name: "already", strict: false, schema: {} },
+      },
+    },
+  });
+
+  assertEquals(result.response_format, {
+    type: "json_schema",
+    json_schema: { name: "already", strict: false, schema: {} },
+  });
 });
 
 Deno.test("translateResponsesEventToChatCompletionsChunks emits a completed opaque reasoning item before completion", () => {
@@ -1016,4 +1086,159 @@ Deno.test("translateResponsesEventToChatCompletionsChunks keeps first scalar rea
       ],
     },
   ]);
+});
+
+Deno.test("translateResponsesToChatCompletions filters out builtin tools that have no Chat Completions equivalent", () => {
+  // Responses exposes server-side builtin tools (web_search_preview,
+  // file_search, image_generation, ...) that have no Chat Completions
+  // analogue and no `name` field. These should be filtered out rather than
+  // emitting `function: {}` which strict upstreams (vLLM) reject.
+  const result = translateResponsesToChatCompletions({
+    model: "gpt-test",
+    input: [
+      { type: "message", role: "user", content: "Hi" },
+    ],
+    instructions: null,
+    temperature: null,
+    top_p: null,
+    max_output_tokens: null,
+    tools: [
+      // Builtin tools — no name, should be dropped
+      { type: "web_search_preview" } as unknown as ResponseTool,
+      { type: "file_search" } as unknown as ResponseTool,
+      { type: "image_generation" } as unknown as ResponseTool,
+      { type: "local_shell" } as unknown as ResponseTool,
+      // Normal function tool — should be kept
+      {
+        type: "function" as const,
+        name: "get_weather",
+        parameters: {
+          type: "object",
+          properties: { city: { type: "string" } },
+        },
+        strict: false,
+        description: "Get weather for a city",
+      },
+      // Another function tool — should be kept
+      {
+        type: "function" as const,
+        name: "lookup",
+        parameters: { type: "object", properties: { q: { type: "string" } } },
+        strict: true,
+      },
+    ],
+    metadata: null,
+    stream: null,
+    store: null,
+    parallel_tool_calls: null,
+    text: null,
+  });
+
+  // Only the two function tools should survive.
+  assertEquals(result.tools?.length, 2);
+  assertEquals(result.tools![0].function.name, "get_weather");
+  assertEquals(result.tools![0].function.strict, false);
+  assertEquals(result.tools![0].function.description, "Get weather for a city");
+  assertEquals(result.tools![1].function.name, "lookup");
+  assertEquals(result.tools![1].function.strict, true);
+  assertEquals(result.tools![1].function.description, undefined);
+});
+
+Deno.test("translateResponsesToChatCompletions returns undefined tools when only builtin tools are present", () => {
+  const result = translateResponsesToChatCompletions({
+    model: "gpt-test",
+    input: [
+      { type: "message", role: "user", content: "Hi" },
+    ],
+    instructions: null,
+    temperature: null,
+    top_p: null,
+    max_output_tokens: null,
+    tools: [
+      { type: "web_search_preview" } as unknown as ResponseTool,
+      { type: "image_generation" } as unknown as ResponseTool,
+    ],
+    metadata: null,
+    stream: null,
+    store: null,
+    parallel_tool_calls: null,
+    text: null,
+  });
+
+  assertEquals(result.tools, undefined);
+});
+
+Deno.test("translateResponsesToChatCompletions drops forced builtin tool_choice but keeps function tool_choice", () => {
+  // Forced builtin tool choices have no Chat Completions analogue;
+  // they should be dropped (falling back to auto/default).
+  const resultWithBuiltinChoice = translateResponsesToChatCompletions({
+    model: "gpt-test",
+    input: [
+      { type: "message", role: "user", content: "Hi" },
+    ],
+    instructions: null,
+    temperature: null,
+    top_p: null,
+    max_output_tokens: null,
+    tools: null,
+    tool_choice: {
+      type: "web_search_preview",
+    } as unknown as ResponseToolChoice,
+    metadata: null,
+    stream: null,
+    store: null,
+    parallel_tool_calls: null,
+    text: null,
+  });
+
+  assertEquals(resultWithBuiltinChoice.tool_choice, undefined);
+
+  // Forced function tool_choice should be preserved.
+  const resultWithFunctionChoice = translateResponsesToChatCompletions({
+    model: "gpt-test",
+    input: [
+      { type: "message", role: "user", content: "Hi" },
+    ],
+    instructions: null,
+    temperature: null,
+    top_p: null,
+    max_output_tokens: null,
+    tools: null,
+    tool_choice: {
+      type: "function" as const,
+      name: "get_weather",
+    },
+    metadata: null,
+    stream: null,
+    store: null,
+    parallel_tool_calls: null,
+    text: null,
+  });
+
+  assertEquals(resultWithFunctionChoice.tool_choice, {
+    type: "function",
+    function: { name: "get_weather" },
+  });
+});
+
+Deno.test("translateResponsesToChatCompletions returns undefined tool_choice for string auto/required/none choices", () => {
+  const result = translateResponsesToChatCompletions({
+    model: "gpt-test",
+    input: [
+      { type: "message", role: "user", content: "Hi" },
+    ],
+    instructions: null,
+    temperature: null,
+    top_p: null,
+    max_output_tokens: null,
+    tools: null,
+    tool_choice: "auto" as ResponseToolChoice,
+    metadata: null,
+    stream: null,
+    store: null,
+    parallel_tool_calls: null,
+    text: null,
+  });
+
+  assertEquals(result.tool_choice, "auto");
 });

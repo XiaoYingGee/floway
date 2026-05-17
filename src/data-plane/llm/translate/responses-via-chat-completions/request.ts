@@ -183,8 +183,24 @@ const buildChatResponseFormat = (
   // `text: {}` means no explicit format. Keep it omitted instead of converting
   // absence into an explicit Chat `response_format: null`.
   if (!Object.hasOwn(text, "format")) return undefined;
-  if (text.format === undefined) return undefined;
-  return text.format;
+  const format = text.format;
+  if (format === undefined) return undefined;
+  if (format === null) return null;
+  // Responses API uses a flat json_schema shape
+  // ({ type, name, strict, schema }), while Chat Completions wraps the
+  // schema details under a nested `json_schema` field. Reshape only when
+  // needed; pass `text`/`json_object` and already-wrapped variants through.
+  // Without this, upstreams reject the request with
+  // "When response_format type is 'json_schema', the 'json_schema' field
+  // must be provided", which Codex's review/guardian flow trips on.
+  // References:
+  //   https://platform.openai.com/docs/api-reference/responses/create
+  //   https://platform.openai.com/docs/api-reference/chat/create#chat-create-response_format
+  if (format.type === "json_schema" && !("json_schema" in format)) {
+    const { type: _type, ...rest } = format;
+    return { type: "json_schema", json_schema: rest };
+  }
+  return format;
 };
 
 export const translateResponsesToChatCompletions = (

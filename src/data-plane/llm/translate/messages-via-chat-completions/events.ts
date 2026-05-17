@@ -382,6 +382,9 @@ export const translateChatCompletionsChunkToMessagesEvents = (
 
   if (state.aborted) return events;
 
+  // Chat Completions `n > 1` returns alternative completions, not parts of one
+  // answer. Messages has no multi-candidate shape, so only the first choice
+  // can be represented; choices[1+] are dropped.
   const choice = chunk.choices[0];
 
   if (!state.messageStartSent) {
@@ -401,20 +404,16 @@ export const translateChatCompletionsChunkToMessagesEvents = (
     state.messageStartSent = true;
   }
 
-  const aborted = handleReasoningDelta(choice.delta, state, events);
-  if (aborted) return events;
+  if (handleReasoningDelta(choice.delta, state, events)) return events;
 
   if (choice.delta.content) {
     handleContentDelta(choice.delta.content, state, events);
   }
 
-  if (choice.delta.tool_calls) {
-    const aborted = handleToolCallsDelta(
-      choice.delta.tool_calls,
-      state,
-      events,
-    );
-    if (aborted) return events;
+  if (choice.delta.tool_calls?.length) {
+    if (handleToolCallsDelta(choice.delta.tool_calls, state, events)) {
+      return events;
+    }
   }
 
   if (choice.finish_reason) {

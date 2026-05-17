@@ -583,7 +583,7 @@ export const translateChatCompletionsChunkToResponsesEvents = (
       }
     }
 
-    if (choice.delta.tool_calls) {
+    if (choice.delta.tool_calls?.length) {
       if (state.pendingScalarReasoning) {
         state.deferredAfterReasoning.push({
           type: "tool_calls",
