@@ -286,7 +286,11 @@ Deno.test("dashboardApp renders performance chart with 4h buckets for 7d range",
   app.performanceRange = "7d";
   app.performancePercentile = "p95Ms";
   app.performanceSeries = [
-    { bucket: app.local4hBucketKey(start), group: "claude-opus-4-7", p95Ms: 600 },
+    {
+      bucket: app.local4hBucketKey(start),
+      group: "claude-opus-4-7",
+      p95Ms: 600,
+    },
   ];
 
   app.renderPerformanceChart();
@@ -1199,11 +1203,16 @@ Deno.test("DashboardPage merges Upstream into leftmost Settings tab and places M
     html,
     "const TABS = isAdmin ? ['settings', 'models', 'keys', 'usage', 'performance'] : ['models', 'keys', 'usage', 'performance'];",
   );
-  assertStringIncludes(html, "const defaultTab = isAdmin ? 'settings' : 'models';");
+  assertStringIncludes(
+    html,
+    "const defaultTab = isAdmin ? 'settings' : 'models';",
+  );
   assertFalse(html.includes("switchTab('upstream')"));
   assertFalse(html.includes("tab === 'upstream'"));
 
-  const settings = html.indexOf(">\n              Settings\n            </button>");
+  const settings = html.indexOf(
+    ">\n              Settings\n            </button>",
+  );
   const models = html.indexOf(">\n            Models\n          </button>");
   const apiKeys = html.indexOf(">\n            API Keys\n          </button>");
   assert(settings >= 0);
@@ -1275,7 +1284,7 @@ Deno.test("DashboardPage uses frontend-only selected GitHub account for quota di
   assertStringIncludes(html, "selectedGithubAccountId === acct.id");
   assertStringIncludes(html, "'/api/copilot-quota?user_id='");
   assertStringIncludes(html, "async selectGithubAccount(userId)");
-  assertStringIncludes(html, "class=\"ml-1 min-w-0 truncate text-gray-500\"");
+  assertStringIncludes(html, 'class="ml-1 min-w-0 truncate text-gray-500"');
   assertStringIncludes(html, "'· @' + (githubAccounts.find");
   assertStringIncludes(html, "usageData.copilot_plan");
   assertFalse(html.includes("Selected account:"));
@@ -1408,4 +1417,111 @@ Deno.test("dashboardApp renders search usage per-key datasets for active provide
   assertEquals(searchKeyChart.data.datasets[0].label, "Search A");
   assert(searchKeyChart.data.datasets[0].data.includes(5));
   assertFalse(searchKeyChart.data.datasets[0].data.includes(7));
+});
+
+Deno.test("dashboardApp model search does not crash when model.name is missing", async () => {
+  const originalFetch = globalThis.fetch;
+  // deno-lint-ignore no-explicit-any
+  globalThis.fetch = (input: any) => {
+    const url = String(input);
+    if (url.startsWith("/api/models")) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: "custom-model-no-name",
+                model_picker_enabled: true,
+                capabilities: { type: "chat", limits: {} },
+                supported_endpoints: ["/chat/completions"],
+              },
+              {
+                id: "named-model",
+                name: "Named Model",
+                model_picker_enabled: true,
+                capabilities: { type: "chat", limits: {} },
+                supported_endpoints: ["/chat/completions"],
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  try {
+    const { app } = createDashboardHarness();
+    await app.loadModels();
+
+    const nameless = app.allModels.find(
+      (m: { id: string }) => m.id === "custom-model-no-name",
+    );
+    assertEquals(nameless.name, "custom-model-no-name");
+
+    app.modelsSearch = "custom";
+    const filtered = app.filteredChatModels
+      .filter((m: { _divider?: boolean }) => !m._divider)
+      .map((m: { id: string }) => m.id);
+    assertEquals(filtered, ["custom-model-no-name"]);
+
+    app.modelsSearch = "Named Model";
+    const filtered2 = app.filteredChatModels
+      .filter((m: { _divider?: boolean }) => !m._divider)
+      .map((m: { id: string }) => m.id);
+    assertEquals(filtered2, ["named-model"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+Deno.test("dashboardApp filteredChatModels excludes embedding-only models", async () => {
+  const originalFetch = globalThis.fetch;
+  // deno-lint-ignore no-explicit-any
+  globalThis.fetch = (input: any) => {
+    const url = String(input);
+    if (url.startsWith("/api/models")) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: "chat-model",
+                name: "Chat Model",
+                model_picker_enabled: true,
+                capabilities: { type: "chat", limits: {} },
+                supported_endpoints: ["/chat/completions"],
+              },
+              {
+                id: "embed-only",
+                name: "Embed Only",
+                model_picker_enabled: true,
+                supported_endpoints: ["/embeddings"],
+              },
+              {
+                id: "no-caps-embed",
+                model_picker_enabled: true,
+                supported_endpoints: ["/embeddings"],
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  try {
+    const { app } = createDashboardHarness();
+    await app.loadModels();
+
+    const ids = app.filteredChatModels
+      .filter((m: { _divider?: boolean }) => !m._divider)
+      .map((m: { id: string }) => m.id);
+    assertEquals(ids, ["chat-model"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

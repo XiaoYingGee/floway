@@ -248,11 +248,20 @@ export function dashboardAssets() {
                 }
 
                 const CLAUDE_TIER = { opus: 0, sonnet: 1, haiku: 2 };
+                const LLM_ENDPOINTS = ['/v1/messages', '/responses', '/chat/completions'];
 
                 function modelContextWindow(model) {
                   const limits = model.capabilities?.limits;
                   return limits?.max_context_window_tokens
                     || ((limits?.max_prompt_tokens || 0) + (limits?.max_output_tokens || 0));
+                }
+
+                function modelSupportsGeneration(model) {
+                  if (model.supports_generation !== undefined) return model.supports_generation;
+                  if (Array.isArray(model.supported_endpoints)) {
+                    return model.supported_endpoints.some((endpoint) => LLM_ENDPOINTS.includes(endpoint));
+                  }
+                  return model.capabilities?.type !== 'embeddings';
                 }
 
                 function claudeTier(id) {
@@ -407,10 +416,10 @@ export function dashboardAssets() {
                   },
 
                   get filteredChatModels() {
-                    let models = this.allModels.filter(m => m.capabilities?.type !== 'embeddings');
+                    let models = this.allModels.filter(modelSupportsGeneration);
                     if (this.modelsSearch.trim()) {
                       const q = this.modelsSearch.toLowerCase();
-                      models = models.filter(m => m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q));
+                      models = models.filter(m => m.id.toLowerCase().includes(q) || (m.name || m.id).toLowerCase().includes(q));
                     }
                     const enabled = models.filter(m => m.model_picker_enabled);
                     const legacy = models.filter(m => !m.model_picker_enabled);
@@ -609,7 +618,11 @@ export function dashboardAssets() {
                             return;
                           }
                           const { data: rawData } = await resp.json();
-                          const data = rawData;
+                          const data = rawData.map((m) => ({
+                            ...m,
+                            name: m.name || m.id,
+                            supports_generation: modelSupportsGeneration(m),
+                          }));
 
                           this.allModels = data;
                           if (!this.chatModelId) {
