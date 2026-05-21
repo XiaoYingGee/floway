@@ -3,7 +3,6 @@ import { test } from 'vitest';
 import { collectMessagesProtocolEventsToResponse } from './to-response.ts';
 import { assertEquals, assertRejects } from '../../../../../test-assert.ts';
 import type { MessagesResponse, MessagesStreamEventData } from '../../../../shared/protocol/messages.ts';
-import { messagesResultToEvents } from '../../../shared/protocol/messages.ts';
 import { eventFrame } from '../../../shared/stream/types.ts';
 
 test('collectMessagesProtocolEventsToResponse reassembles synthetic Messages events', async () => {
@@ -19,7 +18,18 @@ test('collectMessagesProtocolEventsToResponse reassembles synthetic Messages eve
   };
 
   async function* events() {
-    yield* messagesResultToEvents(expected);
+    const payloads: MessagesStreamEventData[] = [
+      {
+        type: 'message_start',
+        message: { ...expected, content: [], stop_reason: null, stop_sequence: null, usage: { ...expected.usage, output_tokens: 0 } },
+      },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Hello' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 2 } },
+      { type: 'message_stop' },
+    ];
+    for (const event of payloads) yield eventFrame(event);
   }
 
   assertEquals(await collectMessagesProtocolEventsToResponse(events()), expected);

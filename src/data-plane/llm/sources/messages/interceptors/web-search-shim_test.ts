@@ -1,19 +1,18 @@
 import { test } from 'vitest';
 
 import {
-  collectAndRewriteMessagesWebSearchEventsToNative,
   decodeWebSearchCitationPayload,
   decodeWebSearchResultPayload,
   encodeWebSearchCitationPayload,
   encodeWebSearchResultPayload,
   type MessagesWebSearchShimState,
   prepareMessagesWebSearchShimRequest,
-  rewriteMessagesWebSearchResponseToNative,
+  rewriteMessagesWebSearchEventsToNative,
   withMessagesWebSearchShim,
 } from './web-search-shim.ts';
 import { initRepo } from '../../../../../repo/index.ts';
 import { InMemoryRepo } from '../../../../../repo/memory.ts';
-import { assertEquals, assertExists } from '../../../../../test-assert.ts';
+import { assertEquals, assertExists, assertRejects } from '../../../../../test-assert.ts';
 import type {
   MessagesAssistantContentBlock,
   MessagesClientTool,
@@ -29,9 +28,7 @@ import { type WebSearchProvider } from '../../../../tools/web-search/provider.ts
 import { DEFAULT_SEARCH_CONFIG } from '../../../../tools/web-search/search-config.ts';
 import type { WebSearchProviderResult } from '../../../../tools/web-search/types.ts';
 import type { MessagesExchangeContext } from '../../../interceptors.ts';
-import { messagesResultToEvents } from '../../../shared/protocol/messages.ts';
-import { type ProtocolFrame } from '../../../shared/stream/types.ts';
-import { collectMessagesProtocolEventsToResponse } from '../events/to-response.ts';
+import { type ProtocolFrame, eventFrame } from '../../../shared/stream/types.ts';
 import { messagesProtocolFrameToSSEFrame } from '../events/to-sse.ts';
 
 const testTelemetryModelIdentity = {
@@ -124,25 +121,6 @@ const activeMessagesWebSearchShimState = (overrides: Partial<Extract<MessagesWeb
   ...overrides,
 });
 
-const makeUpstreamToolUseResponse = (toolUses: Array<{ name: string; id: string; input: Record<string, unknown> }>): MessagesResponse => ({
-  id: 'msg_upstream',
-  type: 'message',
-  role: 'assistant',
-  model: 'claude-test',
-  stop_reason: 'tool_use',
-  stop_sequence: null,
-  usage: {
-    input_tokens: 10,
-    output_tokens: 3,
-  },
-  content: toolUses.map(toolUse => ({
-    type: 'tool_use',
-    id: toolUse.id,
-    name: toolUse.name,
-    input: toolUse.input,
-  })),
-});
-
 const fakeProviderOk: WebSearchProvider = () =>
   Promise.resolve({
     type: 'ok',
@@ -184,7 +162,61 @@ const collect = async <T>(events: AsyncIterable<T>): Promise<T[]> => {
   return collected;
 };
 
-const messagesResponseToProtocolFrames = (response: MessagesResponse): ProtocolFrame<MessagesStreamEventData>[] => messagesResultToEvents(response);
+// Local helper that projects a MessagesResponse into the canonical Messages SSE
+// event sequence used by the replay-only wiring tests below. Only handles text
+// blocks (with optional citations) because that is the shape these fixtures
+// exercise; extend if a future test needs other block kinds. Kept local so the
+// production layer no longer needs a generic response-to-events helper.
+const messagesResponseToUpstreamFrames = (response: MessagesResponse): ProtocolFrame<MessagesStreamEventData>[] => {
+  const frames: ProtocolFrame<MessagesStreamEventData>[] = [
+    eventFrame({
+      type: 'message_start',
+      message: {
+        id: response.id,
+        type: response.type,
+        role: response.role,
+        content: [],
+        model: response.model,
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { ...response.usage, output_tokens: 0 },
+      },
+    }),
+  ];
+
+  response.content.forEach((block, index) => {
+    if (block.type !== 'text') {
+      throw new Error(`messagesResponseToUpstreamFrames only handles text blocks; got ${block.type}`);
+    }
+    frames.push(eventFrame({
+      type: 'content_block_start',
+      index,
+      content_block: {
+        type: 'text',
+        text: '',
+        ...(block.citations?.length ? { citations: [] } : {}),
+      },
+    }));
+    for (const citation of block.citations ?? []) {
+      frames.push(eventFrame({ type: 'content_block_delta', index, delta: { type: 'citations_delta', citation } }));
+    }
+    if (block.text.length > 0) {
+      frames.push(eventFrame({ type: 'content_block_delta', index, delta: { type: 'text_delta', text: block.text } }));
+    }
+    frames.push(eventFrame({ type: 'content_block_stop', index }));
+  });
+
+  frames.push(
+    eventFrame({
+      type: 'message_delta',
+      delta: { stop_reason: response.stop_reason, stop_sequence: response.stop_sequence },
+      usage: { output_tokens: response.usage.output_tokens },
+    }),
+    eventFrame({ type: 'message_stop' }),
+  );
+
+  return frames;
+};
 
 test('web search shim payload codecs use minimal cgws1 payloads', () => {
   const encryptedContent = encodeWebSearchResultPayload({
@@ -491,386 +523,6 @@ test('prepareMessagesWebSearchShimRequest creates a separate user tool_result me
   });
 });
 
-test('rewriteMessagesWebSearchResponseToNative converts pure web_search tool_use into pause_turn', async () => {
-  const repo = new InMemoryRepo();
-  initRepo(repo);
-
-  const rewritten = await rewriteMessagesWebSearchResponseToNative(
-    makeUpstreamToolUseResponse([
-      {
-        name: 'web_search',
-        id: 'toolu_1',
-        input: { query: 'latest React docs' },
-      },
-    ]),
-    activeMessagesWebSearchShimState(),
-    activeProvider(fakeProviderOk, 'key_usage'),
-  );
-
-  assertEquals(rewritten.stop_reason, 'pause_turn');
-  assertEquals(rewritten.content[0].type, 'server_tool_use');
-  assertEquals(rewritten.content[1].type, 'web_search_tool_result');
-  assertEquals((rewritten.content[1] as { caller?: { type: string } }).caller, { type: 'direct' });
-  assertEquals(rewritten.usage.server_tool_use?.web_search_requests, 1);
-  assertEquals(await repo.searchUsage.listAll(), [
-    {
-      provider: 'tavily',
-      keyId: 'key_usage',
-      hour: new Date().toISOString().slice(0, 13),
-      requests: 1,
-    },
-  ]);
-});
-
-test('rewriteMessagesWebSearchResponseToNative keeps remaining client tool_use in mixed turn', async () => {
-  const rewritten = await rewriteMessagesWebSearchResponseToNative(
-    makeUpstreamToolUseResponse([
-      {
-        name: 'web_search',
-        id: 'toolu_1',
-        input: { query: 'latest React docs' },
-      },
-      { name: 'calc', id: 'toolu_2', input: { expression: '2+2' } },
-    ]),
-    activeMessagesWebSearchShimState(),
-    activeProvider(fakeProviderOk),
-  );
-
-  assertEquals(rewritten.stop_reason, 'tool_use');
-  assertEquals(
-    rewritten.content.some((block: MessagesAssistantContentBlock) => block.type === 'tool_use'),
-    true,
-  );
-  assertEquals(
-    rewritten.content.some((block: MessagesAssistantContentBlock) => block.type === 'server_tool_use'),
-    true,
-  );
-});
-
-test('rewriteMessagesWebSearchResponseToNative synthesizes max_uses_exceeded without calling the provider', async () => {
-  const repo = new InMemoryRepo();
-  initRepo(repo);
-  let called = false;
-
-  const rewritten = await rewriteMessagesWebSearchResponseToNative(
-    makeUpstreamToolUseResponse([
-      {
-        name: 'web_search',
-        id: 'toolu_1',
-        input: { query: 'latest React docs' },
-      },
-    ]),
-    activeMessagesWebSearchShimState({ maxUses: 1, priorSearchUseCount: 1 }),
-    activeProvider(() => {
-      called = true;
-      return Promise.resolve({
-        type: 'ok',
-        results: [],
-      });
-    }, 'key_usage'),
-  );
-
-  assertEquals(called, false);
-  assertEquals(rewritten.content[1], {
-    type: 'web_search_tool_result',
-    tool_use_id: 'srvtoolu_1',
-    caller: { type: 'direct' },
-    content: {
-      type: 'web_search_tool_result_error',
-      error_code: 'max_uses_exceeded',
-    },
-  });
-  assertEquals(rewritten.usage.server_tool_use, undefined);
-  assertEquals(await repo.searchUsage.listAll(), []);
-});
-
-test('rewriteMessagesWebSearchResponseToNative maps provider errors into native-looking tool-result errors', async () => {
-  const rewritten = await rewriteMessagesWebSearchResponseToNative(
-    makeUpstreamToolUseResponse([
-      {
-        name: 'web_search',
-        id: 'toolu_1',
-        input: { query: 'latest React docs' },
-      },
-    ]),
-    activeMessagesWebSearchShimState(),
-    activeProvider(fakeProviderError('too_many_requests')),
-  );
-
-  assertEquals(rewritten.content[1], {
-    type: 'web_search_tool_result',
-    tool_use_id: 'srvtoolu_1',
-    caller: { type: 'direct' },
-    content: {
-      type: 'web_search_tool_result_error',
-      error_code: 'too_many_requests',
-    },
-  });
-  assertEquals(rewritten.stop_reason, 'pause_turn');
-});
-
-test('rewriteMessagesWebSearchResponseToNative uses invalid_tool_input for blank queries', async () => {
-  const repo = new InMemoryRepo();
-  initRepo(repo);
-
-  const rewritten = await rewriteMessagesWebSearchResponseToNative(
-    makeUpstreamToolUseResponse([
-      {
-        name: 'web_search',
-        id: 'toolu_1',
-        input: { query: '   ' },
-      },
-    ]),
-    activeMessagesWebSearchShimState(),
-    activeProvider(fakeProviderOk, 'key_usage'),
-  );
-
-  assertEquals(rewritten.content[1], {
-    type: 'web_search_tool_result',
-    tool_use_id: 'srvtoolu_1',
-    caller: { type: 'direct' },
-    content: {
-      type: 'web_search_tool_result_error',
-      error_code: 'invalid_tool_input',
-    },
-  });
-  assertEquals(rewritten.stop_reason, 'pause_turn');
-  assertEquals(await repo.searchUsage.listAll(), []);
-});
-
-test('rewriteMessagesWebSearchResponseToNative uses query_too_long without recording usage', async () => {
-  const repo = new InMemoryRepo();
-  initRepo(repo);
-
-  const rewritten = await rewriteMessagesWebSearchResponseToNative(
-    makeUpstreamToolUseResponse([
-      {
-        name: 'web_search',
-        id: 'toolu_1',
-        input: { query: 'x'.repeat(1001) },
-      },
-    ]),
-    activeMessagesWebSearchShimState(),
-    activeProvider(fakeProviderOk, 'key_usage'),
-  );
-
-  assertEquals(rewritten.content[1], {
-    type: 'web_search_tool_result',
-    tool_use_id: 'srvtoolu_1',
-    caller: { type: 'direct' },
-    content: {
-      type: 'web_search_tool_result_error',
-      error_code: 'query_too_long',
-    },
-  });
-  assertEquals(rewritten.stop_reason, 'pause_turn');
-  assertEquals(await repo.searchUsage.listAll(), []);
-});
-
-test('rewriteMessagesWebSearchResponseToNative forwards only definition-level domain policy to the provider', async () => {
-  let providerRequest:
-    | {
-      query: string;
-      allowedDomains?: string[];
-      blockedDomains?: string[];
-    }
-    | undefined;
-
-  const rewritten = await rewriteMessagesWebSearchResponseToNative(
-    makeUpstreamToolUseResponse([
-      {
-        name: 'web_search',
-        id: 'toolu_1',
-        input: {
-          query: 'latest React docs',
-          allowed_domains: ['ignored.example.com'],
-          blocked_domains: ['also-ignored.example.com'],
-        },
-      },
-    ]),
-    activeMessagesWebSearchShimState({
-      allowedDomains: ['react.dev'],
-      blockedDomains: ['example.com'],
-    }),
-    activeProvider(request => {
-      providerRequest = {
-        query: request.query,
-        allowedDomains: request.allowedDomains,
-        blockedDomains: request.blockedDomains,
-      };
-      return Promise.resolve({
-        type: 'ok',
-        results: [],
-      });
-    }),
-  );
-
-  assertEquals(providerRequest, {
-    query: 'latest React docs',
-    allowedDomains: ['react.dev'],
-    blockedDomains: ['example.com'],
-  });
-  assertEquals(rewritten.stop_reason, 'pause_turn');
-});
-
-test('rewriteMessagesWebSearchResponseToNative counts thrown provider attempts toward max_uses within the same turn', async () => {
-  let callCount = 0;
-
-  const rewritten = await rewriteMessagesWebSearchResponseToNative(
-    makeUpstreamToolUseResponse([
-      {
-        name: 'web_search',
-        id: 'toolu_1',
-        input: { query: 'latest React docs' },
-      },
-      {
-        name: 'web_search',
-        id: 'toolu_2',
-        input: { query: 'latest React docs again' },
-      },
-    ]),
-    activeMessagesWebSearchShimState({ maxUses: 1 }),
-    activeProvider(() => {
-      callCount += 1;
-      return Promise.reject(new Error('provider exploded'));
-    }),
-  );
-
-  assertEquals(callCount, 1);
-  assertEquals(rewritten.usage.server_tool_use?.web_search_requests, 1);
-  assertEquals(rewritten.content[1], {
-    type: 'web_search_tool_result',
-    tool_use_id: 'srvtoolu_1',
-    caller: { type: 'direct' },
-    content: {
-      type: 'web_search_tool_result_error',
-      error_code: 'unavailable',
-    },
-  });
-  assertEquals(rewritten.content[3], {
-    type: 'web_search_tool_result',
-    tool_use_id: 'srvtoolu_2',
-    caller: { type: 'direct' },
-    content: {
-      type: 'web_search_tool_result_error',
-      error_code: 'max_uses_exceeded',
-    },
-  });
-});
-
-test('rewriteMessagesWebSearchResponseToNative rewrites search_result_location citations only for owned indices', async () => {
-  const rewritten = await rewriteMessagesWebSearchResponseToNative(
-    {
-      id: 'msg_citations',
-      type: 'message',
-      role: 'assistant',
-      model: 'claude-test',
-      stop_reason: 'end_turn',
-      stop_sequence: null,
-      usage: { input_tokens: 10, output_tokens: 1 },
-      content: [
-        {
-          type: 'text',
-          text: 'Use the docs.',
-          citations: [
-            {
-              type: 'search_result_location',
-              url: 'https://react.dev',
-              title: 'React',
-              search_result_index: 0,
-              start_block_index: 0,
-              end_block_index: 0,
-              cited_text: 'Official docs',
-            },
-            {
-              type: 'search_result_location',
-              url: 'https://example.com',
-              title: 'Foreign',
-              search_result_index: 1,
-              start_block_index: 0,
-              end_block_index: 0,
-              cited_text: 'Foreign docs',
-            },
-          ],
-        },
-      ],
-    },
-    activeMessagesWebSearchShimState({
-      requestSearchResultOwnership: ['owned', 'foreign'],
-    }),
-    activeProvider(fakeProviderOk),
-  );
-
-  const textBlock = rewritten.content[0] as MessagesTextBlock;
-  assertEquals(textBlock.citations?.[0]?.type, 'web_search_result_location');
-  assertEquals(textBlock.citations?.[1]?.type, 'search_result_location');
-});
-
-test('collectAndRewriteMessagesWebSearchEventsToNative rewrites collected events once', async () => {
-  const frames = collectAndRewriteMessagesWebSearchEventsToNative(
-    toAsyncIterable(
-      messagesResponseToProtocolFrames(
-        makeUpstreamToolUseResponse([
-          {
-            name: 'web_search',
-            id: 'toolu_1',
-            input: { query: 'latest React docs' },
-          },
-        ]),
-      ),
-    ),
-    activeMessagesWebSearchShimState(),
-    activeProvider(fakeProviderOk),
-  );
-
-  const rewritten = await collectMessagesProtocolEventsToResponse(frames);
-
-  assertEquals(rewritten.stop_reason, 'pause_turn');
-  assertEquals(rewritten.content[0].type, 'server_tool_use');
-  assertEquals(rewritten.content[1].type, 'web_search_tool_result');
-});
-
-test('rewriteMessagesWebSearchResponseToNative preserves user-defined web_search tool calls in replay-only mode', async () => {
-  const { tools: _tools, ...replayPayload } = makeNativeReplayPayload();
-  const prepared = prepareMessagesWebSearchShimRequest({
-    ...replayPayload,
-    tools: [
-      {
-        name: 'web_search',
-        description: 'user-defined tool',
-        input_schema: { type: 'object' },
-      },
-    ],
-  });
-
-  assertEquals(prepared.type, 'ok');
-  if (prepared.type !== 'ok') throw new Error('expected ok result');
-
-  let called = false;
-  const upstreamResponse = makeUpstreamToolUseResponse([
-    {
-      name: 'web_search',
-      id: 'toolu_1',
-      input: { query: 'latest React docs' },
-    },
-  ]);
-
-  const rewritten = await rewriteMessagesWebSearchResponseToNative(
-    upstreamResponse,
-    prepared.state,
-    activeProvider(() => {
-      called = true;
-      return Promise.resolve({
-        type: 'ok',
-        results: [],
-      });
-    }),
-  );
-
-  assertEquals(called, false);
-  assertEquals(rewritten, upstreamResponse);
-});
-
 test('withMessagesWebSearchShim returns internal-error when request requires disabled search config', async () => {
   const repo = new InMemoryRepo();
   initRepo(repo);
@@ -900,7 +552,7 @@ test('withMessagesWebSearchShim allows replay-only history when the search provi
     Promise.resolve({
       type: 'events',
       events: toAsyncIterable(
-        messagesResponseToProtocolFrames({
+        messagesResponseToUpstreamFrames({
           id: 'msg_replay_only',
           type: 'message',
           role: 'assistant',
@@ -933,9 +585,9 @@ test('withMessagesWebSearchShim allows replay-only history when the search provi
   assertEquals(result.type, 'events');
   if (result.type !== 'events') throw new Error('expected events result');
 
-  const rewritten = await collectMessagesProtocolEventsToResponse(result.events);
-  const textBlock = rewritten.content[0] as MessagesTextBlock;
-  assertEquals(textBlock.citations?.[0]?.type, 'web_search_result_location');
+  const events = (await collect(result.events)).flatMap(frame => (frame.type === 'event' ? [frame.event] : []));
+  const citationsDelta = events.find((event): event is Extract<MessagesStreamEventData, { type: 'content_block_delta' }> => event.type === 'content_block_delta' && event.delta.type === 'citations_delta');
+  assertEquals(citationsDelta?.delta.type === 'citations_delta' ? citationsDelta.delta.citation.type : undefined, 'web_search_result_location');
 });
 
 test('withMessagesWebSearchShim emits native-like citation deltas for replay-only history', async () => {
@@ -949,7 +601,7 @@ test('withMessagesWebSearchShim emits native-like citation deltas for replay-onl
     Promise.resolve({
       type: 'events',
       events: toAsyncIterable(
-        messagesResponseToProtocolFrames({
+        messagesResponseToUpstreamFrames({
           id: 'msg_replay_only_stream',
           type: 'message',
           role: 'assistant',
@@ -1013,4 +665,609 @@ test('withMessagesWebSearchShim emits native-like citation deltas for replay-onl
     start_block_index: 0,
     end_block_index: 0,
   });
+});
+
+// Hand-built upstream event sequences below stand in for what a real Messages
+// upstream sends: each scenario exercises the streaming generator against the
+// minimal set of events needed for the rule it covers.
+
+const upstreamMessageStart = (id = 'msg_upstream'): MessagesStreamEventData => ({
+  type: 'message_start',
+  message: {
+    id,
+    type: 'message',
+    role: 'assistant',
+    content: [],
+    model: 'claude-test',
+    stop_reason: null,
+    stop_sequence: null,
+    usage: { input_tokens: 10, output_tokens: 0 },
+  },
+});
+
+const upstreamTextBlock = (index: number, text: string, citations?: MessagesStreamEventData[]): MessagesStreamEventData[] => [
+  {
+    type: 'content_block_start',
+    index,
+    content_block: { type: 'text', text: '' },
+  },
+  ...(text.length > 0
+    ? [{
+        type: 'content_block_delta' as const,
+        index,
+        delta: { type: 'text_delta' as const, text },
+      }]
+    : []),
+  ...(citations ?? []),
+  { type: 'content_block_stop', index },
+];
+
+const upstreamWebSearchBlock = (index: number, id: string, query: string): MessagesStreamEventData[] => [
+  {
+    type: 'content_block_start',
+    index,
+    content_block: { type: 'tool_use', id, name: 'web_search', input: {} },
+  },
+  {
+    type: 'content_block_delta',
+    index,
+    delta: { type: 'input_json_delta', partial_json: JSON.stringify({ query }) },
+  },
+  { type: 'content_block_stop', index },
+];
+
+const upstreamWebSearchBlockRawJson = (index: number, id: string, rawJson: string): MessagesStreamEventData[] => [
+  {
+    type: 'content_block_start',
+    index,
+    content_block: { type: 'tool_use', id, name: 'web_search', input: {} },
+  },
+  ...(rawJson.length > 0
+    ? [{
+        type: 'content_block_delta' as const,
+        index,
+        delta: { type: 'input_json_delta' as const, partial_json: rawJson },
+      }]
+    : []),
+  { type: 'content_block_stop', index },
+];
+
+const upstreamClientToolBlock = (index: number, id: string, name: string, input: Record<string, unknown>): MessagesStreamEventData[] => [
+  {
+    type: 'content_block_start',
+    index,
+    content_block: { type: 'tool_use', id, name, input: {} },
+  },
+  {
+    type: 'content_block_delta',
+    index,
+    delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) },
+  },
+  { type: 'content_block_stop', index },
+];
+
+const upstreamMessageEnd = (stopReason: NonNullable<MessagesResponse['stop_reason']> = 'tool_use'): MessagesStreamEventData[] => [
+  {
+    type: 'message_delta',
+    delta: { stop_reason: stopReason, stop_sequence: null },
+    usage: { output_tokens: 7 },
+  },
+  { type: 'message_stop' },
+];
+
+const collectStreamEvents = async (
+  frames: AsyncIterable<ProtocolFrame<MessagesStreamEventData>>,
+): Promise<MessagesStreamEventData[]> => {
+  const events: MessagesStreamEventData[] = [];
+  for await (const frame of frames) {
+    if (frame.type === 'event') events.push(frame.event);
+  }
+  return events;
+};
+
+const runStreamingShim = (
+  events: MessagesStreamEventData[],
+  state: MessagesWebSearchShimState,
+  provider?: ReturnType<typeof activeProvider>,
+) =>
+  collectStreamEvents(
+    rewriteMessagesWebSearchEventsToNative(
+      toAsyncIterable(events.map(event => ({ type: 'event' as const, event }))),
+      state,
+      provider,
+    ),
+  );
+
+test('rewriteMessagesWebSearchEventsToNative single web search emits server_tool_use/result pair around text', async () => {
+  const events = await runStreamingShim(
+    [
+      upstreamMessageStart(),
+      ...upstreamTextBlock(0, 'Searching...'),
+      ...upstreamWebSearchBlock(1, 'toolu_1', 'react 19'),
+      ...upstreamTextBlock(2, 'Done.'),
+      ...upstreamMessageEnd('tool_use'),
+    ],
+    activeMessagesWebSearchShimState(),
+    activeProvider(fakeProviderOk),
+  );
+
+  assertEquals(
+    events.map(event => event.type),
+    [
+      'message_start',
+      'content_block_start', 'content_block_delta', 'content_block_stop',
+      'content_block_start', 'content_block_stop',
+      'content_block_start', 'content_block_stop',
+      'content_block_start', 'content_block_delta', 'content_block_stop',
+      'message_delta', 'message_stop',
+    ],
+  );
+
+  const indexed = events.filter(event => event.type === 'content_block_start' || event.type === 'content_block_stop' || event.type === 'content_block_delta');
+  assertEquals(indexed.map(event => (event as { index: number }).index), [0, 0, 0, 1, 1, 2, 2, 3, 3, 3]);
+
+  const serverToolUse = events.find(event => event.type === 'content_block_start' && event.content_block.type === 'server_tool_use');
+  assertEquals(serverToolUse?.type === 'content_block_start' ? serverToolUse.content_block : undefined, {
+    type: 'server_tool_use',
+    id: 'srvtoolu_1',
+    name: 'web_search',
+    input: { query: 'react 19' },
+  });
+
+  const toolResult = events.find(event => event.type === 'content_block_start' && event.content_block.type === 'web_search_tool_result');
+  assertExists(toolResult);
+
+  const messageDelta = events.find(event => event.type === 'message_delta');
+  assertEquals(messageDelta?.type === 'message_delta' ? messageDelta.delta.stop_reason : undefined, 'pause_turn');
+  assertEquals(messageDelta?.type === 'message_delta' ? messageDelta.usage?.server_tool_use : undefined, { web_search_requests: 1 });
+});
+
+test('rewriteMessagesWebSearchEventsToNative renumbers indices across two intercepted searches', async () => {
+  let providerCalls = 0;
+  const events = await runStreamingShim(
+    [
+      upstreamMessageStart(),
+      ...upstreamTextBlock(0, 'Looking up first.'),
+      ...upstreamWebSearchBlock(1, 'toolu_1', 'react 19 release notes'),
+      ...upstreamTextBlock(2, 'And another.'),
+      ...upstreamWebSearchBlock(3, 'toolu_2', 'react 19 features'),
+      ...upstreamTextBlock(4, 'Summary.'),
+      ...upstreamMessageEnd('tool_use'),
+    ],
+    activeMessagesWebSearchShimState(),
+    activeProvider(() => {
+      providerCalls += 1;
+      return Promise.resolve({ type: 'ok', results: [] });
+    }),
+  );
+
+  const blockIndexEvents = events.filter(event => event.type === 'content_block_start') as Array<Extract<MessagesStreamEventData, { type: 'content_block_start' }>>;
+  assertEquals(blockIndexEvents.map(event => event.index), [0, 1, 2, 3, 4, 5, 6]);
+  assertEquals(blockIndexEvents.map(event => event.content_block.type), [
+    'text',
+    'server_tool_use',
+    'web_search_tool_result',
+    'text',
+    'server_tool_use',
+    'web_search_tool_result',
+    'text',
+  ]);
+
+  assertEquals(providerCalls, 2);
+  const messageDelta = events.find(event => event.type === 'message_delta');
+  assertEquals(messageDelta?.type === 'message_delta' ? messageDelta.usage?.server_tool_use : undefined, { web_search_requests: 2 });
+});
+
+test('rewriteMessagesWebSearchEventsToNative surfaces unavailable when provider throws on second search', async () => {
+  let providerCalls = 0;
+  const events = await runStreamingShim(
+    [
+      upstreamMessageStart(),
+      ...upstreamWebSearchBlock(0, 'toolu_1', 'first'),
+      ...upstreamWebSearchBlock(1, 'toolu_2', 'second'),
+      ...upstreamMessageEnd('tool_use'),
+    ],
+    activeMessagesWebSearchShimState({ priorSearchUseCount: 0 }),
+    activeProvider(() => {
+      providerCalls += 1;
+      if (providerCalls === 2) return Promise.reject(new Error('boom'));
+      return Promise.resolve({ type: 'ok', results: [] });
+    }),
+  );
+
+  const resultBlocks = events.filter(event => event.type === 'content_block_start' && event.content_block.type === 'web_search_tool_result') as Array<Extract<MessagesStreamEventData, { type: 'content_block_start' }>>;
+  assertEquals(resultBlocks.length, 2);
+  const secondResult = resultBlocks[1].content_block as { content: unknown };
+  assertEquals(secondResult.content, { type: 'web_search_tool_result_error', error_code: 'unavailable' });
+
+  const messageDelta = events.find(event => event.type === 'message_delta');
+  assertEquals(messageDelta?.type === 'message_delta' ? messageDelta.usage?.server_tool_use : undefined, { web_search_requests: 2 });
+});
+
+test('rewriteMessagesWebSearchEventsToNative maps provider error result codes through', async () => {
+  const events = await runStreamingShim(
+    [
+      upstreamMessageStart(),
+      ...upstreamWebSearchBlock(0, 'toolu_1', 'first'),
+      ...upstreamMessageEnd('tool_use'),
+    ],
+    activeMessagesWebSearchShimState(),
+    activeProvider(fakeProviderError('too_many_requests')),
+  );
+
+  const resultBlock = events.find(event => event.type === 'content_block_start' && event.content_block.type === 'web_search_tool_result') as Extract<MessagesStreamEventData, { type: 'content_block_start' }> | undefined;
+  assertEquals((resultBlock?.content_block as { content: unknown }).content, { type: 'web_search_tool_result_error', error_code: 'too_many_requests' });
+});
+
+test('rewriteMessagesWebSearchEventsToNative emits max_uses_exceeded once limit is hit', async () => {
+  let providerCalls = 0;
+  const events = await runStreamingShim(
+    [
+      upstreamMessageStart(),
+      ...upstreamWebSearchBlock(0, 'toolu_1', 'first'),
+      ...upstreamWebSearchBlock(1, 'toolu_2', 'second'),
+      ...upstreamMessageEnd('tool_use'),
+    ],
+    activeMessagesWebSearchShimState({ maxUses: 1 }),
+    activeProvider(() => {
+      providerCalls += 1;
+      return Promise.resolve({ type: 'ok', results: [] });
+    }),
+  );
+
+  assertEquals(providerCalls, 1);
+  const resultBlocks = events.filter(event => event.type === 'content_block_start' && event.content_block.type === 'web_search_tool_result') as Array<Extract<MessagesStreamEventData, { type: 'content_block_start' }>>;
+  assertEquals(resultBlocks.length, 2);
+  assertEquals((resultBlocks[1].content_block as { content: unknown }).content, { type: 'web_search_tool_result_error', error_code: 'max_uses_exceeded' });
+
+  const messageDelta = events.find(event => event.type === 'message_delta');
+  assertEquals(messageDelta?.type === 'message_delta' ? messageDelta.usage?.server_tool_use : undefined, { web_search_requests: 1 });
+});
+
+test('rewriteMessagesWebSearchEventsToNative honours priorSearchUseCount when computing remaining budget', async () => {
+  let providerCalls = 0;
+  await runStreamingShim(
+    [
+      upstreamMessageStart(),
+      ...upstreamWebSearchBlock(0, 'toolu_1', 'first'),
+      ...upstreamMessageEnd('tool_use'),
+    ],
+    activeMessagesWebSearchShimState({ priorSearchUseCount: 1, maxUses: 2 }),
+    activeProvider(() => {
+      providerCalls += 1;
+      return Promise.resolve({ type: 'ok', results: [] });
+    }),
+  );
+
+  assertEquals(providerCalls, 1);
+});
+
+test('rewriteMessagesWebSearchEventsToNative routes blank query to invalid_tool_input without provider call', async () => {
+  let providerCalls = 0;
+  const events = await runStreamingShim(
+    [
+      upstreamMessageStart(),
+      ...upstreamWebSearchBlock(0, 'toolu_1', '   '),
+      ...upstreamMessageEnd('tool_use'),
+    ],
+    activeMessagesWebSearchShimState(),
+    activeProvider(() => {
+      providerCalls += 1;
+      return Promise.resolve({ type: 'ok', results: [] });
+    }),
+  );
+
+  assertEquals(providerCalls, 0);
+  const resultBlock = events.find(event => event.type === 'content_block_start' && event.content_block.type === 'web_search_tool_result') as Extract<MessagesStreamEventData, { type: 'content_block_start' }> | undefined;
+  assertEquals((resultBlock?.content_block as { content: unknown }).content, { type: 'web_search_tool_result_error', error_code: 'invalid_tool_input' });
+});
+
+test('rewriteMessagesWebSearchEventsToNative routes oversized query to query_too_long', async () => {
+  let providerCalls = 0;
+  const events = await runStreamingShim(
+    [
+      upstreamMessageStart(),
+      ...upstreamWebSearchBlock(0, 'toolu_1', 'x'.repeat(1001)),
+      ...upstreamMessageEnd('tool_use'),
+    ],
+    activeMessagesWebSearchShimState(),
+    activeProvider(() => {
+      providerCalls += 1;
+      return Promise.resolve({ type: 'ok', results: [] });
+    }),
+  );
+
+  assertEquals(providerCalls, 0);
+  const resultBlock = events.find(event => event.type === 'content_block_start' && event.content_block.type === 'web_search_tool_result') as Extract<MessagesStreamEventData, { type: 'content_block_start' }> | undefined;
+  assertEquals((resultBlock?.content_block as { content: unknown }).content, { type: 'web_search_tool_result_error', error_code: 'query_too_long' });
+});
+
+test('rewriteMessagesWebSearchEventsToNative routes malformed input json to invalid_tool_input', async () => {
+  let providerCalls = 0;
+  const events = await runStreamingShim(
+    [
+      upstreamMessageStart(),
+      ...upstreamWebSearchBlockRawJson(0, 'toolu_1', '{not json'),
+      ...upstreamMessageEnd('tool_use'),
+    ],
+    activeMessagesWebSearchShimState(),
+    activeProvider(() => {
+      providerCalls += 1;
+      return Promise.resolve({ type: 'ok', results: [] });
+    }),
+  );
+
+  assertEquals(providerCalls, 0);
+  const resultBlock = events.find(event => event.type === 'content_block_start' && event.content_block.type === 'web_search_tool_result') as Extract<MessagesStreamEventData, { type: 'content_block_start' }> | undefined;
+  assertEquals((resultBlock?.content_block as { content: unknown }).content, { type: 'web_search_tool_result_error', error_code: 'invalid_tool_input' });
+});
+
+test('rewriteMessagesWebSearchEventsToNative keeps client tool_use and reports tool_use stop_reason in mixed turn', async () => {
+  const events = await runStreamingShim(
+    [
+      upstreamMessageStart(),
+      ...upstreamWebSearchBlock(0, 'toolu_1', 'react 19'),
+      ...upstreamClientToolBlock(1, 'toolu_calc', 'calculator', { expression: '2+2' }),
+      ...upstreamMessageEnd('tool_use'),
+    ],
+    activeMessagesWebSearchShimState(),
+    activeProvider(fakeProviderOk),
+  );
+
+  const blockStarts = events.filter(event => event.type === 'content_block_start') as Array<Extract<MessagesStreamEventData, { type: 'content_block_start' }>>;
+  assertEquals(blockStarts.map(event => event.content_block.type), ['server_tool_use', 'web_search_tool_result', 'tool_use']);
+  assertEquals(blockStarts.map(event => event.index), [0, 1, 2]);
+
+  const messageDelta = events.find(event => event.type === 'message_delta');
+  assertEquals(messageDelta?.type === 'message_delta' ? messageDelta.delta.stop_reason : undefined, 'tool_use');
+});
+
+test('rewriteMessagesWebSearchEventsToNative rewrites citations carried by text_delta', async () => {
+  const events = await runStreamingShim(
+    [
+      upstreamMessageStart(),
+      {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'text', text: '' },
+      },
+      {
+        type: 'content_block_delta',
+        index: 0,
+        delta: {
+          type: 'text_delta',
+          text: 'cited',
+          citations: [
+            {
+              type: 'search_result_location',
+              url: 'https://react.dev',
+              title: 'React',
+              search_result_index: 0,
+              start_block_index: 0,
+              end_block_index: 0,
+            },
+          ],
+        },
+      },
+      { type: 'content_block_stop', index: 0 },
+      ...upstreamMessageEnd('end_turn'),
+    ],
+    {
+      mode: 'replay_only',
+      priorSearchUseCount: 0,
+      requestSearchResultOwnership: ['owned'],
+    },
+  );
+
+  const textDelta = events.find(event => event.type === 'content_block_delta' && event.delta.type === 'text_delta') as Extract<MessagesStreamEventData, { type: 'content_block_delta' }> | undefined;
+  assertEquals(textDelta?.delta.type === 'text_delta' ? textDelta.delta.citations?.[0]?.type : undefined, 'web_search_result_location');
+});
+
+test('rewriteMessagesWebSearchEventsToNative rewrites citations_delta entries', async () => {
+  const events = await runStreamingShim(
+    [
+      upstreamMessageStart(),
+      {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'text', text: '' },
+      },
+      {
+        type: 'content_block_delta',
+        index: 0,
+        delta: {
+          type: 'citations_delta',
+          citation: {
+            type: 'search_result_location',
+            url: 'https://react.dev',
+            title: 'React',
+            search_result_index: 0,
+            start_block_index: 0,
+            end_block_index: 0,
+          },
+        },
+      },
+      { type: 'content_block_stop', index: 0 },
+      ...upstreamMessageEnd('end_turn'),
+    ],
+    {
+      mode: 'replay_only',
+      priorSearchUseCount: 0,
+      requestSearchResultOwnership: ['owned'],
+    },
+  );
+
+  const citationsDelta = events.find(event => event.type === 'content_block_delta' && event.delta.type === 'citations_delta') as Extract<MessagesStreamEventData, { type: 'content_block_delta' }> | undefined;
+  assertEquals(citationsDelta?.delta.type === 'citations_delta' ? citationsDelta.delta.citation.type : undefined, 'web_search_result_location');
+});
+
+test('rewriteMessagesWebSearchEventsToNative rewrites pre-populated citations on content_block_start', async () => {
+  const events = await runStreamingShim(
+    [
+      upstreamMessageStart(),
+      {
+        type: 'content_block_start',
+        index: 0,
+        content_block: {
+          type: 'text',
+          text: '',
+          citations: [
+            {
+              type: 'search_result_location',
+              url: 'https://react.dev',
+              title: 'React',
+              search_result_index: 0,
+              start_block_index: 0,
+              end_block_index: 0,
+            },
+          ],
+        },
+      },
+      { type: 'content_block_stop', index: 0 },
+      ...upstreamMessageEnd('end_turn'),
+    ],
+    {
+      mode: 'replay_only',
+      priorSearchUseCount: 0,
+      requestSearchResultOwnership: ['owned'],
+    },
+  );
+
+  const blockStart = events.find(event => event.type === 'content_block_start') as Extract<MessagesStreamEventData, { type: 'content_block_start' }> | undefined;
+  assertEquals(blockStart?.content_block.type === 'text' ? blockStart.content_block.citations?.[0]?.type : undefined, 'web_search_result_location');
+});
+
+test('rewriteMessagesWebSearchEventsToNative leaves foreign citations untouched', async () => {
+  const events = await runStreamingShim(
+    [
+      upstreamMessageStart(),
+      {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'text', text: '' },
+      },
+      {
+        type: 'content_block_delta',
+        index: 0,
+        delta: {
+          type: 'citations_delta',
+          citation: {
+            type: 'search_result_location',
+            url: 'https://example.com',
+            title: 'Foreign',
+            search_result_index: 0,
+            start_block_index: 0,
+            end_block_index: 0,
+          },
+        },
+      },
+      { type: 'content_block_stop', index: 0 },
+      ...upstreamMessageEnd('end_turn'),
+    ],
+    {
+      mode: 'replay_only',
+      priorSearchUseCount: 0,
+      requestSearchResultOwnership: ['foreign'],
+    },
+  );
+
+  const citationsDelta = events.find(event => event.type === 'content_block_delta' && event.delta.type === 'citations_delta') as Extract<MessagesStreamEventData, { type: 'content_block_delta' }> | undefined;
+  assertEquals(citationsDelta?.delta.type === 'citations_delta' ? citationsDelta.delta.citation.type : undefined, 'search_result_location');
+});
+
+test('rewriteMessagesWebSearchEventsToNative replay-only mode forwards message_delta unchanged', async () => {
+  const events = await runStreamingShim(
+    [
+      upstreamMessageStart(),
+      ...upstreamTextBlock(0, 'plain text'),
+      {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn', stop_sequence: null },
+        usage: { output_tokens: 5 },
+      },
+      { type: 'message_stop' },
+    ],
+    {
+      mode: 'replay_only',
+      priorSearchUseCount: 0,
+      requestSearchResultOwnership: [],
+    },
+  );
+
+  const messageDelta = events.find(event => event.type === 'message_delta');
+  assertEquals(messageDelta?.type === 'message_delta' ? messageDelta.delta : undefined, { stop_reason: 'end_turn', stop_sequence: null });
+  assertEquals(messageDelta?.type === 'message_delta' ? messageDelta.usage : undefined, { output_tokens: 5 });
+});
+
+test('rewriteMessagesWebSearchEventsToNative forwards upstream error and returns without synthetic terminal', async () => {
+  const events = await runStreamingShim(
+    [
+      upstreamMessageStart(),
+      {
+        type: 'error',
+        error: { type: 'overloaded_error', message: 'upstream overloaded' },
+      },
+    ],
+    activeMessagesWebSearchShimState(),
+    activeProvider(fakeProviderOk),
+  );
+
+  assertEquals(events.map(event => event.type), ['message_start', 'error']);
+});
+
+test('rewriteMessagesWebSearchEventsToNative yields message_stop even when message_delta is missing', async () => {
+  const events = await runStreamingShim(
+    [
+      upstreamMessageStart(),
+      ...upstreamTextBlock(0, 'just text'),
+      { type: 'message_stop' },
+    ],
+    {
+      mode: 'replay_only',
+      priorSearchUseCount: 0,
+      requestSearchResultOwnership: [],
+    },
+  );
+
+  assertEquals(events[events.length - 1].type, 'message_stop');
+});
+
+test('rewriteMessagesWebSearchEventsToNative throws when upstream interleaves content blocks', async () => {
+  await assertRejects(
+    () =>
+      runStreamingShim(
+        [
+          upstreamMessageStart(),
+          {
+            type: 'content_block_start',
+            index: 0,
+            content_block: { type: 'text', text: '' },
+          },
+          {
+            type: 'content_block_start',
+            index: 1,
+            content_block: { type: 'text', text: '' },
+          },
+        ],
+        {
+          mode: 'replay_only',
+          priorSearchUseCount: 0,
+          requestSearchResultOwnership: [],
+        },
+      ),
+    Error,
+    'interleaved content blocks',
+  );
+});
+
+test('rewriteMessagesWebSearchEventsToNative requires a provider when mode is active', async () => {
+  await assertRejects(
+    () =>
+      runStreamingShim(
+        [upstreamMessageStart(), ...upstreamMessageEnd('end_turn')],
+        activeMessagesWebSearchShimState(),
+      ),
+    Error,
+    'Active messages web-search rewrite requires a provider.',
+  );
 });

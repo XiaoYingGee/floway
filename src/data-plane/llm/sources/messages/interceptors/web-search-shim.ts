@@ -5,7 +5,6 @@ import type {
   MessagesMessage,
   MessagesNativeWebSearchTool,
   MessagesPayload,
-  MessagesResponse,
   MessagesSearchResultBlock,
   MessagesStreamEventData,
   MessagesTextBlock,
@@ -24,9 +23,7 @@ import type { WebSearchProviderName, WebSearchProviderRequest, WebSearchProvider
 import type { MessagesInterceptor } from '../../../interceptors.ts';
 import { toInternalDebugError } from '../../../shared/errors/internal-debug-error.ts';
 import { internalErrorResult } from '../../../shared/errors/result.ts';
-import { messagesResultToEvents } from '../../../shared/protocol/messages.ts';
-import { type ProtocolFrame } from '../../../shared/stream/types.ts';
-import { collectMessagesProtocolEventsToResponse } from '../events/to-response.ts';
+import { eventFrame, type ProtocolFrame } from '../../../shared/stream/types.ts';
 
 const MAX_QUERY_LENGTH = 1000;
 const WEB_SEARCH_TOOL_NAME = 'web_search';
@@ -648,105 +645,283 @@ const searchWithActiveMessagesWebSearchProvider = (provider: ActiveMessagesWebSe
         request,
       });
 
-export const rewriteMessagesWebSearchResponseToNative = async (
-  response: MessagesResponse,
+// Per-block sub-state captured while walking upstream content blocks. Messages
+// SSE serializes blocks (no interleaving), so a single ActiveBlock at a time is
+// sufficient; an interleaving upstream is treated as a protocol violation.
+type ActiveBlock =
+  | { kind: 'passthrough'; downstreamIndex: number }
+  | { kind: 'text'; downstreamIndex: number }
+  | {
+    kind: 'web-search-tool-use';
+    upstreamToolUseId: string;
+    serverToolUseIndex: number;
+    resultIndex: number;
+    inputJson: string;
+  };
+
+interface ShimStreamingState {
+  downstreamIndexOffset: number;
+  currentSearchUseCount: number;
+  executedSearchCount: number;
+  interceptedSearches: number;
+  hasRemainingClientToolUse: boolean;
+}
+
+const isNativeWebSearchToolUseStart = (event: MessagesStreamEventData, state: MessagesWebSearchShimState): boolean =>
+  state.mode === 'active' && event.type === 'content_block_start' && event.content_block.type === 'tool_use' && event.content_block.name === WEB_SEARCH_TOOL_NAME;
+
+const rewriteContentBlockStartCitations = (
+  event: Extract<MessagesStreamEventData, { type: 'content_block_start' }>,
+  state: MessagesWebSearchShimState,
+): Extract<MessagesStreamEventData, { type: 'content_block_start' }> => {
+  if (event.content_block.type !== 'text' || !event.content_block.citations?.length) {
+    return event;
+  }
+
+  return {
+    ...event,
+    content_block: {
+      ...event.content_block,
+      citations: event.content_block.citations.map(citation => rewriteResponseCitationToNative(citation, state)),
+    },
+  };
+};
+
+const rewriteContentBlockDeltaCitations = (
+  event: Extract<MessagesStreamEventData, { type: 'content_block_delta' }>,
+  state: MessagesWebSearchShimState,
+): Extract<MessagesStreamEventData, { type: 'content_block_delta' }> => {
+  if (event.delta.type === 'text_delta' && event.delta.citations?.length) {
+    return {
+      ...event,
+      delta: {
+        ...event.delta,
+        citations: event.delta.citations.map(citation => rewriteResponseCitationToNative(citation, state)),
+      },
+    };
+  }
+
+  if (event.delta.type === 'citations_delta') {
+    return {
+      ...event,
+      delta: {
+        type: 'citations_delta',
+        citation: rewriteResponseCitationToNative(event.delta.citation, state),
+      },
+    };
+  }
+
+  return event;
+};
+
+// Synthesised events use the canonical Messages SSE shape for `server_tool_use`
+// and `web_search_tool_result` blocks (input baked into the start event, no
+// `input_json_delta`) so downstream clients see the same bytes Anthropic would
+// emit for native server tools.
+const runWebSearchStopHandler = async function* (
+  block: Extract<ActiveBlock, { kind: 'web-search-tool-use' }>,
+  shimState: ShimStreamingState,
+  state: Extract<MessagesWebSearchShimState, { mode: 'active' }>,
+  provider: ActiveMessagesWebSearchProvider,
+): AsyncGenerator<ProtocolFrame<MessagesStreamEventData>> {
+  const parsedInput = (() => {
+    if (block.inputJson === '') return null;
+    try {
+      const parsed = JSON.parse(block.inputJson);
+      return isRecord(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  })();
+
+  const query = parsedInput ? normalizeWebSearchQuery(parsedInput) : null;
+
+  shimState.interceptedSearches += 1;
+
+  yield eventFrame({
+    type: 'content_block_start',
+    index: block.serverToolUseIndex,
+    content_block: buildNativeWebSearchServerToolUseBlock(block.upstreamToolUseId, query ?? ''),
+  });
+  yield eventFrame({ type: 'content_block_stop', index: block.serverToolUseIndex });
+
+  const resultBlock = await (async () => {
+    if (state.maxUses !== undefined && shimState.currentSearchUseCount >= state.maxUses) {
+      return buildNativeWebSearchErrorResultBlock(block.upstreamToolUseId, 'max_uses_exceeded');
+    }
+
+    if (!query || query.length === 0) {
+      return buildNativeWebSearchErrorResultBlock(block.upstreamToolUseId, 'invalid_tool_input');
+    }
+
+    if (query.length > MAX_QUERY_LENGTH) {
+      return buildNativeWebSearchErrorResultBlock(block.upstreamToolUseId, 'query_too_long');
+    }
+
+    shimState.executedSearchCount += 1;
+    shimState.currentSearchUseCount += 1;
+
+    try {
+      const providerResult = await searchWithActiveMessagesWebSearchProvider(provider, {
+        query,
+        allowedDomains: state.allowedDomains,
+        blockedDomains: state.blockedDomains,
+        userLocation: state.userLocation,
+      });
+      return buildNativeWebSearchResultBlockFromProviderResult(providerResult, block.upstreamToolUseId);
+    } catch {
+      // TODO: Add gateway-side recent web-search error-log storage so operators can inspect detailed provider/runtime failures even though the client-visible native error intentionally collapses them to `unavailable`.
+      return buildNativeWebSearchErrorResultBlock(block.upstreamToolUseId, 'unavailable');
+    }
+  })();
+
+  yield eventFrame({
+    type: 'content_block_start',
+    index: block.resultIndex,
+    content_block: {
+      type: 'web_search_tool_result',
+      tool_use_id: resultBlock.tool_use_id,
+      content: resultBlock.content,
+    },
+  });
+  yield eventFrame({ type: 'content_block_stop', index: block.resultIndex });
+
+  shimState.downstreamIndexOffset += 1;
+};
+
+export const rewriteMessagesWebSearchEventsToNative = async function* (
+  frames: AsyncIterable<ProtocolFrame<MessagesStreamEventData>>,
   state: MessagesWebSearchShimState,
   provider?: ActiveMessagesWebSearchProvider,
-): Promise<MessagesResponse> => {
+): AsyncGenerator<ProtocolFrame<MessagesStreamEventData>> {
   if (state.mode === 'inactive') {
-    return response;
+    yield* frames;
+    return;
   }
 
   if (state.mode === 'active' && !provider) {
     throw new Error('Active messages web-search rewrite requires a provider.');
   }
 
-  let executedSearchCount = 0;
-  let interceptedSearches = 0;
-  let hasRemainingClientToolUse = false;
-  let currentSearchUseCount = state.priorSearchUseCount;
-  const rewrittenContent: MessagesAssistantContentBlock[] = [];
-
-  for (const block of response.content) {
-    if (block.type === 'text') {
-      rewrittenContent.push(mapTextBlockCitations(block, citation => rewriteResponseCitationToNative(citation, state)));
-      continue;
-    }
-
-    if (state.mode !== 'active' || block.type !== 'tool_use' || block.name !== WEB_SEARCH_TOOL_NAME) {
-      if (block.type === 'tool_use') {
-        hasRemainingClientToolUse = true;
-      }
-      rewrittenContent.push(block);
-      continue;
-    }
-
-    interceptedSearches += 1;
-    const query = normalizeWebSearchQuery(block.input);
-    rewrittenContent.push(buildNativeWebSearchServerToolUseBlock(block.id, query ?? ''));
-
-    if (state.maxUses !== undefined && currentSearchUseCount >= state.maxUses) {
-      rewrittenContent.push(buildNativeWebSearchErrorResultBlock(block.id, 'max_uses_exceeded'));
-      continue;
-    }
-
-    if (!query || query.length === 0) {
-      rewrittenContent.push(buildNativeWebSearchErrorResultBlock(block.id, 'invalid_tool_input'));
-      continue;
-    }
-
-    if (query.length > MAX_QUERY_LENGTH) {
-      rewrittenContent.push(buildNativeWebSearchErrorResultBlock(block.id, 'query_too_long'));
-      continue;
-    }
-
-    executedSearchCount += 1;
-    currentSearchUseCount += 1;
-
-    try {
-      const providerResult = await searchWithActiveMessagesWebSearchProvider(provider!, {
-        query,
-        allowedDomains: state.allowedDomains,
-        blockedDomains: state.blockedDomains,
-        userLocation: state.userLocation,
-      });
-
-      rewrittenContent.push(buildNativeWebSearchResultBlockFromProviderResult(providerResult, block.id));
-    } catch {
-      // TODO: Add gateway-side recent web-search error-log storage so operators can inspect detailed provider/runtime failures even though the client-visible native error intentionally collapses them to `unavailable`.
-      rewrittenContent.push(buildNativeWebSearchErrorResultBlock(block.id, 'unavailable'));
-    }
-  }
-
-  return {
-    ...response,
-    content: rewrittenContent,
-    stop_reason: interceptedSearches === 0 ? response.stop_reason : hasRemainingClientToolUse ? 'tool_use' : 'pause_turn',
-    usage:
-      executedSearchCount > 0
-        ? {
-            ...response.usage,
-            server_tool_use: {
-              web_search_requests: executedSearchCount,
-            },
-          }
-        : response.usage,
+  const shimState: ShimStreamingState = {
+    downstreamIndexOffset: 0,
+    currentSearchUseCount: state.priorSearchUseCount,
+    executedSearchCount: 0,
+    interceptedSearches: 0,
+    hasRemainingClientToolUse: false,
   };
-};
 
-export const collectAndRewriteMessagesWebSearchEventsToNative = async function* (
-  frames: AsyncIterable<ProtocolFrame<MessagesStreamEventData>>,
-  state: MessagesWebSearchShimState,
-  provider?: ActiveMessagesWebSearchProvider,
-): AsyncGenerator<ProtocolFrame<MessagesStreamEventData>> {
-  // Native-looking web_search replay is order-sensitive: we may need to
-  // execute multiple searches, inject result blocks, and then rewrite later
-  // text citations against the final search-result ordering. That forces us
-  // to buffer the whole upstream Messages stream here and trade first-byte
-  // latency for a single coherent rewritten response.
-  const response = await collectMessagesProtocolEventsToResponse(frames);
-  const rewritten = await rewriteMessagesWebSearchResponseToNative(response, state, provider);
-  yield* messagesResultToEvents(rewritten);
+  let activeBlock: ActiveBlock | undefined;
+
+  for await (const frame of frames) {
+    if (frame.type === 'done') {
+      yield frame;
+      continue;
+    }
+
+    const event = frame.event;
+
+    if (event.type === 'content_block_start') {
+      if (activeBlock !== undefined) {
+        throw new Error('upstream Messages SSE interleaved content blocks; web-search shim cannot renumber.');
+      }
+
+      const downstreamBase = event.index + shimState.downstreamIndexOffset;
+
+      if (isNativeWebSearchToolUseStart(event, state) && event.content_block.type === 'tool_use') {
+        activeBlock = {
+          kind: 'web-search-tool-use',
+          upstreamToolUseId: event.content_block.id,
+          serverToolUseIndex: downstreamBase,
+          resultIndex: downstreamBase + 1,
+          inputJson: '',
+        };
+        continue;
+      }
+
+      if (event.content_block.type === 'text') {
+        activeBlock = { kind: 'text', downstreamIndex: downstreamBase };
+        yield eventFrame({ ...rewriteContentBlockStartCitations(event, state), index: downstreamBase });
+        continue;
+      }
+
+      if (event.content_block.type === 'tool_use') {
+        shimState.hasRemainingClientToolUse = true;
+      }
+
+      activeBlock = { kind: 'passthrough', downstreamIndex: downstreamBase };
+      yield eventFrame({ ...event, index: downstreamBase });
+      continue;
+    }
+
+    if (event.type === 'content_block_delta') {
+      if (activeBlock === undefined) {
+        throw new Error('upstream Messages SSE emitted content_block_delta without an open block.');
+      }
+
+      if (activeBlock.kind === 'web-search-tool-use') {
+        if (event.delta.type === 'input_json_delta') {
+          activeBlock = { ...activeBlock, inputJson: activeBlock.inputJson + event.delta.partial_json };
+        }
+        continue;
+      }
+
+      if (activeBlock.kind === 'text') {
+        yield eventFrame({ ...rewriteContentBlockDeltaCitations(event, state), index: activeBlock.downstreamIndex });
+        continue;
+      }
+
+      yield eventFrame({ ...event, index: activeBlock.downstreamIndex });
+      continue;
+    }
+
+    if (event.type === 'content_block_stop') {
+      if (activeBlock === undefined) {
+        throw new Error('upstream Messages SSE emitted content_block_stop without an open block.');
+      }
+
+      if (activeBlock.kind === 'web-search-tool-use') {
+        if (state.mode !== 'active') {
+          throw new Error('web-search shim entered intercept path without active state.');
+        }
+
+        yield* runWebSearchStopHandler(activeBlock, shimState, state, provider!);
+        activeBlock = undefined;
+        continue;
+      }
+
+      yield eventFrame({ type: 'content_block_stop', index: activeBlock.downstreamIndex });
+      activeBlock = undefined;
+      continue;
+    }
+
+    // Inject `usage.server_tool_use.web_search_requests` and flip `stop_reason`
+    // so the downstream view matches what an upstream with native web_search
+    // (Anthropic's own) would have produced.
+    if (event.type === 'message_delta') {
+      const interceptedAny = shimState.interceptedSearches > 0;
+      const baseUsage = event.usage ?? { output_tokens: 0 };
+      const newUsage = shimState.executedSearchCount > 0
+        ? { ...baseUsage, server_tool_use: { web_search_requests: shimState.executedSearchCount } }
+        : baseUsage;
+
+      yield eventFrame({
+        type: 'message_delta',
+        delta: interceptedAny
+          ? { ...event.delta, stop_reason: shimState.hasRemainingClientToolUse ? 'tool_use' : 'pause_turn' }
+          : event.delta,
+        usage: newUsage,
+      });
+      continue;
+    }
+
+    if (event.type === 'error') {
+      yield frame;
+      return;
+    }
+
+    yield frame;
+  }
 };
 
 const buildSyntheticInvalidRequestUpstreamError = (message: string) => ({
@@ -825,7 +1000,7 @@ export const withMessagesWebSearchShim: MessagesInterceptor = async (ctx, run) =
 
   return {
     ...result,
-    events: collectAndRewriteMessagesWebSearchEventsToNative(result.events, prepared.state, provider.provider),
+    events: rewriteMessagesWebSearchEventsToNative(result.events, prepared.state, provider.provider),
   };
 };
 
