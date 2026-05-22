@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "db:migrate": "wrangler d1 migrations apply copilot-db",
+    "db:migrate": "wrangler d1 migrations apply $(node -p \"require('jsonc-parser').parse(require('fs').readFileSync('wrangler.jsonc','utf8')).d1_databases[0].database_name\")",
     "lint": "eslint --cache .",
     "lint:fix": "eslint --cache . --fix",
     "test": "vitest run",
@@ -25,6 +25,7 @@
     "eslint-import-resolver-typescript": "4.4.4",
     "eslint-plugin-import": "2.32.0",
     "jiti": "2.6.1",
+    "jsonc-parser": "^3.3.1",
     "sql.js": "^1.14.1",
     "typescript": "^5.9.3",
     "vitest": "4.0.18",

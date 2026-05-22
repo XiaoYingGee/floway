@@ -388,3 +388,93 @@ For Copilot-specific quirks, compare nearby Copilot gateway implementations
 before inventing a new policy. For generic adapter behavior, compare at least
 one Copilot gateway and one general LLM gateway. Do not cargo-cult behavior from
 a single project.
+
+## Deployment
+
+A production deploy can disconnect the agent that triggers it, especially when
+the deploy includes a D1 migration and the live schema briefly does not match
+the code that the same agent is still running against. That window is hard to
+avoid, so every production deploy must be a deliberate, announced step.
+
+Always tell the user before you deploy. If the user already asked for the
+deploy up front, you do not have to re-ask for confirmation, but you still
+explicitly announce that the deploy is starting. Beyond that single up-front
+announcement, the whole flow proceeds autonomously — no further user
+confirmation between steps.
+
+Use the three-step workflow below for every production deploy. Substitute
+`<WORKER_NAME>` (the top-level `name`) and `<DB_NAME>` (the D1 binding's
+`database_name`) from `wrangler.jsonc` wherever those placeholders appear in
+the commands.
+
+**Step 1 — gather current state.** Read `wrangler.jsonc` to learn
+`<WORKER_NAME>` and `<DB_NAME>`, then run a single chained shell command that
+reports the currently active Worker version and the D1 migration diff:
+
+```bash
+pnpm wrangler deployments list \
+  && pnpm wrangler d1 migrations list <DB_NAME> --remote
+```
+
+`deployments list` shows recent deployments for `<WORKER_NAME>` with their
+version ids and marks the currently active one — that gives both the active
+deployment timestamp and the version id you would later roll back to.
+`d1 migrations list --remote` prints applied migrations and the pending
+migrations this deploy would apply, i.e. the diff between the live database
+version and the target.
+
+**Step 2 — report findings and stage the rollback.** Tell the user what Step 1
+returned: the active version id, the active deployment timestamp, the latest
+applied migration, and the migrations this deploy will apply (or that there
+are none).
+
+If migrations are pending, take an explicit D1 backup to a temp file outside
+the repo so the working tree stays clean:
+
+```bash
+pnpm wrangler d1 export <DB_NAME> --remote \
+  --output "${TMPDIR:-/tmp}/<DB_NAME>-$(date -u +%Y%m%dT%H%M%SZ).sql"
+```
+
+Report the resolved backup path to the user, then give them two rollback
+commands, in this order:
+
+- Restore the database from that dump, e.g. `pnpm wrangler d1 execute <DB_NAME>
+  --remote --file <backup-path>` (drop the migrated tables first if the dump's
+  `CREATE`s would collide), or `pnpm wrangler d1 time-travel restore <DB_NAME>
+  --bookmark <bookmark>` if a pre-deploy bookmark was captured.
+- Roll back the Worker code to the previous active version id from Step 1:
+  `pnpm wrangler rollback <PREVIOUS_VERSION_ID>`.
+
+If no migrations are pending, skip the backup and the database-rollback
+command. Give the user only the code-rollback command and proceed straight to
+Step 3.
+
+**Step 3 — deploy with one chained shell command.** Migrate (when needed) and
+publish the new code in the same command so the system spends as little time
+as possible in an inconsistent state:
+
+```bash
+pnpm run db:migrate && pnpm run deploy
+```
+
+Print this exact command to the user before running it, and tell them that if
+the deploy stops halfway they can rerun the same command to recover —
+`wrangler d1 migrations apply` is idempotent on already-applied migrations and
+`wrangler deploy` always publishes the current code regardless of prior state.
+When there are no pending migrations, the command reduces to `pnpm run
+deploy`.
+
+Worker rollback by version id is supported (`pnpm wrangler rollback
+<VERSION_ID>`) across the 100 most recent versions, but Cloudflare blocks
+rollback when intervening deployments changed Durable Object migrations or
+removed referenced KV/R2/Queue bindings. This Worker only binds D1, so plain
+code rollback is currently safe; D1 state is rolled back separately as
+described above.
+
+A complete deploy fits in a strict turn budget: **three agent turns when
+migrations are pending** (Step 1 = gather, Step 2 = backup + report + two
+rollback commands, Step 3 = deploy) and **two agent turns when no migrations
+are pending** (Step 2 has no backup work, so it collapses into the gather
+turn: Turn 1 = gather + report + single code-rollback command, Turn 2 =
+deploy). Do not insert extra turns to ask for confirmation along the way.

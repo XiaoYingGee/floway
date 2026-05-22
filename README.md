@@ -65,10 +65,11 @@ cd copilot-gateway
 # Install dependencies
 pnpm install
 
-# Create the D1 database
-pnpm wrangler d1 create copilot-db
+# Create the D1 database (pick a name; record it as database_name in wrangler.jsonc)
+pnpm wrangler d1 create <DB_NAME>
 
-# Update wrangler.jsonc with your account_id and database_id, then apply migrations
+# Update wrangler.jsonc with your account_id, database_id, and database_name,
+# then apply migrations
 pnpm run db:migrate
 
 # Set the admin key as a secret
