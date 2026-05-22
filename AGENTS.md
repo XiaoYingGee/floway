@@ -153,6 +153,7 @@ Provider API shape:
 
 ```text
 getProvidedModels() -> UpstreamModel[]
+getPricingForModelKey(modelKey) -> ModelPricing | null
 callChatCompletions(upstreamModel, bodyWithoutModel, signal?)
 callResponses(upstreamModel, bodyWithoutModel, signal?)
 callMessages(upstreamModel, bodyWithoutModel, signal?, anthropicBeta?)
@@ -198,6 +199,37 @@ work.
 
 Backoff is intentionally disabled for now. Control-plane status returns empty
 temporary-unavailability data until a provider-level backoff design lands.
+
+### Pricing
+
+`ModelMetadata.cost?: ModelPricing` carries optional per-model pricing in
+`{ input, output, cache_read?, cache_write? }` shape. Values are USD per
+million tokens. Field names and semantics follow the
+[sst/models.dev `Cost` schema](https://github.com/sst/models.dev/blob/main/packages/core/src/schema.ts);
+future fields (`reasoning`, `input_audio`, `output_audio`, tiered context)
+should reuse that schema's names.
+
+Each provider attaches pricing per upstream model and resolves
+`getPricingForModelKey(modelKey)` over its own internal model id space:
+
+- `copilot`: hardcoded table at
+  `src/data-plane/providers/copilot/pricing.ts`, keyed by the public model
+  name that survives Claude variant merging. `getPricingForModelKey` strips
+  Copilot raw-id variant suffixes (`-high`, `-xhigh`, `-1m`,
+  `-1m-internal`, trailing date) before lookup, mirroring migration 0009.
+- `azure`: per-deployment `cost` field on `AzureDeploymentConfig`,
+  validated as `input` + `output` paired and `cache_read` / `cache_write`
+  independently optional. `getPricingForModelKey` resolves by deployment
+  name.
+- `custom`: never priced. `getPricingForModelKey` always returns null;
+  `cost` is never attached to `UpstreamModel`.
+
+Public `/models` shapes (`/v1/models`, `/models`, `/v1beta/models`) and
+control-plane `/api/models` expose `cost` directly when present. Cost
+aggregation in `src/control-plane/token-usage/aggregate.ts` resolves
+pricing by `(upstream, modelKey)` through the provider registry; NULL
+upstream or unresolved modelKey contributes 0 to cost, matching the
+pre-refactor "no rule matched" behaviour.
 
 ## Data Plane
 

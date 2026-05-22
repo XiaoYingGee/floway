@@ -17,6 +17,7 @@ const collect = async <T>(events: AsyncIterable<T>): Promise<T[]> => {
 
 const stubProvider = (): ModelProvider => ({
   getProvidedModels: () => Promise.resolve([]),
+  getPricingForModelKey: () => null,
   callChatCompletions: () => Promise.reject(new Error('unexpected call')),
   callResponses: () => Promise.reject(new Error('unexpected call')),
   callMessages: () => Promise.reject(new Error('unexpected call')),
@@ -41,7 +42,7 @@ const stubUpstreamModel = (): UpstreamModel => ({
 const testTelemetryModelIdentity: TelemetryModelIdentity = {
   model: 'test-model',
   upstream: 'test-upstream',
-  modelKey: 'test-model-key',
+  modelKey: 'test-model-key', cost: null,
 };
 
 const makeCtx = (

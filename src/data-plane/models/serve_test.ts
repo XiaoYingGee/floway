@@ -205,6 +205,7 @@ test('/models returns Anthropic-shaped model list', async () => {
             id: 'claude-opus-4-7',
             type: 'model',
             display_name: 'Claude Opus 4.7 XHigh',
+            cost: { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
           },
         ],
         has_more: false,

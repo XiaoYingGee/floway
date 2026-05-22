@@ -18,6 +18,7 @@ import type {
   UsageRecord,
   UsageRepo,
 } from './types.ts';
+import type { ModelPricing } from '../data-plane/providers/types.ts';
 import { latencyBucketForMs } from '../shared/performance-histogram.ts';
 import { assertWebSearchProviderName } from '../shared/web-search-providers.ts';
 
@@ -110,87 +111,25 @@ function toApiKey(row: { id: string; name: string; key: string; created_at: stri
   };
 }
 
+const USAGE_COLUMNS = 'key_id, model, upstream, model_key, hour, requests, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_json';
+
+const usageCostJson = (cost: UsageRecord['cost']): string | null => (cost ? JSON.stringify(cost) : null);
+
 class D1UsageRepo implements UsageRepo {
   constructor(private db: D1Database) {}
 
-  async record(
-    keyId: string,
-    model: string,
-    upstream: string | null,
-    modelKey: string,
-    hour: string,
-    requests: number,
-    inputTokens: number,
-    outputTokens: number,
-    cacheReadTokens = 0,
-    cacheCreationTokens = 0,
-  ): Promise<void> {
+  async record(record: UsageRecord): Promise<void> {
+    const normalized = normalizeUsageRecord(record);
     await this.db
       .prepare(
-        `INSERT INTO usage (key_id, model, upstream, model_key, hour, requests, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO usage (${USAGE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT DO UPDATE SET
            requests = requests + excluded.requests,
            input_tokens = input_tokens + excluded.input_tokens,
            output_tokens = output_tokens + excluded.output_tokens,
            cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
-           cache_creation_tokens = cache_creation_tokens + excluded.cache_creation_tokens`,
-      )
-      .bind(keyId, model, upstream, modelKey, hour, requests, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens)
-      .run();
-  }
-
-  async query(opts: { keyId?: string; start: string; end: string }): Promise<UsageRecord[]> {
-    const sql = opts.keyId
-      ? 'SELECT key_id, model, upstream, model_key, hour, requests, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens FROM usage WHERE key_id = ? AND hour >= ? AND hour < ? ORDER BY hour'
-      : 'SELECT key_id, model, upstream, model_key, hour, requests, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens FROM usage WHERE hour >= ? AND hour < ? ORDER BY hour';
-    const binds = opts.keyId ? [opts.keyId, opts.start, opts.end] : [opts.start, opts.end];
-    const { results } = await this.db
-      .prepare(sql)
-      .bind(...binds)
-      .all<{
-      key_id: string;
-      model: string;
-      upstream: string | null;
-      model_key: string;
-      hour: string;
-      requests: number;
-      input_tokens: number;
-      output_tokens: number;
-      cache_read_tokens: number;
-      cache_creation_tokens: number;
-    }>();
-    return results.map(toUsageRecord);
-  }
-
-  async listAll(): Promise<UsageRecord[]> {
-    const { results } = await this.db
-      .prepare('SELECT key_id, model, upstream, model_key, hour, requests, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens FROM usage ORDER BY hour')
-      .all<{
-      key_id: string;
-      model: string;
-      upstream: string | null;
-      model_key: string;
-      hour: string;
-      requests: number;
-      input_tokens: number;
-      output_tokens: number;
-      cache_read_tokens: number;
-      cache_creation_tokens: number;
-    }>();
-    return results.map(toUsageRecord);
-  }
-
-  async set(record: UsageRecord): Promise<void> {
-    const normalized = normalizeUsageRecord(record);
-    await this.db
-      .prepare(
-        `INSERT INTO usage (key_id, model, upstream, model_key, hour, requests, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT DO UPDATE SET
-           requests = excluded.requests,
-           input_tokens = excluded.input_tokens,
-           output_tokens = excluded.output_tokens,
-           cache_read_tokens = excluded.cache_read_tokens,
-           cache_creation_tokens = excluded.cache_creation_tokens`,
+           cache_creation_tokens = cache_creation_tokens + excluded.cache_creation_tokens,
+           cost_json = COALESCE(cost_json, excluded.cost_json)`,
       )
       .bind(
         normalized.keyId,
@@ -203,6 +142,53 @@ class D1UsageRepo implements UsageRepo {
         normalized.outputTokens,
         normalized.cacheReadTokens ?? 0,
         normalized.cacheCreationTokens ?? 0,
+        usageCostJson(normalized.cost),
+      )
+      .run();
+  }
+
+  async query(opts: { keyId?: string; start: string; end: string }): Promise<UsageRecord[]> {
+    const sql = opts.keyId
+      ? `SELECT ${USAGE_COLUMNS} FROM usage WHERE key_id = ? AND hour >= ? AND hour < ? ORDER BY hour`
+      : `SELECT ${USAGE_COLUMNS} FROM usage WHERE hour >= ? AND hour < ? ORDER BY hour`;
+    const binds = opts.keyId ? [opts.keyId, opts.start, opts.end] : [opts.start, opts.end];
+    const { results } = await this.db
+      .prepare(sql)
+      .bind(...binds)
+      .all<UsageRow>();
+    return results.map(toUsageRecord);
+  }
+
+  async listAll(): Promise<UsageRecord[]> {
+    const { results } = await this.db.prepare(`SELECT ${USAGE_COLUMNS} FROM usage ORDER BY hour`).all<UsageRow>();
+    return results.map(toUsageRecord);
+  }
+
+  async set(record: UsageRecord): Promise<void> {
+    const normalized = normalizeUsageRecord(record);
+    await this.db
+      .prepare(
+        `INSERT INTO usage (${USAGE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT DO UPDATE SET
+           requests = excluded.requests,
+           input_tokens = excluded.input_tokens,
+           output_tokens = excluded.output_tokens,
+           cache_read_tokens = excluded.cache_read_tokens,
+           cache_creation_tokens = excluded.cache_creation_tokens,
+           cost_json = excluded.cost_json`,
+      )
+      .bind(
+        normalized.keyId,
+        normalized.model,
+        normalized.upstream,
+        normalized.modelKey,
+        normalized.hour,
+        normalized.requests,
+        normalized.inputTokens,
+        normalized.outputTokens,
+        normalized.cacheReadTokens ?? 0,
+        normalized.cacheCreationTokens ?? 0,
+        usageCostJson(normalized.cost),
       )
       .run();
   }
@@ -223,6 +209,7 @@ type UsageRow = {
   output_tokens: number;
   cache_read_tokens: number;
   cache_creation_tokens: number;
+  cost_json: string | null;
 };
 
 const normalizeUsageRecord = (record: UsageRecord): UsageRecord => ({
@@ -231,6 +218,17 @@ const normalizeUsageRecord = (record: UsageRecord): UsageRecord => ({
   cacheReadTokens: record.cacheReadTokens ?? 0,
   cacheCreationTokens: record.cacheCreationTokens ?? 0,
 });
+
+const parseUsageCost = (raw: string | null): UsageRecord['cost'] => {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<ModelPricing>;
+    if (typeof parsed.input !== 'number' || typeof parsed.output !== 'number') return null;
+    return parsed as ModelPricing;
+  } catch {
+    return null;
+  }
+};
 
 const toUsageRecord = (row: UsageRow): UsageRecord => ({
   keyId: row.key_id,
@@ -243,6 +241,7 @@ const toUsageRecord = (row: UsageRow): UsageRecord => ({
   outputTokens: row.output_tokens,
   cacheReadTokens: row.cache_read_tokens ?? 0,
   cacheCreationTokens: row.cache_creation_tokens ?? 0,
+  cost: parseUsageCost(row.cost_json),
 });
 
 class D1SearchUsageRepo implements SearchUsageRepo {

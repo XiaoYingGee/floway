@@ -1,7 +1,7 @@
 import type { Context } from 'hono';
 
 import { getCatalogModels } from '../providers/registry.ts';
-import type { CatalogModel } from '../providers/types.ts';
+import type { CatalogModel, ModelPricing } from '../providers/types.ts';
 import { ModelsFetchError, ModelsRequestError } from '../providers/upstream-model-cache.ts';
 
 type GeminiGenerationMethod = 'generateContent' | 'streamGenerateContent' | 'countTokens';
@@ -19,6 +19,7 @@ interface GeminiModel {
   maxTemperature?: number;
   topP?: number;
   topK?: number;
+  cost?: ModelPricing;
 }
 
 const toGeminiModel = (model: CatalogModel): GeminiModel => {
@@ -40,6 +41,7 @@ const toGeminiModel = (model: CatalogModel): GeminiModel => {
     temperature: 1,
     topP: 0.95,
     topK: 40,
+    ...(model.cost ? { cost: model.cost } : {}),
   };
 };
 

@@ -1048,6 +1048,31 @@ export function renderSettingsTab() {
                                   </div>
 
                                   <div class="mt-4">
+                                    <p class="mb-2 text-xs font-semibold text-gray-400">Pricing</p>
+                                    <div class="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+                                      <label class="min-w-0">
+                                        <span class="mb-1 block text-[11px] font-medium text-gray-500">Input ($/MTok)</span>
+                                        <input type="number" step="any" min="0" class="!py-2 !px-2.5 !text-[11px] font-mono" placeholder="e.g. 2.5" x-model="deployment.cost.input" />
+                                      </label>
+                                      <label class="min-w-0">
+                                        <span class="mb-1 block text-[11px] font-medium text-gray-500">Output ($/MTok)</span>
+                                        <input type="number" step="any" min="0" class="!py-2 !px-2.5 !text-[11px] font-mono" placeholder="e.g. 15" x-model="deployment.cost.output" />
+                                      </label>
+                                      <label class="min-w-0">
+                                        <span class="mb-1 block text-[11px] font-medium text-gray-500">Cache Read ($/MTok)</span>
+                                        <input type="number" step="any" min="0" class="!py-2 !px-2.5 !text-[11px] font-mono" placeholder="e.g. 0.25" x-model="deployment.cost.cache_read" />
+                                      </label>
+                                      <label class="min-w-0">
+                                        <span class="mb-1 block text-[11px] font-medium text-gray-500">Cache Write ($/MTok)</span>
+                                        <input type="number" step="any" min="0" class="!py-2 !px-2.5 !text-[11px] font-mono" placeholder="leave blank if not charged" x-model="deployment.cost.cache_write" />
+                                      </label>
+                                    </div>
+                                    <p class="mt-2 text-[11px] leading-relaxed text-gray-500">
+                                      Per-million-token USD rates. Leave all four blank to omit pricing. <span class="text-gray-400">Input</span> and <span class="text-gray-400">Output</span> must both be filled or both blank; <span class="text-gray-400">Cache Read</span> / <span class="text-gray-400">Cache Write</span> are independently optional.
+                                    </p>
+                                  </div>
+
+                                  <div class="mt-4">
                                     <p class="mb-2 text-xs font-semibold text-gray-400">Capabilities</p>
                                     <div class="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
                                       <template x-for="flag in ['tool_calls','parallel_tool_calls','streaming','vision','adaptive_thinking']" :key="flag">

@@ -115,7 +115,7 @@ const assertSourceKeepAlive = async <TEvent>(respond: (c: Context, events: Async
 const testTelemetryModelIdentity = {
   model: 'test-model',
   upstream: 'test-upstream',
-  modelKey: 'test-model-key',
+  modelKey: 'test-model-key', cost: null,
 };
 
 const requestStartedAt = performance.now();

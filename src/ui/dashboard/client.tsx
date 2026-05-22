@@ -385,6 +385,13 @@ export function dashboardAssets() {
                 reasoning_effort: '',
               },
             },
+            cost: {
+              input: '',
+              output: '',
+              cache_read: '',
+              cache_write: '',
+            },
+            costError: null,
           };
         }
 
@@ -430,6 +437,13 @@ export function dashboardAssets() {
                 reasoning_effort: optionalStringArrayForInput(supports.reasoning_effort),
               },
             },
+            cost: {
+              input: optionalNumberForInput((source.cost || {}).input),
+              output: optionalNumberForInput((source.cost || {}).output),
+              cache_read: optionalNumberForInput((source.cost || {}).cache_read),
+              cache_write: optionalNumberForInput((source.cost || {}).cache_write),
+            },
+            costError: null,
           };
         }
 
@@ -492,7 +506,31 @@ export function dashboardAssets() {
           if (Object.keys(supports).length > 0) capabilities.supports = supports;
           if (Object.keys(capabilities).length > 0) metadata.capabilities = capabilities;
 
+          const cost = azureDeploymentCostFromInputs(deployment.cost);
+          if (cost) metadata.cost = cost;
+
           return metadata;
+        }
+
+        function azureDeploymentCostFromInputs(costInputs) {
+          if (!costInputs) return undefined;
+          const input = trimmedOptionalNumber(costInputs.input, 'Pricing input');
+          const output = trimmedOptionalNumber(costInputs.output, 'Pricing output');
+          const cacheRead = trimmedOptionalNumber(costInputs.cache_read, 'Pricing cache read');
+          const cacheWrite = trimmedOptionalNumber(costInputs.cache_write, 'Pricing cache write');
+          if (input === undefined && output === undefined && cacheRead === undefined && cacheWrite === undefined) {
+            return undefined;
+          }
+          if (input === undefined || output === undefined) {
+            throw new Error('Pricing input and output must both be filled or both blank');
+          }
+          if (input < 0 || output < 0 || (cacheRead !== undefined && cacheRead < 0) || (cacheWrite !== undefined && cacheWrite < 0)) {
+            throw new Error('Pricing values must be non-negative');
+          }
+          const cost = { input, output };
+          if (cacheRead !== undefined) cost.cache_read = cacheRead;
+          if (cacheWrite !== undefined) cost.cache_write = cacheWrite;
+          return cost;
         }
 
         function azureDeploymentPayloadFromModal(deployment) {

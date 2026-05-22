@@ -67,8 +67,12 @@ export const createAzureProvider = (record: UpstreamRecord): ModelProviderInstan
           providerData: {
             deployment: deployment.deployment,
           } satisfies AzureProviderData,
+          ...(deployment.cost ? { cost: deployment.cost } : {}),
         };
       });
+    },
+    getPricingForModelKey(modelKey) {
+      return azure.config.deployments.find(deployment => deployment.deployment === modelKey)?.cost ?? null;
     },
     callChatCompletions: (model, body, signal) => call('chat_completions', model, body, signal),
     callResponses: (model, body, signal) => call('responses', model, body, signal),

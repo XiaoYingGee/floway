@@ -8,6 +8,7 @@ export const toPublicModelInfo = (model: CatalogModel): ModelInfo => {
     object: model.object,
     ...(model.owned_by !== undefined ? { owned_by: model.owned_by } : {}),
     ...(model.created !== undefined ? { created: model.created } : {}),
+    ...(model.cost ? { cost: model.cost } : {}),
   };
 };
 
@@ -18,6 +19,7 @@ export const toAnthropicModelInfo = (model: CatalogModel): AnthropicModelInfo =>
     type: 'model',
     display_name: model.display_name ?? model.name ?? model.id,
     ...(createdAt !== undefined ? { created_at: createdAt } : {}),
+    ...(model.cost ? { cost: model.cost } : {}),
   };
 };
 

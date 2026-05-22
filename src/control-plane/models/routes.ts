@@ -52,6 +52,7 @@ const toControlPlaneModelInfo = (model: ResolvedModel): ControlPlaneModelInfo =>
     supports_generation: model.supports_generation,
     provider: modelProvider(model),
     upstream_ids: [...new Set(model.providers.map(provider => provider.upstream))],
+    ...(model.cost ? { cost: model.cost } : {}),
   };
   if (model.billing) info.billing = model.billing;
   if (model.policy) info.policy = model.policy;

@@ -1,3 +1,4 @@
+import type { ModelPricing } from '../data-plane/providers/types.ts';
 import type { HistogramBucket } from '../shared/performance-histogram.ts';
 import type { WebSearchProviderName } from '../shared/web-search-providers.ts';
 
@@ -20,12 +21,20 @@ export interface UsageRecord {
   outputTokens: number;
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
+  // Pricing snapshot taken at write time. null means the provider did not
+  // resolve pricing for this model (Custom upstreams, unknown Copilot
+  // public id, etc.). Aggregation treats null as cost 0.
+  cost: ModelPricing | null;
 }
 
 export interface TelemetryModelIdentity {
   model: string;
   upstream: string;
   modelKey: string;
+  // Pricing snapshot resolved at request time by the provider that served
+  // the call. Travels alongside the identity end-to-end so telemetry writes
+  // never have to re-resolve. null when no pricing is configured.
+  cost: ModelPricing | null;
 }
 
 export interface TokenUsage {
@@ -81,20 +90,15 @@ export interface ApiKeyRepo {
 }
 
 export interface UsageRepo {
-  record(
-    keyId: string,
-    model: string,
-    upstream: string | null,
-    modelKey: string,
-    hour: string,
-    requests: number,
-    inputTokens: number,
-    outputTokens: number,
-    cacheReadTokens?: number,
-    cacheCreationTokens?: number,
-  ): Promise<void>;
+  // Additive upsert: on (keyId, model, upstream, modelKey, hour) conflict,
+  // token counts are summed. cost is COALESCED — the first write within a
+  // bucket establishes the pricing snapshot for that row, later writes that
+  // share the bucket keep the original snapshot.
+  record(record: UsageRecord): Promise<void>;
   query(opts: { keyId?: string; start: string; end: string }): Promise<UsageRecord[]>;
   listAll(): Promise<UsageRecord[]>;
+  // Replacement upsert (counts and cost both overwritten from the record).
+  // Used by import/restore flows.
   set(record: UsageRecord): Promise<void>;
   deleteAll(): Promise<void>;
 }

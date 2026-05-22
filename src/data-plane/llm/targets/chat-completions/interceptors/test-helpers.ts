@@ -20,6 +20,7 @@ export const stubUpstreamModel = (overrides: Partial<UpstreamModel> = {}): Upstr
 
 export const stubProvider = (overrides: Partial<ModelProvider> = {}): ModelProvider => ({
   getProvidedModels: () => Promise.resolve([]),
+  getPricingForModelKey: () => null,
   callChatCompletions: () => Promise.reject(new Error('stubProvider.callChatCompletions was called')),
   callResponses: () => Promise.reject(new Error('stubProvider.callResponses was called')),
   callMessages: () => Promise.reject(new Error('stubProvider.callMessages was called')),
@@ -31,7 +32,7 @@ export const stubProvider = (overrides: Partial<ModelProvider> = {}): ModelProvi
 export const testTelemetryModelIdentity: TelemetryModelIdentity = {
   model: 'test-model',
   upstream: 'test-upstream',
-  modelKey: 'test-model-key',
+  modelKey: 'test-model-key', cost: null,
 };
 
 export const chatCompletionsInvocation = (payload: ChatCompletionsPayload, enabledFixes: ReadonlySet<string> = new Set()): ChatCompletionsInvocation => ({

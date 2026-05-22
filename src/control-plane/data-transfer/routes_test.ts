@@ -101,6 +101,7 @@ const USAGE_1: UsageRecord = {
   outputTokens: 500,
   cacheReadTokens: 120,
   cacheCreationTokens: 80,
+  cost: null,
 };
 
 const USAGE_2: UsageRecord = {
@@ -114,6 +115,7 @@ const USAGE_2: UsageRecord = {
   outputTokens: 800,
   cacheReadTokens: 200,
   cacheCreationTokens: 50,
+  cost: null,
 };
 
 const SEARCH_USAGE_1: SearchUsageRecord = {

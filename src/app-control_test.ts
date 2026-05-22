@@ -205,6 +205,7 @@ test('/api/token-usage is visible to any authenticated user and includes all key
     outputTokens: 5,
     cacheReadTokens: 4,
     cacheCreationTokens: 1,
+    cost: null,
   });
   await repo.usage.set({
     keyId: 'key_other',
@@ -217,6 +218,7 @@ test('/api/token-usage is visible to any authenticated user and includes all key
     outputTokens: 8,
     cacheReadTokens: 6,
     cacheCreationTokens: 2,
+    cost: null,
   });
 
   const response = await requestApp('/api/token-usage?start=2026-03-15T00&end=2026-03-16T00', {
@@ -257,6 +259,7 @@ test('/api/token-usage can include all key metadata for stable dashboard color s
     requests: 1,
     inputTokens: 20,
     outputTokens: 8,
+    cost: null,
   });
 
   const response = await requestApp('/api/token-usage?start=2026-03-16T00&end=2026-03-17T00&include_key_metadata=1', {
@@ -309,16 +312,19 @@ test('/api/token-usage merges Claude variants into backend base model records', 
     ...shared,
     model: 'claude-opus-4-7',
     modelKey: 'claude-opus-4.7',
+    cost: null,
   });
   await repo.usage.set({
     ...shared,
     model: 'claude-opus-4-7',
     modelKey: 'claude-opus-4.7-xhigh',
+    cost: null,
   });
   await repo.usage.set({
     ...shared,
     model: 'claude-opus-4-7',
     modelKey: 'claude-opus-4.7-1m-internal',
+    cost: null,
   });
   await repo.usage.set({
     ...shared,
@@ -328,6 +334,7 @@ test('/api/token-usage merges Claude variants into backend base model records', 
     outputTokens: 4,
     cacheReadTokens: 0,
     cacheCreationTokens: 0,
+    cost: null,
   });
 
   const response = await requestApp('/api/token-usage?start=2026-03-17T00&end=2026-03-18T00', { headers: { 'x-api-key': apiKey.key } });

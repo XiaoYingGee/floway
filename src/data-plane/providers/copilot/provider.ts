@@ -3,6 +3,7 @@ import { responsesCopilotInterceptors } from './interceptors/responses/index.ts'
 import { mergeClaudeVariants } from './merge-claude-variants.ts';
 import { copilotPublicModelId, copilotRequestedModelAliasTarget } from './model-name.ts';
 import { hasContext1mBeta, type ModelSelectionHints, resolveCopilotRawModel } from './model-selection.ts';
+import { pricingForCopilotModelKey, pricingForCopilotPublicModelId } from './pricing.ts';
 import type { CopilotModelsResponse, CopilotRawModel } from './types.ts';
 import type { UpstreamRecord } from '../../../repo/types.ts';
 import { isCopilotAccountType, type CopilotAccountType } from '../../../shared/copilot.ts';
@@ -269,14 +270,17 @@ export const createCopilotProvider = async (record: UpstreamRecord): Promise<Mod
         const variants = groups.get(mergedModel.id) ?? [mergedModel];
         const endpoints = copilotModelEndpoints(mergedModel, variants);
         const model = withModelInfoDefaults(mergedModel);
+        const cost = pricingForCopilotPublicModelId(mergedModel.id);
         models.push({
           ...model,
           supportedEndpoints: endpoints,
           providerData: { rawModels: variants } satisfies CopilotProviderData,
+          ...(cost ? { cost } : {}),
         });
       }
       return models;
     },
+    getPricingForModelKey: pricingForCopilotModelKey,
     callChatCompletions: (model, body, signal) => {
       const rawModel = rawModelFor(model, 'chat_completions', {
         reasoningEffort: chatReasoningEffort(body),

@@ -193,6 +193,20 @@ const validateApiKeyIdentities = (records: readonly ApiKey[], existing: readonly
   return null;
 };
 
+const parseImportedCost = (value: unknown): UsageRecord['cost'] => {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'object' || Array.isArray(value)) return null;
+  const obj = value as Record<string, unknown>;
+  if (typeof obj.input !== 'number' || typeof obj.output !== 'number') return null;
+  const cost: { input: number; output: number; cache_read?: number; cache_write?: number } = {
+    input: obj.input,
+    output: obj.output,
+  };
+  if (typeof obj.cache_read === 'number') cost.cache_read = obj.cache_read;
+  if (typeof obj.cache_write === 'number') cost.cache_write = obj.cache_write;
+  return cost;
+};
+
 const parseUsageRecords = (value: unknown): { type: 'ok'; records: UsageRecord[] } | { type: 'invalid'; index: number; error: string } => {
   if (!Array.isArray(value)) return { type: 'invalid', index: -1, error: 'usage must be an array' };
 
@@ -232,6 +246,9 @@ const parseUsageRecords = (value: unknown): { type: 'ok'; records: UsageRecord[]
       outputTokens: record.outputTokens,
       ...(record.cacheReadTokens !== undefined ? { cacheReadTokens: record.cacheReadTokens } : {}),
       ...(record.cacheCreationTokens !== undefined ? { cacheCreationTokens: record.cacheCreationTokens } : {}),
+      // Imported payloads may omit cost (older exports) — null is the
+      // canonical "no pricing recorded" value; aggregation treats it as 0.
+      cost: parseImportedCost(record.cost),
     });
   }
 

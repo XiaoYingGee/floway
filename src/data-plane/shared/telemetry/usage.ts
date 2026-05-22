@@ -20,18 +20,19 @@ export const tokenUsageFromPromptTokenResponse = (value: unknown): TokenUsage | 
 
 export const recordTokenUsage = async (keyId: string, modelIdentity: TelemetryModelIdentity, usage: TokenUsage): Promise<void> => {
   await Promise.all([
-    getRepo().usage.record(
+    getRepo().usage.record({
       keyId,
-      modelIdentity.model,
-      modelIdentity.upstream,
-      modelIdentity.modelKey,
-      currentHour(),
-      1,
-      usage.inputTokens,
-      usage.outputTokens,
-      usage.cacheReadTokens,
-      usage.cacheCreationTokens,
-    ),
+      model: modelIdentity.model,
+      upstream: modelIdentity.upstream,
+      modelKey: modelIdentity.modelKey,
+      hour: currentHour(),
+      requests: 1,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheReadTokens: usage.cacheReadTokens,
+      cacheCreationTokens: usage.cacheCreationTokens,
+      cost: modelIdentity.cost,
+    }),
     (async () => {
       const key = await getRepo().apiKeys.getById(keyId);
       if (!key) return;

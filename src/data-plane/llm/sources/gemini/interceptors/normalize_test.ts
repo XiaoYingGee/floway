@@ -11,6 +11,7 @@ const testTelemetryModelIdentity = {
   model: 'test-model',
   upstream: 'test-upstream',
   modelKey: 'test-model-key',
+  cost: null,
 };
 
 const invocation = (payload: GeminiGenerateContentRequest): GeminiInvocation => ({

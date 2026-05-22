@@ -135,6 +135,7 @@ export const embeddings = async (c: Context): Promise<Response> => {
               model: modelId,
               upstream: binding.upstream,
               modelKey,
+              cost: binding.provider.getPricingForModelKey(modelKey),
             },
             usage,
           );

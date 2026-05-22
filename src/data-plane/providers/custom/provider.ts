@@ -58,6 +58,7 @@ export const createCustomProvider = (record: UpstreamRecord): ModelProviderInsta
       }
       return models;
     },
+    getPricingForModelKey: () => null,
     callChatCompletions: (model, body, signal) => call('chat_completions', model, body, signal),
     callResponses: (model, body, signal) => call('responses', model, body, signal),
     callMessages: (model, body, signal, anthropicBeta) => call('messages', model, body, signal, anthropicBeta && anthropicBeta.length > 0 ? { 'anthropic-beta': anthropicBeta.join(',') } : undefined),

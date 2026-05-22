@@ -21,7 +21,7 @@ const setup = (): TelemetryHarness => {
 const testTelemetryModelIdentity = {
   model: 'claude-test',
   upstream: 'copilot:1',
-  modelKey: 'claude-test-raw',
+  modelKey: 'claude-test-raw', cost: null,
 };
 
 const baseInvocation = (

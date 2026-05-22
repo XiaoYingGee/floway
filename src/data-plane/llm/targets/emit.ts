@@ -14,6 +14,7 @@ export const targetModelIdentity = (invocation: Invocation<unknown>, modelKey: s
   model: invocation.model,
   upstream: invocation.upstream,
   modelKey,
+  cost: invocation.provider.getPricingForModelKey(modelKey),
 });
 
 export const targetProviderResultToFrames = async (

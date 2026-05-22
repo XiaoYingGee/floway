@@ -1,5 +1,6 @@
 import { joinBaseAndPath } from './join.ts';
 import type { EndpointKey, Upstream, UpstreamFetchOptions } from './types.ts';
+import type { ModelPricing } from '../../data-plane/providers/types.ts';
 import type { UpstreamRecord } from '../../repo/types.ts';
 
 export interface AzureDeploymentConfig {
@@ -8,6 +9,7 @@ export interface AzureDeploymentConfig {
   supportedEndpoints: string[];
   display_name?: string;
   capabilities?: AzureDeploymentCapabilities;
+  cost?: ModelPricing;
 }
 
 export interface AzureDeploymentCapabilities {
@@ -188,14 +190,41 @@ const capabilitiesField = (value: unknown, field: string): AzureDeploymentCapabi
   };
 };
 
+const nonNegativeNumberField = (value: unknown, field: string): number => {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new Error(`Malformed azure upstream config: ${field} must be a finite non-negative number`);
+  }
+  return value;
+};
+
+const pricingField = (value: unknown, field: string): ModelPricing | undefined => {
+  const record = optionalMetadataRecord(value, field);
+  if (!record) return undefined;
+  if (record.input === undefined && record.output === undefined && record.cache_read === undefined && record.cache_write === undefined) {
+    return undefined;
+  }
+  if (record.input === undefined || record.output === undefined) {
+    throw new Error(`Malformed azure upstream config: ${field}.input and ${field}.output must both be set when ${field} is provided`);
+  }
+  const pricing: ModelPricing = {
+    input: nonNegativeNumberField(record.input, `${field}.input`),
+    output: nonNegativeNumberField(record.output, `${field}.output`),
+  };
+  if (record.cache_read !== undefined) pricing.cache_read = nonNegativeNumberField(record.cache_read, `${field}.cache_read`);
+  if (record.cache_write !== undefined) pricing.cache_write = nonNegativeNumberField(record.cache_write, `${field}.cache_write`);
+  return pricing;
+};
+
 const deploymentField = (value: unknown, index: number): AzureDeploymentConfig => {
   if (!isRecord(value)) throw new Error(`Malformed azure upstream config: deployments[${index}] must be an object`);
+  const pricing = pricingField(value.cost, `deployments[${index}].cost`);
   return {
     deployment: nonEmptyStringField(value.deployment, `deployments[${index}].deployment`),
     ...(value.publicModelId !== undefined ? { publicModelId: optionalStringField(value.publicModelId, `deployments[${index}].publicModelId`) } : {}),
     supportedEndpoints: supportedEndpointsField(value.supportedEndpoints, `deployments[${index}].supportedEndpoints`),
     ...(value.display_name !== undefined ? { display_name: optionalStringField(value.display_name, `deployments[${index}].display_name`) } : {}),
     ...(value.capabilities !== undefined ? { capabilities: capabilitiesField(value.capabilities, `deployments[${index}].capabilities`) } : {}),
+    ...(pricing ? { cost: pricing } : {}),
   };
 };
 

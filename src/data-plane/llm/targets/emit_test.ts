@@ -26,7 +26,7 @@ const baseRequest = (): RequestContext => ({
 const testTelemetryModelIdentity = {
   model: 'claude-test',
   upstream: 'copilot:1',
-  modelKey: 'claude-test-raw',
+  modelKey: 'claude-test-raw', cost: null,
 };
 
 test('targetProviderResultToFrames returns 502 with diagnostic context when upstream replies with non-SSE 200', async () => {

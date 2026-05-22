@@ -16,6 +16,7 @@ const testTelemetryModelIdentity = {
   model: 'test-model',
   upstream: 'test-upstream',
   modelKey: 'test-model-key',
+  cost: null,
 };
 const request = (): RequestContext => ({
   requestStartedAt: performance.now(),

@@ -391,3 +391,99 @@ test('createAzureUpstream validates Azure opaque config strictly', () => {
     'deployments[0].capabilities.supports.streaming must be a boolean',
   );
 });
+
+test('createAzureUpstream accepts deployment.cost with full pricing fields', () => {
+  const upstream = createAzureUpstream({
+    ...baseRecord,
+    config: {
+      ...(baseRecord.config as Record<string, unknown>),
+      deployments: [
+        {
+          deployment: 'gpt-prod',
+          supportedEndpoints: ['/chat/completions'],
+          cost: { input: 2.5, output: 15, cache_read: 0.25, cache_write: 3.75 },
+        },
+      ],
+    },
+  });
+  assertEquals(upstream.kind, 'azure');
+});
+
+test('createAzureUpstream accepts deployment without cost field', () => {
+  const upstream = createAzureUpstream({
+    ...baseRecord,
+    config: {
+      ...(baseRecord.config as Record<string, unknown>),
+      deployments: [
+        {
+          deployment: 'gpt-prod',
+          supportedEndpoints: ['/chat/completions'],
+        },
+      ],
+    },
+  });
+  assertEquals(upstream.kind, 'azure');
+});
+
+test('createAzureUpstream rejects deployment.cost with only input set', () => {
+  assertThrows(
+    () =>
+      createAzureUpstream({
+        ...baseRecord,
+        config: {
+          ...(baseRecord.config as Record<string, unknown>),
+          deployments: [
+            {
+              deployment: 'gpt-prod',
+              supportedEndpoints: ['/chat/completions'],
+              cost: { input: 2.5 },
+            },
+          ],
+        },
+      }),
+    Error,
+    'deployments[0].cost.input and deployments[0].cost.output must both be set',
+  );
+});
+
+test('createAzureUpstream rejects deployment.cost with negative input', () => {
+  assertThrows(
+    () =>
+      createAzureUpstream({
+        ...baseRecord,
+        config: {
+          ...(baseRecord.config as Record<string, unknown>),
+          deployments: [
+            {
+              deployment: 'gpt-prod',
+              supportedEndpoints: ['/chat/completions'],
+              cost: { input: -1, output: 1 },
+            },
+          ],
+        },
+      }),
+    Error,
+    'deployments[0].cost.input must be a finite non-negative number',
+  );
+});
+
+test('createAzureUpstream rejects deployment.cost with non-number cache_read', () => {
+  assertThrows(
+    () =>
+      createAzureUpstream({
+        ...baseRecord,
+        config: {
+          ...(baseRecord.config as Record<string, unknown>),
+          deployments: [
+            {
+              deployment: 'gpt-prod',
+              supportedEndpoints: ['/chat/completions'],
+              cost: { input: 2, output: 8, cache_read: 'cheap' },
+            },
+          ],
+        },
+      }),
+    Error,
+    'deployments[0].cost.cache_read must be a finite non-negative number',
+  );
+});

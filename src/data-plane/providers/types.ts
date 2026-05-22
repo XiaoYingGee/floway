@@ -7,6 +7,17 @@ import type { ResponsesPayload } from '../shared/protocol/responses.ts';
 
 export type ModelEndpoint = 'chat_completions' | 'responses' | 'messages' | 'messages_count_tokens' | 'embeddings';
 
+// Per-model pricing in USD per million tokens, aligned with the sst/models.dev
+// `Cost` schema (https://github.com/sst/models.dev/blob/main/packages/core/src/schema.ts).
+// Extensions follow that schema's field names (`reasoning`, `input_audio`,
+// `output_audio`, etc.) when they are added.
+export interface ModelPricing {
+  input: number;
+  output: number;
+  cache_read?: number;
+  cache_write?: number;
+}
+
 export interface ModelMetadata {
   id: string;
   name: string;
@@ -44,6 +55,7 @@ export interface ModelMetadata {
     state?: string;
     terms?: string;
   };
+  cost?: ModelPricing;
   model_picker_enabled?: boolean;
 }
 
@@ -102,6 +114,10 @@ export interface ProviderCallResult {
 
 export interface ModelProvider {
   getProvidedModels(): Promise<readonly UpstreamModel[]>;
+  // Resolve pricing for a usage record's `model_key` (the raw upstream model
+  // id). Used by aggregation-time cost computation. Public-model-name lookups
+  // happen elsewhere by reading `UpstreamModel.cost` directly.
+  getPricingForModelKey(modelKey: string): ModelPricing | null;
   callChatCompletions(model: UpstreamModel, body: Omit<ChatCompletionsPayload, 'model'>, signal?: AbortSignal): Promise<ProviderCallResult>;
   callResponses(model: UpstreamModel, body: Omit<ResponsesPayload, 'model'>, signal?: AbortSignal): Promise<ProviderCallResult>;
   callMessages(model: UpstreamModel, body: Omit<MessagesPayload, 'model'>, signal?: AbortSignal, anthropicBeta?: readonly string[]): Promise<ProviderCallResult>;

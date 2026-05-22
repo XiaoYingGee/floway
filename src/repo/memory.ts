@@ -67,45 +67,23 @@ class MemoryUsageRepo implements UsageRepo {
       upstream: record.upstream ?? null,
       cacheReadTokens: record.cacheReadTokens ?? 0,
       cacheCreationTokens: record.cacheCreationTokens ?? 0,
+      cost: record.cost ?? null,
     };
   }
 
-  record(
-    keyId: string,
-    model: string,
-    upstream: string | null,
-    modelKey: string,
-    hour: string,
-    requests: number,
-    inputTokens: number,
-    outputTokens: number,
-    cacheReadTokens = 0,
-    cacheCreationTokens = 0,
-  ): Promise<void> {
-    const k = this.key({ keyId, model, upstream, modelKey, hour });
+  record(record: UsageRecord): Promise<void> {
+    const k = this.key(record);
     const existing = this.store.get(k);
     if (existing) {
-      existing.requests += requests;
-      existing.inputTokens += inputTokens;
-      existing.outputTokens += outputTokens;
-      existing.cacheReadTokens = (existing.cacheReadTokens ?? 0) + cacheReadTokens;
-      existing.cacheCreationTokens = (existing.cacheCreationTokens ?? 0) + cacheCreationTokens;
+      existing.requests += record.requests;
+      existing.inputTokens += record.inputTokens;
+      existing.outputTokens += record.outputTokens;
+      existing.cacheReadTokens = (existing.cacheReadTokens ?? 0) + (record.cacheReadTokens ?? 0);
+      existing.cacheCreationTokens = (existing.cacheCreationTokens ?? 0) + (record.cacheCreationTokens ?? 0);
+      // COALESCE: first-write-wins for the pricing snapshot.
+      existing.cost = existing.cost ?? record.cost ?? null;
     } else {
-      this.store.set(
-        k,
-        this.normalize({
-          keyId,
-          model,
-          upstream,
-          modelKey,
-          hour,
-          requests,
-          inputTokens,
-          outputTokens,
-          cacheReadTokens,
-          cacheCreationTokens,
-        }),
-      );
+      this.store.set(k, this.normalize(record));
     }
     return Promise.resolve();
   }

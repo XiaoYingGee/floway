@@ -233,3 +233,54 @@ test('createAzureProvider supports native Azure Anthropic Messages deployments',
     },
   ]);
 });
+
+test('createAzureProvider attaches cost field from deployment config', async () => {
+  const instance = createAzureProvider(
+    azureRecord({
+      config: {
+        endpoint: 'https://example.openai.azure.com',
+        apiKey: 'az-key',
+        deployments: [
+          {
+            deployment: 'gpt-prod',
+            publicModelId: 'gpt-public',
+            supportedEndpoints: ['/chat/completions'],
+            cost: { input: 2.5, output: 15, cache_read: 0.25 },
+          },
+          {
+            deployment: 'gpt-small',
+            supportedEndpoints: ['/chat/completions'],
+          },
+        ],
+      },
+    }),
+  );
+  const models = await instance.provider.getProvidedModels();
+  assertEquals(models[0].cost, { input: 2.5, output: 15, cache_read: 0.25 });
+  assertEquals(models[1].cost, undefined);
+});
+
+test('createAzureProvider getPricingForModelKey resolves by deployment name', () => {
+  const instance = createAzureProvider(
+    azureRecord({
+      config: {
+        endpoint: 'https://example.openai.azure.com',
+        apiKey: 'az-key',
+        deployments: [
+          {
+            deployment: 'gpt-prod',
+            supportedEndpoints: ['/chat/completions'],
+            cost: { input: 2.5, output: 15 },
+          },
+          {
+            deployment: 'gpt-small',
+            supportedEndpoints: ['/chat/completions'],
+          },
+        ],
+      },
+    }),
+  );
+  assertEquals(instance.provider.getPricingForModelKey('gpt-prod'), { input: 2.5, output: 15 });
+  assertEquals(instance.provider.getPricingForModelKey('gpt-small'), null);
+  assertEquals(instance.provider.getPricingForModelKey('unknown'), null);
+});

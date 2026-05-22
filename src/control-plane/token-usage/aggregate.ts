@@ -1,4 +1,4 @@
-import { recordCostUsd } from './pricing.ts';
+import type { ModelPricing } from '../../data-plane/providers/types.ts';
 import type { UsageRecord } from '../../repo/types.ts';
 
 export interface DisplayUsageRecord {
@@ -13,6 +13,16 @@ export interface DisplayUsageRecord {
   cost: number;
 }
 
+const recordCostUsd = (pricing: ModelPricing | null, inputTokens: number, outputTokens: number, cacheReadTokens: number, cacheCreationTokens: number): number => {
+  if (!pricing) return 0;
+  const prefillInput = inputTokens - cacheReadTokens - cacheCreationTokens;
+  const inputCost = prefillInput * pricing.input;
+  const cacheReadCost = cacheReadTokens * (pricing.cache_read ?? pricing.input);
+  const cacheWriteCost = cacheCreationTokens * (pricing.cache_write ?? pricing.input);
+  const outputCost = outputTokens * pricing.output;
+  return (inputCost + cacheReadCost + cacheWriteCost + outputCost) / 1e6;
+};
+
 const usageRecordKey = (record: DisplayUsageRecord): string => `${record.keyId}\0${record.model}\0${record.hour}`;
 
 export function aggregateUsageForDisplay(records: readonly UsageRecord[]): DisplayUsageRecord[] {
@@ -21,7 +31,7 @@ export function aggregateUsageForDisplay(records: readonly UsageRecord[]): Displ
   for (const record of records) {
     const cacheRead = record.cacheReadTokens ?? 0;
     const cacheCreation = record.cacheCreationTokens ?? 0;
-    const cost = recordCostUsd(record.model, record.inputTokens, record.outputTokens, cacheRead, cacheCreation);
+    const cost = recordCostUsd(record.cost, record.inputTokens, record.outputTokens, cacheRead, cacheCreation);
 
     const displayRecord: DisplayUsageRecord = {
       keyId: record.keyId,
