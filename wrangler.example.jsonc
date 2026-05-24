@@ -1,0 +1,31 @@
+// Copy this file to wrangler.jsonc and fill in the placeholder values.
+// wrangler.jsonc is gitignored so that each contributor's own Cloudflare
+// account id, D1 database id, and Worker name stay local.
+//
+// 1. Optionally set CLOUDFLARE_ACCOUNT_ID in the environment, or run
+//    `pnpm wrangler login`. If neither is in place, add an `account_id`
+//    field below.
+// 2. Run `pnpm wrangler d1 create <DB_NAME>` and paste the returned
+//    `database_id` into the placeholder below; set `database_name` to the
+//    same `<DB_NAME>` you picked.
+// 3. Pick a unique `name` for your Worker; it becomes the deployed
+//    workers.dev subdomain.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "copilot-gateway",
+  "main": "apps/api/entry-cloudflare.ts",
+  "compatibility_date": "2025-01-01",
+  "assets": {
+    "directory": "apps/web/dist",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "none"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "copilot-gateway",
+      "database_id": "<YOUR_D1_DATABASE_ID>",
+      "migrations_dir": "apps/api/migrations"
+    }
+  ]
+}

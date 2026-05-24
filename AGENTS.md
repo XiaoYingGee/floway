@@ -41,8 +41,11 @@ The repo is a pnpm workspace with four packages, two libraries under
 
 ```text
 copilot-gateway/
-├── wrangler.jsonc              # root; main -> apps/api/entry-cloudflare.ts,
-│                               # assets -> apps/web/dist, migrations_dir ->
+├── wrangler.example.jsonc      # committed template; copy to wrangler.jsonc
+│                               # (gitignored) and fill in account_id and
+│                               # d1 database_id locally. main ->
+│                               # apps/api/entry-cloudflare.ts, assets ->
+│                               # apps/web/dist, migrations_dir ->
 │                               # apps/api/migrations
 ├── eslint.config.ts            # internal regex ^@copilot-gateway/ + a
 │                               # no-restricted-imports ban on @copilot-gateway/*/src/**

@@ -65,11 +65,18 @@ cd copilot-gateway
 # Install dependencies
 pnpm install
 
-# Create the D1 database (pick a name; record it as database_name in wrangler.jsonc)
+# Copy the committed template to a local wrangler.jsonc (gitignored)
+cp wrangler.example.jsonc wrangler.jsonc
+
+# Create the D1 database; copy the returned database_id into wrangler.jsonc
+# and set database_name to the same <DB_NAME> you picked
 pnpm wrangler d1 create <DB_NAME>
 
-# Update wrangler.jsonc with your account_id, database_id, and database_name,
-# then apply migrations
+# Authenticate so wrangler knows which account to target (or set
+# CLOUDFLARE_ACCOUNT_ID and add an account_id field to wrangler.jsonc)
+pnpm wrangler login
+
+# Apply migrations
 pnpm run db:migrate
 
 # Set the admin key as a secret
@@ -206,8 +213,8 @@ The repo is a pnpm workspace with two libraries and two deployables:
 
 ```text
 copilot-gateway/
-├── wrangler.jsonc           # root; main -> apps/api/entry-cloudflare.ts,
-│                            # assets -> apps/web/dist
+├── wrangler.example.jsonc   # committed template; copy to wrangler.jsonc
+│                            # (gitignored) and fill in your IDs locally
 ├── packages/
 │   ├── protocols/           # @copilot-gateway/protocols — pure protocol types
 │   └── translate/           # @copilot-gateway/translate — cross-protocol
