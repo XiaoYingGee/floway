@@ -226,10 +226,6 @@ const makeNativeWebSearchUpstreamHandler =
     async (request: Request): Promise<Response> => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
-
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -361,9 +357,6 @@ test('/v1/messages rewrites upstream context-window errors to Messages compact f
     request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -415,9 +408,6 @@ test('/messages uses the same data-plane handler as /v1/messages', async () => {
     request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -513,9 +503,6 @@ test('/v1/messages uses native endpoint and applies native request workarounds',
     async request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -667,9 +654,6 @@ test('/v1/messages keeps caller thinking and tool_choice unchanged on native ada
     async request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -786,9 +770,6 @@ test('/v1/messages sends summarized thinking upstream while exposing 4.7 default
     async request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -887,9 +868,6 @@ test('/v1/messages streams explicit omitted without thinking_delta while preserv
     async request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -986,9 +964,6 @@ test('/v1/messages resolves base Claude models to effort variants before plannin
     async request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -1058,9 +1033,6 @@ test('/v1/messages native streaming filters trailing DONE sentinel', async () =>
     request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -1131,9 +1103,6 @@ test('/v1/messages streams malformed upstream Messages SSE as an error event', a
     request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -1198,9 +1167,6 @@ test('/v1/messages forwards Messages tool strict field on native messages', asyn
     async request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -1304,9 +1270,6 @@ test('/v1/messages keeps strict Messages tools on native messages when both endp
     async request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -1423,9 +1386,6 @@ test('/v1/messages falls back to chat completions and translates both directions
     async request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -1560,9 +1520,6 @@ test('/v1/messages falls back to responses and preserves readable reasoning with
     async request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -1731,9 +1688,6 @@ test('/v1/messages preserves output_config.effort max when translating to respon
     async request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -1816,9 +1770,6 @@ test('/v1/messages prefers responses on dual-endpoint models when native message
     async request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -1903,9 +1854,6 @@ test('stripReservedKeywords removes entire billing header line from string syste
   await withMockedFetch(
     async request => {
       const url = new URL(request.url);
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'tok',
@@ -2007,9 +1955,6 @@ test('stripReservedKeywords removes billing-only system block without 400 error'
   await withMockedFetch(
     async request => {
       const url = new URL(request.url);
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'tok',
@@ -2120,9 +2065,6 @@ test('/v1/messages strips cache_control.scope only for Copilot Messages', async 
   await withMockedFetch(
     async request => {
       const url = new URL(request.url);
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'tok',
@@ -2734,9 +2676,6 @@ test('stripReservedKeywords handles all-billing system blocks by removing system
   await withMockedFetch(
     async request => {
       const url = new URL(request.url);
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'tok',
@@ -2988,9 +2927,6 @@ test('/v1/messages returns internal debug error when native web search is disabl
     request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -3125,9 +3061,6 @@ test('/v1/messages passes through foreign native-looking history and preserves u
     async request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -3177,9 +3110,6 @@ test('/v1/messages rejects duplicate native web search tools before upstream fet
     request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -3228,9 +3158,6 @@ test('/v1/messages rejects native web search tools whose name is not web_search'
     request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -3279,9 +3206,6 @@ test('/v1/messages rejects native web search tool name collisions before upstrea
     request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -3339,9 +3263,6 @@ test('/v1/messages routes native web search through translated /responses target
     async request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
@@ -3451,9 +3372,6 @@ test('/v1/messages routes native web search through translated /chat/completions
     async request => {
       const url = new URL(request.url);
 
-      if (url.hostname === 'update.code.visualstudio.com') {
-        return jsonResponse(['1.110.1']);
-      }
       if (url.pathname === '/copilot_internal/v2/token') {
         return jsonResponse({
           token: 'copilot-access-token',
