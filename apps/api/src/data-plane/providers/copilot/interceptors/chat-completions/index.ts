@@ -3,6 +3,7 @@
 // does not need to know which provider kind is running.
 
 import { withToolArgumentWhitespaceAborted } from './abort-on-tool-argument-whitespace.ts';
+import { withInitiatorHeaderSet } from './set-initiator-header.ts';
 import { withVisionHeaderSet } from './set-vision-header.ts';
 import type { ChatCompletionsInterceptor } from '../../../../llm/interceptors.ts';
 
@@ -11,5 +12,6 @@ import type { ChatCompletionsInterceptor } from '../../../../llm/interceptors.ts
 // populate `invocation.headers` for the upstream call.
 export const chatCompletionsCopilotInterceptors = [
   withToolArgumentWhitespaceAborted,
+  withInitiatorHeaderSet,
   withVisionHeaderSet,
 ] as const satisfies readonly ChatCompletionsInterceptor[];
