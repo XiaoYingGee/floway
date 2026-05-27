@@ -39,7 +39,7 @@ pnpm wrangler d1 create <DB_NAME>        # paste database_id into wrangler.jsonc
 pnpm run db:migrate
 pnpm wrangler secret put ADMIN_KEY
 
-# Run locally or deploy.
+# Run locally or deploy. In dev, open the Vite SPA at http://localhost:5174.
 pnpm run dev
 pnpm run deploy
 ```
@@ -70,13 +70,16 @@ search via the provider configured under **Settings → Web Search** (`tavily` o
 pnpm run lint          # eslint --cache across the workspace
 pnpm run test          # vitest run over the root test.projects
 pnpm run typecheck     # pnpm -r run typecheck
-pnpm run dev           # builds apps/web, then wrangler dev on apps/api
+pnpm run dev           # parallel wrangler dev (8788) + Vite SPA dev server (5174)
 ```
 
 The repo is a pnpm workspace: `packages/protocols` and `packages/translate` are
-pure libraries; `apps/api` is the Worker; `apps/web` prerenders the dashboard
-that Workers Static Assets serves. Cross-package imports go through each
-package's `exports` map; deep imports are blocked by ESLint.
+pure libraries; `apps/api` is the Worker; `apps/web` is a Vue/Vite SPA served by
+Vite in dev and by Workers Static Assets from `apps/web/dist` after build.
+`wrangler.example.jsonc` keeps API/data-plane routes Worker-first and lets
+other direct browser routes fall through to the SPA's `index.html`.
+Cross-package imports go through each package's `exports` map; deep imports are
+blocked by ESLint.
 
 See [AGENTS.md](./AGENTS.md) for the architecture, provider model, routing
 rules, deploy workflow, and conventions that coding agents (and humans) follow

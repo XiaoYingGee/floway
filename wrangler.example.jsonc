@@ -18,7 +18,22 @@
   "assets": {
     "directory": "apps/web/dist",
     "html_handling": "auto-trailing-slash",
-    "not_found_handling": "single-page-application"
+    "not_found_handling": "single-page-application",
+    "run_worker_first": [
+      "/api/*",
+      "/auth",
+      "/auth/*",
+      "/v1/*",
+      "/v1beta/*",
+      "/chat/*",
+      "/responses",
+      "/messages",
+      "/messages/*",
+      "/embeddings",
+      "/images/*",
+      "/models",
+      "/favicon.ico"
+    ]
   },
   "d1_databases": [
     {

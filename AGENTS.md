@@ -46,7 +46,8 @@ floway/
 │                               # (gitignored) and fill in account_id and
 │                               # d1 database_id locally. main ->
 │                               # apps/api/entry-cloudflare.ts, assets ->
-│                               # apps/web/dist (SPA fallback enabled),
+│                               # apps/web/dist (SPA fallback enabled with
+│                               # backend-only run_worker_first routes),
 │                               # migrations_dir -> apps/api/migrations
 ├── eslint.config.ts            # internal regex ^@floway-dev/ + a
 │                               # no-restricted-imports ban on @floway-dev/*/src/**
@@ -806,21 +807,27 @@ Primary commands, all run from the repo root:
 pnpm run test                # vitest run over the root test.projects (all packages)
 pnpm run lint                # eslint --cache across the whole workspace
 pnpm run typecheck           # pnpm -r run typecheck (one tsc --noEmit per package)
-pnpm run dev                 # parallel wrangler dev (8787) + vite dev (5173)
+pnpm run dev                 # parallel wrangler dev (8788) + Vite dev (5174)
 pnpm run deploy              # builds apps/web, then wrangler deploy on apps/api
 pnpm run db:migrate          # apply migrations to the local D1
 pnpm run db:migrate:remote   # apply migrations to the remote (production) D1
 ```
 
 `dev` uses `concurrently` to run `wrangler dev` (Worker on
-http://127.0.0.1:8787) and `vite` (SPA on http://localhost:5173) in the
-same shell. The SPA is the one you open: Vite proxies `/api`, `/auth`,
-`/v1`, `/v1beta`, `/embeddings`, and `/models` to the Worker, so the
-relative-URL fetch calls in `apps/web` work identically in dev and prod.
-`deploy` chains the `apps/web` build (`pnpm run build:web` → `vite build`)
-before `wrangler deploy` because the Worker's Static Assets binding serves
-`apps/web/dist`. To work on a single package in isolation, use pnpm filters,
-e.g. `pnpm --filter @floway-dev/translate run typecheck`.
+http://127.0.0.1:8788) and `vite` (SPA on http://localhost:5174) in the
+same shell. For frontend development, open the Vite SPA at port 5174:
+Vite proxies `/api`, `/auth`, `/v1`, `/v1beta`, `/embeddings`, and
+`/models` to the Worker, so the relative-URL fetch calls in `apps/web`
+work identically in dev and prod. The Worker port serves the last built
+`apps/web/dist` through Workers Static Assets. Direct SPA routes such as
+`/login` and `/dashboard/settings` require
+`assets.not_found_handling: "single-page-application"` plus the backend-only
+`assets.run_worker_first` route list in `wrangler.jsonc`, matching
+`wrangler.example.jsonc`. `deploy` chains the `apps/web` build
+(`pnpm run build:web` → `vite build`) before `wrangler deploy` because the
+Worker's Static Assets binding serves `apps/web/dist`. To work on a single
+package in isolation, use pnpm filters, e.g.
+`pnpm --filter @floway-dev/translate run typecheck`.
 
 Wrangler commands should go through the local dependency with `pnpm wrangler`
 or package scripts. When deploying, use `pnpm run deploy` or `pnpm wrangler
