@@ -42,15 +42,7 @@ export const createAzureProvider = (record: UpstreamRecord): ModelProviderInstan
     const deployment = providerData(model).deployment;
     const requestBody = isStreamingEndpoint(endpoint) ? { ...body, stream: true, model: deployment } : { ...body, model: deployment };
     return upstream
-      .fetch(
-        endpoint,
-        {
-          method: 'POST',
-          body: JSON.stringify(requestBody),
-          signal,
-        },
-        headers && Object.keys(headers).length > 0 ? { extraHeaders: headers } : undefined,
-      )
+      .fetch(endpoint, { method: 'POST', body: JSON.stringify(requestBody), signal }, { extraHeaders: headers })
       .then(response => ({
         response,
         modelKey: deployment,
@@ -83,6 +75,16 @@ export const createAzureProvider = (record: UpstreamRecord): ModelProviderInstan
     callMessages: (model, body, signal, headers) => call('messages', model, body, signal, headers),
     callMessagesCountTokens: (model, body, signal, headers) => call('messages_count_tokens', model, body, signal, headers),
     callEmbeddings: (model, body, signal, headers) => call('embeddings', model, body, signal, headers),
+    callImagesGenerations: (model, body, signal, headers) => call('images_generations', model, body, signal, headers),
+    callImagesEdits: async (model, body, signal, headers) => {
+      // Azure routes by deployment name in the multipart `model` field; the
+      // runtime re-encodes the FormData with a fresh boundary and sets
+      // Content-Type itself.
+      const deployment = providerData(model).deployment;
+      body.append('model', deployment);
+      const response = await upstream.fetch('images_edits', { method: 'POST', body, signal }, { extraHeaders: headers });
+      return { response, modelKey: deployment };
+    },
   };
 
   return {

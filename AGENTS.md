@@ -14,7 +14,8 @@
 ## Project
 
 `floway` is a Cloudflare Workers API proxy. It exposes Anthropic
-Messages, OpenAI Responses, OpenAI Chat Completions, Embeddings, and Google
+Messages, OpenAI Responses, OpenAI Chat Completions, Embeddings, OpenAI
+Images (`/v1/images/generations` and `/v1/images/edits`), and Google
 Gemini-compatible APIs over unified upstream records. Supported provider kinds
 are `copilot`, `custom`, and `azure`.
 
@@ -53,7 +54,7 @@ floway/
 ├── vitest.config.ts            # root project list (Vitest 4 test.projects)
 ├── packages/
 │   ├── protocols/              # @floway-dev/protocols — pure type defs
-│   │   └── src/{common,chat-completions,responses,messages,gemini,embeddings}/index.ts
+│   │   └── src/{common,chat-completions,responses,messages,gemini,embeddings,images}/index.ts
 │   ├── translate/              # @floway-dev/translate — translation pairs
 │   │   └── src/{<pair-dirs>,shared,types.ts,index.ts}
 │   └── ui/                     # @floway-dev/ui — internal Vue component
@@ -111,9 +112,14 @@ new and adding tests is a follow-up if and when behavior solidifies.
 - `apps/api/src/control-plane/upstreams/`: unified upstream CRUD, custom/Azure
   probing, Copilot device-flow auth, and Copilot per-upstream quota.
 - `apps/api/src/data-plane/`: client-facing compatibility APIs, model/provider
-  routing, embeddings, and data-plane tools. Cross-protocol request/event
+  routing, embeddings, images, and data-plane tools. Cross-protocol request/event
   translation lives in `@floway-dev/translate` and is dispatched from the
   data-plane source serves.
+- `apps/api/src/data-plane/images/`: source serves for
+  `POST /v1/images/generations` and `POST /v1/images/edits`. Multipart edits
+  are loaded into the Workers heap via `request.formData()`; dispatch picks
+  the first provider binding whose `upstreamEndpoints` declares the requested
+  capability, which in practice means `UpstreamModel.kind === 'image'`.
 - `apps/api/src/data-plane/providers/`: provider interface, provider registry,
   model merge, provider-owned alias resolution, flag catalog and
   effective-flag resolver, and concrete provider implementations.
@@ -194,22 +200,30 @@ Provider config rules:
   `x-api-key: <token>` plus `anthropic-version: 2023-06-01`
   (api.anthropic.com-style upstreams). `supportedEndpoints` declares which
   chat generation protocols this upstream speaks (`/chat/completions`,
-  `/responses`, `/v1/messages`); the embeddings endpoint is intentionally
-  not configurable there — embeddings routing is decided per-model from
-  `kind === 'embedding'`. An upstream that only serves embedding models
-  (e.g. Voyage) saves with an empty `supportedEndpoints` array. The `/models`
-  parser accepts OpenAI, Anthropic, and floway-own container /
-  per-model shapes; entries are best-effort and unrecognized fields are
-  ignored. Per-model `kind` resolves through a two-tier detector: Tier 1
-  reads `kind` from the upstream `/models` response when present (only
-  floway emits it today); Tier 2 falls back to an id-token
-  heuristic (see `apps/api/src/data-plane/providers/custom/infer-kind.ts`)
-  matching common embedding families (`embed`, `embedding`, `bge`, `e5`,
-  `gte`, `nomic`, `voyage`, ...). Everything else defaults to `chat`. The
-  /models response is otherwise read only for display metadata
+  `/responses`, `/v1/messages`); the embeddings and images endpoints are
+  intentionally not configurable there — embeddings routing is decided
+  per-model from `kind === 'embedding'` and images routing from
+  `kind === 'image'`. An upstream that only serves embedding models
+  (e.g. Voyage) or only serves image models saves with an empty
+  `supportedEndpoints` array. The `/models` parser accepts OpenAI,
+  Anthropic, and floway-own container / per-model shapes; entries are
+  best-effort and unrecognized fields are ignored. Per-model `kind`
+  resolves through a two-tier detector: Tier 1 reads `kind` from the
+  upstream `/models` response when present (only floway emits it today);
+  Tier 2 falls back to an id-token heuristic (see
+  `apps/api/src/data-plane/providers/custom/infer-kind.ts`) — embedding
+  families match common embedding tokens (`embed`, `embedding`, `bge`,
+  `e5`, `gte`, `nomic`, `voyage`, ...), and the `gpt-image-*` prefix
+  matches image. Other image families (`dall-e`, `imagen`, `flux`, `sdxl`,
+  `stable-diffusion`) are intentionally NOT recognized; operators who run
+  those models against a custom upstream need the planned per-model kind
+  override. Everything else defaults to `chat`. The /models response is
+  otherwise read only for display metadata
   (`display_name`/`created`/`created_at`/`owned_by`/`limits`) and an
   optional `cost` block. The provider calls upstream models by their raw
-  model id.
+  model id. When `kind === 'image'` the provider attaches both
+  `images_generations` and `images_edits` to `upstreamEndpoints`
+  unconditionally; per-endpoint custom image opt-out is not modeled.
 - `azure`: one `endpoint`, `apiKey`, and deployment rows. `endpoint` must be an
   HTTPS Azure URL on `*.openai.azure.com` or `*.services.ai.azure.com`; it may
   be an Azure resource root, a Foundry project endpoint, an OpenAI v1 URL ending
@@ -218,9 +232,12 @@ Provider config rules:
   `/anthropic/v1/messages` is also accepted and normalized to the Anthropic
   base. Runtime derives protocol bases from that one field.
   OpenAI-shaped calls use `api-key` auth and append `/chat/completions`,
-  `/responses`, `/embeddings`, and `/models` to the derived OpenAI v1 base.
-  Foundry project endpoints derive OpenAI calls under
-  `/api/projects/<project>/openai/v1`. Native Messages calls use the
+  `/responses`, `/embeddings`, `/images/generations`, `/images/edits`, and
+  `/models` to the derived OpenAI v1 base. The image endpoints currently pin
+  `?api-version=preview` because the `gpt-image-*` family is still on Azure's
+  preview lifecycle; that override drops when Azure promotes the image
+  endpoints to the GA default. Foundry project endpoints derive OpenAI calls
+  under `/api/projects/<project>/openai/v1`. Native Messages calls use the
   resource-level `/anthropic` base and call `/v1/messages` plus
   `/v1/messages/count_tokens` with `x-api-key` auth and
   `anthropic-version: 2023-06-01`. The Azure OpenAI / Foundry OpenAI v1 surface
@@ -230,15 +247,17 @@ Provider config rules:
   Azure Chat Completions or Responses via the normal planner. Each deployment's
   `modelKey` is the deployment name; the public model id is `publicModelId` when
   non-empty and otherwise defaults to the deployment name. The dashboard edits
-  Azure deployments as one row per deployment with a compact API type preset;
-  code persists the provider-owned `supportedEndpoints` capability set. Azure
-  deployment rows may also carry provider-owned catalog metadata such as
-  `display_name`, limits, and `model_picker_enabled`; keep that metadata out of
-  the main dashboard form unless a concrete UI workflow needs it. Each
-  deployment row may also carry `flagOverrides: { enabled: boolean; values:
-  Record<string, boolean> }`; when `enabled` is true the deployment's `values`
-  replace the upstream layer in the effective-flag computation for that
-  deployment's models. The configured
+  Azure deployments as one row per deployment with a compact API-type preset
+  (`Responses`, `Responses + Chat`, `Chat`, `Messages`, `Embeddings`,
+  `Images`); code persists the provider-owned `supportedEndpoints` capability
+  set. The `Images` preset covers both `/v1/images/generations` and
+  `/v1/images/edits`. Azure deployment rows may also carry provider-owned
+  catalog metadata such as `display_name`, limits, and `model_picker_enabled`;
+  keep that metadata out of the main dashboard form unless a concrete UI
+  workflow needs it. Each deployment row may also carry `flagOverrides:
+  { enabled: boolean; values: Record<string, boolean> }`; when `enabled` is
+  true the deployment's `values` replace the upstream layer in the
+  effective-flag computation for that deployment's models. The configured
   endpoint plus API key is not enough to fetch rich Azure deployment metadata;
   Azure management-plane metadata requires ARM/AAD credentials and subscription
   resource context. Do not add a Chat+Messages Azure preset unless Azure
@@ -284,6 +303,8 @@ callResponses(upstreamModel, bodyWithoutModel, signal?, headers?)
 callMessages(upstreamModel, bodyWithoutModel, signal?, headers?, anthropicBeta?)
 callMessagesCountTokens(upstreamModel, bodyWithoutModel, signal?, headers?, anthropicBeta?)
 callEmbeddings(upstreamModel, bodyWithoutModel, signal?, headers?)
+callImagesGenerations(upstreamModel, bodyWithoutModel, signal?, headers?)
+callImagesEdits(upstreamModel, formDataWithoutModel, signal?, headers?)
 ```
 
 `headers` is the per-invocation HTTP header bag that target interceptors
@@ -293,7 +314,10 @@ Copilot's `copilot-vision-request`, `X-Initiator`, filtered
 `anthropic-beta`); the target emit then passes that bag through to the
 provider's call method unchanged. Provider implementations forward the bag
 straight to their upstream fetch and never branch on protocol-specific
-header semantics.
+header semantics. Image endpoints have no target interceptor stack today
+(image sources dispatch straight to the provider call method), so the
+`headers` slot stays empty for them in practice — the parameter exists
+only for signature parity with the other call methods.
 
 The Messages and count_tokens calls additionally receive the source-derived
 `anthropicBeta` slice as a typed read-only input separate from the wire
@@ -316,14 +340,23 @@ eager_input_streaming stripping) stay on the `messages` chain and never
 run on count_tokens.
 
 `UpstreamModel.kind` discriminates the endpoint family (`'chat'` for any
-generation protocol, `'embedding'` for `/embeddings`), and
+generation protocol, `'embedding'` for `/embeddings`, `'image'` for
+`/images/generations` and `/images/edits`), and
 `UpstreamModel.upstreamEndpoints` is the precise per-protocol availability
 list used by the chat planner. Both are derived at the producer boundary and
 must stay consistent: `kind === 'embedding'` ⇔ `upstreamEndpoints ===
-['embeddings']`; `kind === 'chat'` ⇒ `upstreamEndpoints ⊂` generation
-endpoints. Embeddings routing in `apps/api/src/data-plane/embeddings/serve.ts`
-gates on `kind === 'embedding'`; chat planning gates on the
-`upstreamEndpoints` list directly.
+['embeddings']`; `kind === 'image'` ⇔ `upstreamEndpoints ⊂
+{images_generations, images_edits}`; `kind === 'chat'` ⇒
+`upstreamEndpoints ⊂` generation endpoints. Embeddings routing in
+`apps/api/src/data-plane/embeddings/serve.ts` gates on `kind === 'embedding'`;
+images routing in `apps/api/src/data-plane/images/serve.ts` gates on
+`upstreamEndpoints.includes('images_generations')` /
+`upstreamEndpoints.includes('images_edits')`; chat planning gates on the
+`upstreamEndpoints` list directly. The `kind` vocabulary
+(`'chat' | 'embedding' | 'image'`) is borrowed from Together AI's open
+`/v1/models` `type` enum; the full known set and the "add only when we
+actually route the family" rule live in the `ModelKind` JSDoc at
+`packages/protocols/src/common/models.ts`.
 
 The registry separates public catalog data from execution bindings:
 
@@ -415,8 +448,8 @@ pre-refactor "no rule matched" behaviour.
 
 `apps/api/src/data-plane/llm/` owns LLM source routing for Messages, Responses,
 Chat Completions, Gemini generation, and source-owned token counting endpoints.
-Models, embeddings, and data-plane tools live outside that LLM routing graph in
-their capability directories.
+Models, embeddings, images, and data-plane tools live outside that LLM routing
+graph in their capability directories.
 
 Model listing belongs in `apps/api/src/data-plane/models/`: `/v1/models` is
 OpenAI-shaped, `/models` is Anthropic-shaped, and `/v1beta/models` is
@@ -539,6 +572,11 @@ Target preferences:
 - Chat Completions: native Chat Completions, then Messages, then Responses.
 - Gemini generation has no native upstream target in the provider API; it uses
   Chat Completions, then Messages, then Responses.
+- Images (`/v1/images/generations`, `/v1/images/edits`) have no cross-provider
+  translation and no planner. Each request is dispatched to the first provider
+  binding whose `upstreamEndpoints` declares the requested capability. Custom
+  upstreams declare both endpoints for any `kind === 'image'` model; Azure
+  deployments opt in via the dashboard "Images" API-type preset.
 
 Claude compatibility aliases and Copilot raw variant selection live in the
 provider layer. Until there is a general model-alias feature, Responses rewrites

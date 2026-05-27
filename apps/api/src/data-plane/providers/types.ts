@@ -3,6 +3,7 @@ import type { ChatCompletionsInterceptor, GeminiInterceptor, MessagesCountTokens
 import type { ChatCompletionsPayload } from '@floway-dev/protocols/chat-completions';
 import type { ModelEndpoint, ModelKind, ModelPricing } from '@floway-dev/protocols/common';
 import type { EmbeddingsPayload } from '@floway-dev/protocols/embeddings';
+import type { ImagesGenerationsPayload } from '@floway-dev/protocols/images';
 import type { MessagesPayload } from '@floway-dev/protocols/messages';
 import type { ResponsesPayload } from '@floway-dev/protocols/responses';
 
@@ -17,6 +18,7 @@ import type { ResponsesPayload } from '@floway-dev/protocols/responses';
 // (on UpstreamModel) is the precise per-protocol availability list used by
 // the planner. They are linked invariants enforced at the producer boundary:
 //   `kind === 'embedding'` ⇔ `upstreamEndpoints === ['embeddings']`
+//   `kind === 'image'`     ⇔ `upstreamEndpoints ⊂ {images_generations, images_edits}`
 //   `kind === 'chat'`      ⇒ `upstreamEndpoints ⊂ generation endpoints`.
 export interface InternalModel {
   id: string;
@@ -104,7 +106,8 @@ export interface ModelProvider {
   // interceptors populate it (vision, initiator, anthropic-beta, ...) and the
   // provider passes it straight through to the upstream fetch unchanged. The
   // shape is uniform across protocols so provider implementations never branch
-  // on which protocol they are serving.
+  // on which protocol they are serving. Image endpoints have no target
+  // interceptor stack today, but the parameter stays for interface uniformity.
   callChatCompletions(model: UpstreamModel, body: Omit<ChatCompletionsPayload, 'model'>, signal?: AbortSignal, headers?: Record<string, string>): Promise<ProviderCallResult>;
   callResponses(model: UpstreamModel, body: Omit<ResponsesPayload, 'model'>, signal?: AbortSignal, headers?: Record<string, string>): Promise<ProviderCallResult>;
   // Messages and count_tokens additionally receive the source-derived
@@ -117,4 +120,10 @@ export interface ModelProvider {
   callMessages(model: UpstreamModel, body: Omit<MessagesPayload, 'model'>, signal?: AbortSignal, headers?: Record<string, string>, anthropicBeta?: readonly string[]): Promise<ProviderCallResult>;
   callMessagesCountTokens(model: UpstreamModel, body: Omit<MessagesPayload, 'model'>, signal?: AbortSignal, headers?: Record<string, string>, anthropicBeta?: readonly string[]): Promise<ProviderCallResult>;
   callEmbeddings(model: UpstreamModel, body: Omit<EmbeddingsPayload, 'model'>, signal?: AbortSignal, headers?: Record<string, string>): Promise<ProviderCallResult>;
+  callImagesGenerations(model: UpstreamModel, body: Omit<ImagesGenerationsPayload, 'model'>, signal?: AbortSignal, headers?: Record<string, string>): Promise<ProviderCallResult>;
+  // The provider takes ownership of `body` and may mutate it (e.g. append
+  // the upstream-specific model/deployment id). Callers must allocate a
+  // fresh FormData per call — see images/serve.ts, which builds a new
+  // FormData per binding for that reason.
+  callImagesEdits(model: UpstreamModel, body: FormData, signal?: AbortSignal, headers?: Record<string, string>): Promise<ProviderCallResult>;
 }

@@ -65,7 +65,10 @@ const finalizeCustomModels = (
   for (const rawModel of response.data) {
     if (!rawModel.id) continue;
     const kind = resolveModelKind(rawModel);
-    const upstreamEndpoints: readonly ModelEndpoint[] = kind === 'embedding' ? ['embeddings'] : configuredChatEndpoints;
+    const upstreamEndpoints: readonly ModelEndpoint[] =
+      kind === 'embedding' ? ['embeddings']
+        : kind === 'image' ? ['images_generations', 'images_edits']
+          : configuredChatEndpoints;
     models.push({
       ...customInternalModel(rawModel),
       kind,
@@ -108,15 +111,7 @@ export const createCustomProvider = (record: UpstreamRecord): ModelProviderInsta
       ? { ...body, stream: true, model: providerData(model).rawModelId }
       : { ...body, model: providerData(model).rawModelId };
     return upstream
-      .fetch(
-        endpoint,
-        {
-          method: 'POST',
-          body: JSON.stringify(requestBody),
-          signal,
-        },
-        headers && Object.keys(headers).length > 0 ? { extraHeaders: headers } : undefined,
-      )
+      .fetch(endpoint, { method: 'POST', body: JSON.stringify(requestBody), signal }, { extraHeaders: headers })
       .then(response => ({
         response,
         modelKey: providerData(model).rawModelId,
@@ -151,6 +146,14 @@ export const createCustomProvider = (record: UpstreamRecord): ModelProviderInsta
     callMessages: (model, body, signal, headers) => call('messages', model, body, signal, headers),
     callMessagesCountTokens: (model, body, signal, headers) => call('messages_count_tokens', model, body, signal, headers),
     callEmbeddings: (model, body, signal, headers) => call('embeddings', model, body, signal, headers),
+    callImagesGenerations: (model, body, signal, headers) => call('images_generations', model, body, signal, headers),
+    callImagesEdits: async (model, body, signal, headers) => {
+      // Custom forwards the user's raw model id. The runtime auto-encodes
+      // the FormData with a fresh boundary and sets Content-Type itself.
+      body.append('model', providerData(model).rawModelId);
+      const response = await upstream.fetch('images_edits', { method: 'POST', body, signal }, { extraHeaders: headers });
+      return { response, modelKey: providerData(model).rawModelId };
+    },
   };
 
   return {

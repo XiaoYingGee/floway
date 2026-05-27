@@ -79,9 +79,10 @@ const baseUrlField = (value: unknown): string => {
 const SUPPORTED_ENDPOINT_PATHS = new Set(['/chat/completions', '/v1/chat/completions', '/responses', '/v1/responses', '/v1/messages', '/messages']);
 
 const supportedEndpointsField = (value: unknown): string[] => {
-  // Empty is allowed: an upstream that only serves embedding models has no
-  // chat protocol to declare. supportedEndpoints stays an array contract so
-  // the storage shape is uniform across upstreams.
+  // Empty is allowed: an upstream that only serves embedding models
+  // (`kind === 'embedding'`) or image models (`kind === 'image'`) has no
+  // chat protocol to declare. supportedEndpoints stays an array contract
+  // so the storage shape is uniform across upstreams.
   if (!Array.isArray(value)) {
     throw new Error('Malformed custom upstream config: supportedEndpoints must be a string array');
   }
@@ -97,7 +98,7 @@ const supportedEndpointsField = (value: unknown): string[] => {
   return endpoints;
 };
 
-const PATH_OVERRIDE_KEYS = new Set<Exclude<EndpointKey, 'messages_count_tokens'>>(['chat_completions', 'responses', 'messages', 'embeddings', 'models']);
+const PATH_OVERRIDE_KEYS = new Set<Exclude<EndpointKey, 'messages_count_tokens'>>(['chat_completions', 'responses', 'messages', 'embeddings', 'images_generations', 'images_edits', 'models']);
 
 const pathOverridesField = (value: unknown): CustomUpstreamConfig['pathOverrides'] => {
   if (value === undefined) return undefined;
@@ -138,6 +139,8 @@ const CUSTOM_DEFAULT_PATHS: Record<EndpointKey, string> = {
   messages: '/v1/messages',
   messages_count_tokens: '/v1/messages/count_tokens',
   embeddings: '/v1/embeddings',
+  images_generations: '/v1/images/generations',
+  images_edits: '/v1/images/edits',
   models: '/v1/models',
 };
 
@@ -167,7 +170,7 @@ export const createCustomUpstream = (record: UpstreamRecord): Upstream => {
       } else {
         headers.set('Authorization', `Bearer ${config.bearerToken}`);
       }
-      if (init.body && !headers.has('Content-Type')) {
+      if (init.body && !headers.has('Content-Type') && !(init.body instanceof FormData)) {
         headers.set('Content-Type', 'application/json');
       }
       if (options?.extraHeaders) {

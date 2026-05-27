@@ -14,7 +14,7 @@ const props = defineProps<{
   upstreamFlagOverrides: Record<string, boolean>;
 }>();
 
-type ApiType = 'chat_completions' | 'responses' | 'responses_chat' | 'messages' | 'embeddings' | 'custom';
+type ApiType = 'chat_completions' | 'responses' | 'responses_chat' | 'messages' | 'embeddings' | 'images' | 'custom';
 
 const API_TYPE_ENDPOINTS: Record<Exclude<ApiType, 'custom'>, string[]> = {
   chat_completions: ['/chat/completions'],
@@ -22,6 +22,7 @@ const API_TYPE_ENDPOINTS: Record<Exclude<ApiType, 'custom'>, string[]> = {
   responses_chat: ['/responses', '/chat/completions'],
   messages: ['/v1/messages'],
   embeddings: ['/embeddings'],
+  images: ['/v1/images/generations', '/v1/images/edits'],
 };
 
 const apiTypeOptions: { value: ApiType; label: string }[] = [
@@ -30,6 +31,7 @@ const apiTypeOptions: { value: ApiType; label: string }[] = [
   { value: 'responses_chat', label: 'Responses + Chat' },
   { value: 'messages', label: 'Messages' },
   { value: 'embeddings', label: 'Embeddings' },
+  { value: 'images', label: 'Images' },
   { value: 'custom', label: 'Custom' },
 ];
 
@@ -37,6 +39,7 @@ const apiTypeFromEndpoints = (endpoints: string[] | undefined): ApiType => {
   const set = new Set(endpoints ?? []);
   if (set.has('/v1/messages') || set.has('/messages')) return 'messages';
   if (set.has('/embeddings') || set.has('/v1/embeddings')) return 'embeddings';
+  if (set.has('/v1/images/generations') || set.has('/images/generations') || set.has('/v1/images/edits') || set.has('/images/edits')) return 'images';
   const hasResponses = set.has('/responses') || set.has('/v1/responses');
   const hasChat = set.has('/chat/completions') || set.has('/v1/chat/completions');
   if (hasResponses && hasChat) return 'responses_chat';
@@ -142,6 +145,8 @@ const customSelectableEndpoints = [
   '/responses',
   '/v1/messages',
   '/embeddings',
+  '/v1/images/generations',
+  '/v1/images/edits',
 ];
 
 const titleFor = (d: AzureDeployment) => d.display_name?.trim() || d.deployment?.trim() || 'Untitled model';
