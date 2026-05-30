@@ -67,6 +67,7 @@ export const buildCopilotUpstreamRecord = (githubAccount: CopilotAccountFixture,
     createdAt: TEST_UPSTREAM_TIMESTAMP,
     updatedAt: TEST_UPSTREAM_TIMESTAMP,
     flagOverrides: {},
+    disabledPublicModelIds: [],
     ...rest,
     config: overrideConfig ?? config,
   };
@@ -89,6 +90,7 @@ export const buildCustomUpstreamRecord = (overrides: Partial<UpstreamRecord> = {
     createdAt: TEST_UPSTREAM_TIMESTAMP,
     updatedAt: TEST_UPSTREAM_TIMESTAMP,
     flagOverrides: {},
+    disabledPublicModelIds: [],
     ...rest,
     config: overrideConfig ?? config,
   };
