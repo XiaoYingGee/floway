@@ -1,5 +1,6 @@
 import { normalizeDisabledPublicModelIds } from './disabled-public-models.ts';
 import { normalizeFlagOverrides } from './flag-overrides.ts';
+import { deleteAllResponsesItemPayloadFiles, parseStoredResponsesPayload, serializeStoredResponsesPayload } from './responses-payload.ts';
 import type {
   ApiKey,
   ApiKeyRepo,
@@ -11,9 +12,11 @@ import type {
   PerformanceRepo,
   PerformanceTelemetryRecord,
   Repo,
+  ResponsesItemsRepo,
   SearchConfigRepo,
   SearchUsageRecord,
   SearchUsageRepo,
+  StoredResponsesItem,
   UpstreamProviderKind,
   UpstreamRecord,
   UpstreamRepo,
@@ -651,6 +654,111 @@ class D1CacheRepo implements CacheRepo {
   }
 }
 
+const RESPONSES_ITEM_COLUMNS = 'id, api_key_id, upstream_id, upstream_item_id, item_type, payload_json, encrypted_content_hash, created_at';
+
+class D1ResponsesItemsRepo implements ResponsesItemsRepo {
+  constructor(private db: D1Database) {}
+
+  async lookupMany(apiKeyId: string | null, ids: readonly string[]): Promise<StoredResponsesItem[]> {
+    const rows = await this.lookupByColumn(apiKeyId, 'id', ids);
+    const order = new Map([...new Set(ids)].map((id, index) => [id, index]));
+    return rows.toSorted((a, b) => order.get(a.id)! - order.get(b.id)!);
+  }
+
+  async lookupManyByEncryptedContentHash(apiKeyId: string | null, hashes: readonly string[]): Promise<StoredResponsesItem[]> {
+    return await this.lookupByColumn(apiKeyId, 'encrypted_content_hash', hashes);
+  }
+
+  // D1 caps bound parameters at 100 per query. A single Responses request can
+  // echo back more stored items than that — long agentic sessions resubmit
+  // every prior reasoning/compaction item each turn — so chunk the IN-list
+  // well under the cap (the `api_key_id` bind shares the budget) and union
+  // the results.
+  private async lookupByColumn(apiKeyId: string | null, column: 'id' | 'encrypted_content_hash', values: readonly string[]): Promise<StoredResponsesItem[]> {
+    const unique = [...new Set(values)];
+    if (unique.length === 0) return [];
+
+    const CHUNK = 90;
+    const chunks: string[][] = [];
+    for (let i = 0; i < unique.length; i += CHUNK) chunks.push(unique.slice(i, i + CHUNK));
+
+    const perChunk = await Promise.all(chunks.map(async chunk => {
+      const placeholders = chunk.map(() => '?').join(', ');
+      const { results } = await this.db
+        .prepare(`SELECT ${RESPONSES_ITEM_COLUMNS} FROM responses_items WHERE api_key_id IS ? AND ${column} IN (${placeholders})`)
+        .bind(apiKeyId, ...chunk)
+        .all<ResponsesItemRow>();
+      return await Promise.all(results.map(toStoredResponsesItem));
+    }));
+    return perChunk.flat();
+  }
+
+  async insertMany(items: readonly StoredResponsesItem[]): Promise<void> {
+    const statements = await Promise.all(items.map(async item => {
+      const payload = await serializeStoredResponsesPayload(item.id, item.apiKeyId, item.createdAt, item.payload);
+      // One INSERT per `(id, api_key_id)`. Stream pipelines call insertMany
+      // exactly once per stored id at the carrier's finalizing frame; the
+      // wrap's idMapper memoizes so reattempts within one stream are
+      // impossible. Cross-session collisions of the random body are
+      // effectively impossible (~2^-128) and treated as no-op if they ever
+      // happen.
+      return this.db
+        .prepare(
+          `INSERT INTO responses_items (${RESPONSES_ITEM_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (id, COALESCE(api_key_id, '')) DO NOTHING`,
+        )
+        .bind(item.id, item.apiKeyId, item.upstreamId, item.upstreamItemId, item.itemType, payload, item.encryptedContentHash, item.createdAt);
+    }));
+    await this.runStatements(statements);
+  }
+
+  async clearPayloadOlderThan(createdBefore: number): Promise<number> {
+    const result = await this.db.prepare('UPDATE responses_items SET payload_json = NULL WHERE payload_json IS NOT NULL AND created_at < ?').bind(createdBefore).run();
+    return (result.meta.changes as number | undefined) ?? 0;
+  }
+
+  async deleteOlderThan(createdBefore: number): Promise<number> {
+    const result = await this.db.prepare('DELETE FROM responses_items WHERE created_at < ?').bind(createdBefore).run();
+    return (result.meta.changes as number | undefined) ?? 0;
+  }
+
+  async deleteAll(): Promise<void> {
+    await this.db.prepare('DELETE FROM responses_items').run();
+    await deleteAllResponsesItemPayloadFiles();
+  }
+
+  private async runStatements(statements: D1PreparedStatement[]): Promise<void> {
+    if (statements.length === 0) return;
+    if (this.db.batch) {
+      await this.db.batch(statements);
+      return;
+    }
+    for (const statement of statements) await statement.run();
+  }
+}
+
+interface ResponsesItemRow {
+  id: string;
+  api_key_id: string | null;
+  upstream_id: string | null;
+  upstream_item_id: string | null;
+  item_type: string;
+  payload_json: string | null;
+  encrypted_content_hash: string | null;
+  created_at: number;
+}
+
+const toStoredResponsesItem = async (row: ResponsesItemRow): Promise<StoredResponsesItem> => ({
+  id: row.id,
+  apiKeyId: row.api_key_id,
+  upstreamId: row.upstream_id,
+  upstreamItemId: row.upstream_item_id,
+  itemType: row.item_type,
+  payload: await parseStoredResponsesPayload(row.id, row.payload_json),
+  encryptedContentHash: row.encrypted_content_hash,
+  createdAt: row.created_at,
+});
+
 class D1SearchConfigRepo implements SearchConfigRepo {
   constructor(private db: D1Database) {}
 
@@ -831,6 +939,7 @@ export class D1Repo implements Repo {
   cache: CacheRepo;
   searchConfig: SearchConfigRepo;
   upstreams: UpstreamRepo;
+  responsesItems: ResponsesItemsRepo;
 
   constructor(db: D1Database) {
     this.apiKeys = new D1ApiKeyRepo(db);
@@ -840,5 +949,6 @@ export class D1Repo implements Repo {
     this.cache = new D1CacheRepo(db);
     this.searchConfig = new D1SearchConfigRepo(db);
     this.upstreams = new D1UpstreamRepo(db);
+    this.responsesItems = new D1ResponsesItemsRepo(db);
   }
 }

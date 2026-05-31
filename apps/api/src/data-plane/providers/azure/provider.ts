@@ -88,5 +88,6 @@ export const createAzureProvider = (record: UpstreamRecord): ModelProviderInstan
     name: azure.name,
     disabledPublicModelIds: azure.disabledPublicModelIds,
     provider,
+    supportsResponsesItemReference: true,
   };
 };

@@ -47,6 +47,7 @@ export interface ProviderModelRecord {
   provider: ModelProvider;
   upstreamModel: UpstreamModel;
   enabledFlags: ReadonlySet<string>;
+  supportsResponsesItemReference: boolean;
   sourceInterceptors?: ProviderSourceInterceptors;
   targetInterceptors?: ProviderTargetInterceptors;
 }
@@ -90,6 +91,7 @@ export interface ModelProviderInstance {
   // dashboard view bypasses the registry and still sees them so they can be toggled.
   disabledPublicModelIds: readonly string[];
   provider: ModelProvider;
+  supportsResponsesItemReference: boolean;
   sourceInterceptors?: ProviderSourceInterceptors;
   targetInterceptors?: ProviderTargetInterceptors;
   resolveRequestedModelId?(modelId: string): string | undefined;

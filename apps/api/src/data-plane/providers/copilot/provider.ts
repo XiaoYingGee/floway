@@ -309,6 +309,7 @@ export const createCopilotProvider = async (record: UpstreamRecord): Promise<Mod
     name: copilot.name,
     disabledPublicModelIds: copilot.disabledPublicModelIds,
     provider,
+    supportsResponsesItemReference: false,
     sourceInterceptors: {
       messages: messagesCopilotSourceInterceptors,
     },

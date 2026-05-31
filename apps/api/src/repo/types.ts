@@ -160,6 +160,39 @@ export interface UpstreamRepo {
   deleteAll(): Promise<void>;
 }
 
+export interface StoredResponsesItem {
+  id: string;
+  apiKeyId: string | null;
+  upstreamId: string | null;
+  upstreamItemId: string | null;
+  itemType: string;
+  payload: StoredResponsesItemPayload | null;
+  // sha256 of the item's `encrypted_content`, when it carries one (reasoning /
+  // compaction). Lets a later turn that echoes the blob without a gateway id
+  // recover this row's owning upstream for affinity routing.
+  encryptedContentHash: string | null;
+  createdAt: number;
+}
+
+export interface StoredResponsesItemPayload {
+  item: unknown;
+  // Ancillary state stashed alongside the public `item` body but never sent on
+  // the wire: a server-only slot to preserve data a stateless client strips
+  // from the echoed item (e.g. the real `web_search_call` results) so a later
+  // turn can restore it on replay. Persisted and round-tripped verbatim; not
+  // yet populated by any producer.
+  private?: unknown;
+}
+
+export interface ResponsesItemsRepo {
+  lookupMany(apiKeyId: string | null, ids: readonly string[]): Promise<StoredResponsesItem[]>;
+  lookupManyByEncryptedContentHash(apiKeyId: string | null, hashes: readonly string[]): Promise<StoredResponsesItem[]>;
+  insertMany(items: readonly StoredResponsesItem[]): Promise<void>;
+  clearPayloadOlderThan(createdBefore: number): Promise<number>;
+  deleteOlderThan(createdBefore: number): Promise<number>;
+  deleteAll(): Promise<void>;
+}
+
 export interface Repo {
   apiKeys: ApiKeyRepo;
   usage: UsageRepo;
@@ -168,4 +201,5 @@ export interface Repo {
   cache: CacheRepo;
   searchConfig: SearchConfigRepo;
   upstreams: UpstreamRepo;
+  responsesItems: ResponsesItemsRepo;
 }

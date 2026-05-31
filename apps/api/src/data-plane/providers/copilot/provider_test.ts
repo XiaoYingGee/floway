@@ -15,6 +15,8 @@ test('Copilot provider exposes the highest-priority non-Claude endpoint', async 
   const instance = await createCopilotProvider(copilotUpstream);
   const provider = instance.provider;
 
+  assertEquals(instance.supportsResponsesItemReference, false);
+
   await withMockedFetch(
     request => {
       const url = new URL(request.url);
