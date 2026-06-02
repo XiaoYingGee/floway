@@ -200,8 +200,11 @@ there are no pending migrations, the command reduces to `pnpm run deploy`.
 Worker rollback by version id (`pnpm wrangler rollback <VERSION_ID>`)
 works across the 100 most recent versions, but Cloudflare blocks rollback
 when intervening deployments changed Durable Object migrations or removed
-referenced KV/R2/Queue bindings. This Worker only binds D1, so plain code
-rollback is currently safe; D1 state is rolled back separately as above.
+referenced KV/R2/Queue bindings. The Worker's bindings (D1, R2, Images,
+KV) only ever grow, never shrink — `pnpm run deploy` runs
+`scripts/check-bindings.ts` first and refuses to publish if
+wrangler.jsonc drops any of them — so plain code rollback stays safe; D1
+state is rolled back separately as above.
 
 A complete deploy fits in a strict turn budget: **three agent turns when
 migrations are pending** (Step 1 = gather, Step 2 = backup + report + two

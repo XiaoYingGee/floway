@@ -29,7 +29,21 @@ interface Env {
   [key: string]: unknown;
 }
 
+// Every binding declared on `Env` is load-bearing — D1 holds all config and
+// telemetry, R2 holds spilled payloads, Images compresses inline images, KV
+// memoises compressed results. A missing binding means wrangler.jsonc drifted
+// from the code, so we refuse to initialise rather than 503 on first use of
+// the absent binding.
+const REQUIRED_BINDINGS = ['DB', 'FILES', 'IMAGES', 'KV'] as const;
+
 const initRuntime = (env: Env): void => {
+  const missing = REQUIRED_BINDINGS.filter(name => env[name] === undefined || env[name] === null);
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required Cloudflare bindings: ${missing.join(', ')}. `
+      + 'Declare them in wrangler.jsonc; see wrangler.example.jsonc.',
+    );
+  }
   initEnv(n => (env[n] as string) ?? '');
   initRepo(new D1Repo(env.DB));
   initFileProvider(new R2FileProvider(env.FILES));

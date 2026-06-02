@@ -178,6 +178,7 @@ const config: Linter.Config[] = [
       // Workspace-root configs (live outside any package's TS project).
       'eslint.config.ts',
       'vitest.config.ts',
+      'scripts/**',
     ],
   },
 ];
