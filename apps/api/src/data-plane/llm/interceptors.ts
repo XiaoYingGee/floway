@@ -28,7 +28,7 @@ export interface StatefulResponsesContext {
 }
 
 /**
- * Per-HTTP-request scope. Constructed once in `createRequestContext` and
+ * Per client request scope. Constructed once in `createHttpRequestContext` and
  * threaded through every layer (source interceptors, target emits, target
  * interceptors, telemetry). Holds both immutable identities/adapters and
  * mutable per-request bags that cross-layer producers and consumers share.
@@ -50,7 +50,7 @@ export interface RequestContext {
   readonly requestStartedAt: number;
   readonly apiKeyId?: string;
   // null = Default mode (inherit global upstream order).
-  readonly apiKeyUpstreamIds?: readonly string[] | null;
+  readonly apiKeyUpstreamIds: readonly string[] | null;
   readonly runtimeLocation: string;
   readonly scheduleBackground?: BackgroundScheduler;
   readonly downstreamAbortSignal?: AbortSignal;
@@ -60,7 +60,7 @@ export interface RequestContext {
 
 /**
  * Per-provider-binding-attempt request-side description. Rebuilt for every
- * binding the planner tries inside one HTTP request.
+ * binding the planner tries inside one client request.
  *
  * - sourceApi / targetApi: the protocol the client spoke and the protocol
  *   the planner picked for this binding.
