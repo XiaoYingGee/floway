@@ -52,24 +52,13 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      # Ship the pull-based compose file to the VM so it always matches the repo.
-      - name: Copy compose file to VM
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
-          source: apps/server/docker-compose.deploy.yml
-          target: /opt/floway
-          strip_components: 2
-
-      # Authenticate to GHCR on the VM with the run-scoped GITHUB_TOKEN (valid for
-      # the workflow's lifetime, can pull this repo's package — no long-lived PAT),
-      # pull the SHA-pinned image, and restart the container.
-      - name: Pull and restart on VM
+      # Deploy on the VM by updating its checkout of the deployment source and
+      # running its own compose (base docker-compose.yml + the host-specific
+      # docker-compose.override.yml, which binds the service to loopback only).
+      # The run-scoped GITHUB_TOKEN authenticates both the private-repo fetch and
+      # the GHCR pull — valid for the workflow's lifetime, so no creds persist on
+      # the VM. The image is the SHA built by build-and-push.
+      - name: Update source and restart on VM
         uses: appleboy/ssh-action@v1.2.0
         env:
           GHCR_USER: ${{ github.actor }}
@@ -84,10 +73,19 @@ jobs:
           envs: GHCR_USER,GHCR_TOKEN,FLOWAY_IMAGE,ADMIN_KEY
           script: |
             set -euo pipefail
+            REPO="$HOME/codebase/floway"
+            # Self-bootstrap: turn the existing source dir into a git checkout on
+            # first run. Host-specific files (docker-compose.override.yml) stay
+            # untracked and survive the forced checkout.
+            [ -d "$REPO/.git" ] || git -C "$REPO" init -q
+            git -C "$REPO" fetch --depth 1 \
+              "https://x-access-token:${GHCR_TOKEN}@github.com/XiaoYingGee/floway.git" deployment
+            git -C "$REPO" checkout -q -f FETCH_HEAD
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-            cd /opt/floway
+            cd "$REPO/apps/server"
             export FLOWAY_IMAGE ADMIN_KEY
-            docker compose -f docker-compose.deploy.yml pull
-            docker compose -f docker-compose.deploy.yml up -d
+            # No -f: compose auto-merges docker-compose.yml + docker-compose.override.yml.
+            docker compose pull
+            docker compose up -d
             docker image prune -f
             docker logout ghcr.io
