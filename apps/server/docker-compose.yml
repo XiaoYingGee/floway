@@ -13,7 +13,10 @@ services:
     build:
       context: ../..
       dockerfile: apps/server/Dockerfile
-    image: floway
+    # Local runs build and tag `floway`. The CD pipeline sets FLOWAY_IMAGE to the
+    # CI-built GHCR tag (ghcr.io/xiaoyinggee/floway:<sha>) so `docker compose pull`
+    # fetches that prebuilt image instead of building on the VM.
+    image: ${FLOWAY_IMAGE:-floway}
     container_name: floway
     ports:
       - "8788:8788"
