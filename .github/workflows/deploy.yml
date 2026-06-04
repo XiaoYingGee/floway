@@ -86,6 +86,12 @@ jobs:
             export FLOWAY_IMAGE ADMIN_KEY
             # No -f: compose auto-merges docker-compose.yml + docker-compose.override.yml.
             docker compose pull
-            docker compose up -d
+            # The very first pipeline deploy inherits a `floway` container created
+            # out-of-band (not labelled for this compose project), which collides
+            # on the pinned container_name. Fall back to removing it and retrying;
+            # the /data/floway bind mount keeps all state. Subsequent deploys are
+            # compose-managed and recreate in place without the fallback.
+            docker compose up -d --remove-orphans \
+              || { docker rm -f floway >/dev/null 2>&1 || true; docker compose up -d --remove-orphans; }
             docker image prune -f
             docker logout ghcr.io
