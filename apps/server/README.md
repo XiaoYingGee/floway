@@ -124,6 +124,14 @@ bare `/data`.
 The container also defines a `HEALTHCHECK` hitting `/api/health`, so
 `docker ps` shows health status.
 
+## Continuous deployment
+
+The commands above are the local/manual path. Automated deploys to the VM run
+through GitHub Actions (build → GHCR → SSH → `docker compose` on the host) off a
+three-branch model (`main` mirror / `personal` integration / `deployment`
+release). See **[DEPLOY.md](./DEPLOY.md)** for the branch model, release flow,
+secrets, and rollback.
+
 ## Notes
 
 - `better-sqlite3` and `sharp` ship prebuilt native binaries for common
