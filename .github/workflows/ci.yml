@@ -1,10 +1,16 @@
-# Pre-merge gate for PRs targeting `deployment`. A PR cannot merge unless the
-# server typechecks and both the web console and server bundle build — the same
-# checks run by hand during upstream upgrades. Wired as a required status check
-# on the `deployment` branch protection.
+# Build/validation gate. Runs in two situations:
+#   - push to `personal`: early validation of integration work (e.g. right after
+#     merging upstream `main` into `personal` and resolving conflicts). personal
+#     is pushed directly and never receives PRs, so a push trigger is what catches
+#     a broken integration before it reaches a release PR.
+#   - PR into `deployment`: the release gate — wired as a required status check on
+#     `deployment` protection, so a PR that doesn't compile/bundle cannot merge.
+#     deployment only ever changes via PR merge.
 name: CI
 
 on:
+  push:
+    branches: [personal]
   pull_request:
     branches: [deployment]
 
