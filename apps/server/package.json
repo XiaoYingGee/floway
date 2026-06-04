@@ -1,0 +1,27 @@
+{
+  "name": "@floway-dev/server",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Self-hosted Node server entry for Floway. Implements the same runtime interfaces as entry-cloudflare.ts using server-native components (better-sqlite3, local fs, sharp) so the forked upstream code stays unmodified.",
+  "scripts": {
+    "build": "node build.mjs",
+    "start": "node dist/entry.js",
+    "dev": "node build.mjs && node dist/entry.js",
+    "migrate": "node dist/migrate.js",
+    "build:web": "pnpm --filter @floway-dev/web run build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.14.0",
+    "better-sqlite3": "^12.2.0",
+    "hono": "^4",
+    "sharp": "^0.34.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.9.3"
+  }
+}
