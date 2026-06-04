@@ -1,0 +1,35 @@
+# Pre-merge gate for PRs targeting `deployment`. A PR cannot merge unless the
+# server typechecks and both the web console and server bundle build — the same
+# checks run by hand during upstream upgrades. Wired as a required status check
+# on the `deployment` branch protection.
+name: CI
+
+on:
+  pull_request:
+    branches: [deployment]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm/action-setup reads the pinned version from package.json's
+      # "packageManager" field (pnpm@10.24.0).
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Typecheck server
+        run: pnpm --filter @floway-dev/server run typecheck
+
+      - name: Build web console
+        run: pnpm --filter @floway-dev/web run build
+
+      - name: Build server bundle
+        run: pnpm --filter @floway-dev/server run build
