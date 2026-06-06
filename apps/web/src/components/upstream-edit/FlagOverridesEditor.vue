@@ -1,4 +1,10 @@
 <script setup lang="ts">
+// Tri-state flag editor: each flag is either Inherit, On, or Off. The
+// `inheritedOverrides` prop is what the "Inherit" pill should resolve to when
+// the flag has no explicit override at the level being edited — at the
+// upstream level that's the flag's defaultFor; at the model level that's the
+// upstream's effective value for the flag.
+
 import { cn, OverlayScrollbars } from '@floway-dev/ui';
 import type { HTMLAttributes } from 'vue';
 
@@ -31,14 +37,14 @@ const setState = (flagId: string, next: TriState) => {
   overrides.value = copy;
 };
 
-const inheritedLabel = (flag: FlagDef, kind: UpstreamProviderKind) => {
+const inheritedLabel = (flag: FlagDef): 'on' | 'off' => {
   const inherited = props.inheritedOverrides[flag.id];
   if (typeof inherited === 'boolean') return inherited ? 'on' : 'off';
-  return flag.defaultFor.includes(kind) ? 'on' : 'off';
+  return flag.defaultFor.includes(props.providerKind) ? 'on' : 'off';
 };
 
-const stateLabel = (state: TriState, flag: FlagDef, kind: 'custom' | 'azure' | 'copilot') => {
-  if (state === 'inherit') return `Inherit: ${inheritedLabel(flag, kind)}`;
+const stateLabel = (state: TriState, flag: FlagDef) => {
+  if (state === 'inherit') return `Inherit: ${inheritedLabel(flag)}`;
   return state === 'on' ? 'On' : 'Off';
 };
 
@@ -53,10 +59,14 @@ const pillClass = (state: TriState, selected: boolean, inheritedTo: 'on' | 'off'
 </script>
 
 <template>
-  <OverlayScrollbars :class="cn('max-h-72', props.class)" no-tabindex :v-scrollbar-offset="{ x: 2 }">
+  <OverlayScrollbars :class="cn(props.class)" no-tabindex :v-scrollbar-offset="{ x: 2 }">
     <p v-if="flags.length === 0" class="text-[11px] text-gray-600">No flags are registered.</p>
-    <template v-else>
-      <div v-for="flag in flags" :key="flag.id" class="flex items-start justify-between gap-3 border-t border-white/[0.06] py-2.5">
+    <div v-else class="grid grid-cols-[repeat(auto-fit,minmax(320px,1fr))]">
+      <div
+        v-for="flag in flags"
+        :key="flag.id"
+        class="flex min-w-0 items-start justify-between gap-3 border-t border-white/[0.06] px-1 py-2.5"
+      >
         <div class="min-w-0">
           <span class="block break-words text-xs text-white">{{ flag.label || flag.id }}</span>
           <span v-if="flag.description" class="mt-0.5 block text-[11px] text-gray-500">{{ flag.description }}</span>
@@ -66,7 +76,7 @@ const pillClass = (state: TriState, selected: boolean, inheritedTo: 'on' | 'off'
             v-for="state in (['inherit', 'on', 'off'] as TriState[])"
             :key="state"
             class="flex cursor-pointer items-center gap-1 rounded border px-1.5 py-0.5 transition-colors"
-            :class="pillClass(state, stateFor(flag.id) === state, inheritedLabel(flag, providerKind))"
+            :class="pillClass(state, stateFor(flag.id) === state, inheritedLabel(flag))"
           >
             <input
               type="radio"
@@ -75,10 +85,10 @@ const pillClass = (state: TriState, selected: boolean, inheritedTo: 'on' | 'off'
               class="sr-only"
               @change="setState(flag.id, state)"
             >
-            <span>{{ stateLabel(state, flag, providerKind) }}</span>
+            <span>{{ stateLabel(state, flag) }}</span>
           </label>
         </fieldset>
       </div>
-    </template>
+    </div>
   </OverlayScrollbars>
 </template>

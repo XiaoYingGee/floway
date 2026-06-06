@@ -1,8 +1,4 @@
 <script setup lang="ts">
-// Copilot device-flow panel — extracted from CopilotAuthDialog so it can be
-// embedded inside UpstreamFormDialog (create mode, copilot provider) without
-// stacking a Dialog inside a Dialog.
-
 import { Button, Code, Spinner } from '@floway-dev/ui';
 import { onUnmounted, ref } from 'vue';
 
@@ -27,15 +23,10 @@ const stopPolling = () => {
   polling.value = false;
 };
 
-const reset = () => {
+const start = async () => {
   flow.value = null;
   error.value = null;
-  starting.value = false;
   stopPolling();
-};
-
-const start = async () => {
-  reset();
   starting.value = true;
   const { data, error: err } = await callApi<DeviceFlowStart>(
     () => api.api.upstreams.copilot.auth.start.$post(),
@@ -47,7 +38,7 @@ const start = async () => {
   }
   if (!data) return;
   flow.value = data;
-  scheduleNextPoll(data.interval || 5);
+  scheduleNextPoll(data.interval);
 };
 
 const scheduleNextPoll = (intervalSec: number) => {
@@ -77,8 +68,6 @@ const pollOnce = async (currentInterval: number) => {
     stopPolling();
   }
 };
-
-defineExpose({ reset });
 
 onUnmounted(stopPolling);
 </script>

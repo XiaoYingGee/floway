@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Card } from '@floway-dev/ui';
-import { onMounted, ref } from 'vue';
+import { computed, ref } from 'vue';
 
 import { callApi, useApi } from '../../api/client.ts';
 import type { CopilotQuotaSnapshot, CopilotUpstreamConfig } from '../../api/types.ts';
@@ -8,11 +8,13 @@ import type { CopilotQuotaSnapshot, CopilotUpstreamConfig } from '../../api/type
 const props = defineProps<{
   upstreamId: string;
   config: CopilotUpstreamConfig;
+  initialQuota?: CopilotQuotaSnapshot | null;
+  initialQuotaError?: string | null;
 }>();
 
 const api = useApi();
-const quota = ref<CopilotQuotaSnapshot | null>(null);
-const quotaError = ref<string | null>(null);
+const quota = ref<CopilotQuotaSnapshot | null>(props.initialQuota ?? null);
+const quotaError = ref<string | null>(props.initialQuotaError ?? null);
 const loadingQuota = ref(false);
 
 const loadQuota = async () => {
@@ -29,13 +31,14 @@ const loadQuota = async () => {
   quota.value = data ?? null;
 };
 
-const formatPercent = (entitlement: number, remaining: number) => {
-  if (entitlement <= 0) return null;
-  const used = Math.max(0, entitlement - remaining);
-  return Math.min(100, Math.round((used / entitlement) * 100));
-};
+const premium = computed(() => quota.value?.quota_snapshots?.premium_interactions);
 
-onMounted(() => { void loadQuota(); });
+const usedPercent = computed(() => {
+  const p = premium.value;
+  if (!p || p.entitlement <= 0) return null;
+  const used = Math.max(0, p.entitlement - p.remaining);
+  return Math.min(100, Math.round((used / p.entitlement) * 100));
+});
 </script>
 
 <template>
@@ -68,22 +71,20 @@ onMounted(() => { void loadQuota(); });
         </button>
       </header>
       <div v-if="quotaError" class="text-xs text-accent-rose">{{ quotaError }}</div>
-      <template v-else-if="quota?.quota_snapshots?.premium_interactions">
+      <template v-else-if="premium">
         <div class="space-y-1.5">
           <div class="flex items-baseline justify-between text-sm">
-            <span class="text-white">{{ quota.quota_snapshots.premium_interactions.entitlement - quota.quota_snapshots.premium_interactions.remaining }} / {{ quota.quota_snapshots.premium_interactions.entitlement }}</span>
-            <span class="text-xs text-gray-400">
-              {{ formatPercent(quota.quota_snapshots.premium_interactions.entitlement, quota.quota_snapshots.premium_interactions.remaining) }}% used
-            </span>
+            <span class="text-white">{{ premium.entitlement - premium.remaining }} / {{ premium.entitlement }}</span>
+            <span class="text-xs text-gray-400">{{ usedPercent }}% used</span>
           </div>
           <div class="h-1.5 overflow-hidden rounded-full bg-surface-700">
             <div
               class="h-full bg-accent-cyan transition-[width]"
-              :style="{ width: `${formatPercent(quota.quota_snapshots.premium_interactions.entitlement, quota.quota_snapshots.premium_interactions.remaining) ?? 0}%` }"
+              :style="{ width: `${usedPercent ?? 0}%` }"
             />
           </div>
-          <p v-if="quota.quota_snapshots.premium_interactions.reset_date" class="text-xs text-gray-500">
-            Resets on {{ new Date(quota.quota_snapshots.premium_interactions.reset_date).toLocaleDateString() }}
+          <p v-if="premium.reset_date" class="text-xs text-gray-500">
+            Resets on {{ new Date(premium.reset_date).toLocaleDateString() }}
           </p>
         </div>
       </template>
