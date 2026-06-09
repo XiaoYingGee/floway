@@ -1,0 +1,14 @@
+.git
+.gitignore
+.claude/
+.worktrees/
+.wrangler/
+.eslintcache
+node_modules/
+apps/web/dist/
+apps/platform-node/data/
+apps/platform-cloudflare/data/
+data/
+*.db
+*.db-wal
+*.db-shm

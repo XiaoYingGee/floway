@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [personal]
+  pull_request:
+    branches: [deployment]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Build web console
+        run: pnpm --filter @floway-dev/web run build
+
+      - name: Build Docker image
+        run: docker build -t floway-ci .
