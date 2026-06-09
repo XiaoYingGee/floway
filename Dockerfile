@@ -1,11 +1,8 @@
-FROM node:22-slim
+# Stage 1: Build web assets
+FROM node:22-slim AS web-builder
 WORKDIR /app
-
 RUN corepack enable
-
 COPY . .
-
-# pnpm v10 blocks dependency build scripts unless allow-listed.
 RUN node -e "\
   const fs=require('fs');\
   const p=JSON.parse(fs.readFileSync('package.json','utf8'));\
@@ -15,21 +12,23 @@ RUN node -e "\
     'sharp','esbuild','vue-demi'\
   ]));\
   fs.writeFileSync('package.json',JSON.stringify(p,null,2));"
-
 RUN pnpm install --no-frozen-lockfile \
   && pnpm --filter @floway-dev/web run build
 
-COPY docker-entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
-
-ENV NODE_ENV=production \
-    PORT=8788
-
+# Stage 2: Node app (API only, no static serving)
+FROM node:22-slim AS app
+WORKDIR /app
+RUN corepack enable
+COPY --from=web-builder /app .
+ENV NODE_ENV=production PORT=8788
 VOLUME /data/floway
 EXPOSE 8788
-
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8788)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+CMD ["pnpm", "--filter", "@floway-dev/platform-node", "run", "start"]
 
-ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["pnpm", "--filter", "@floway-dev/platform-node", "exec", "tsx", "docker-entry.ts"]
+# Stage 3: Nginx (static assets + reverse proxy)
+FROM nginx:alpine AS nginx
+COPY --from=web-builder /app/apps/web/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 80

@@ -1,10 +1,12 @@
 services:
-  floway:
-    build: .
-    image: ${FLOWAY_IMAGE:-floway}
-    container_name: floway
-    ports:
-      - "8788:8788"
+  app:
+    build:
+      context: .
+      target: app
+    image: ${FLOWAY_IMAGE:-floway}:app
+    container_name: floway-app
+    expose:
+      - "8788"
     environment:
       ADMIN_KEY: ${ADMIN_KEY:-admin123}
       FLOWAY_DB_PATH: /data/floway/floway.db
@@ -17,4 +19,21 @@ services:
       driver: json-file
       options:
         max-size: "10m"
+        max-file: "3"
+
+  nginx:
+    build:
+      context: .
+      target: nginx
+    image: ${FLOWAY_IMAGE:-floway}:nginx
+    container_name: floway
+    ports:
+      - "8788:80"
+    depends_on:
+      - app
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
         max-file: "3"
