@@ -15,16 +15,9 @@ export default defineConfig({
     }),
     presetWebFonts({
       provider: 'google',
-      // Emit an @import rather than fetching + inlining the font CSS at build
-      // time, so the build never depends on a live Google Fonts request (GitHub
-      // CI runners get rate-limited / 400'd). The browser loads fonts at runtime.
-      inlineImports: false,
       fonts: {
-        // Only real Google families here. Generic fallbacks (system-ui, etc.)
-        // live in theme.fontFamily below — putting them in the fetch list makes
-        // Google 400 the whole request.
-        sans: [{ name: 'DM Sans', weights: ['300', '400', '500', '600', '700'] }],
-        mono: [{ name: 'JetBrains Mono', weights: ['300', '400', '500', '600'] }],
+        sans: [{ name: 'DM Sans', weights: ['300', '400', '500', '600', '700'] }, 'system-ui', 'sans-serif'],
+        mono: [{ name: 'JetBrains Mono', weights: ['300', '400', '500', '600'] }, 'monospace'],
       },
     }),
   ],
@@ -44,6 +37,7 @@ export default defineConfig({
         emerald: '#00e676',
         amber: '#ffd740',
         rose: '#ff5252',
+        violet: '#a78bfa',
       },
     },
     fontFamily: {

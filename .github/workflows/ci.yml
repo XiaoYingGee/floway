@@ -31,11 +31,11 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      - name: Typecheck server
-        run: pnpm --filter @floway-dev/server run typecheck
+      - name: Typecheck
+        run: pnpm run typecheck
 
       - name: Build web console
         run: pnpm --filter @floway-dev/web run build
 
-      - name: Build server bundle
-        run: pnpm --filter @floway-dev/server run build
+      - name: Build Docker image
+        run: docker build -t floway-ci .

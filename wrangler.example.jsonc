@@ -13,7 +13,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "floway",
-  "main": "apps/api/entry-cloudflare.ts",
+  "main": "apps/platform-cloudflare/entry.ts",
   "compatibility_date": "2025-01-01",
   "triggers": {
     "crons": ["17 * * * *"]
@@ -35,6 +35,7 @@
       "/embeddings",
       "/images/*",
       "/models",
+      "/azure-api.codex/*",
       "/favicon.ico"
     ]
   },
@@ -43,7 +44,7 @@
       "binding": "DB",
       "database_name": "floway",
       "database_id": "<YOUR_D1_DATABASE_ID>",
-      "migrations_dir": "apps/api/migrations"
+      "migrations_dir": "packages/gateway/migrations"
     }
   ],
   "r2_buckets": [
