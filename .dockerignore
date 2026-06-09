@@ -1,5 +1,6 @@
 .git
 .gitignore
+.github/
 .claude/
 .worktrees/
 .wrangler/
@@ -9,6 +10,8 @@ apps/web/dist/
 apps/platform-node/data/
 apps/platform-cloudflare/data/
 data/
+graphify-out/
 *.db
 *.db-wal
 *.db-shm
+*.md

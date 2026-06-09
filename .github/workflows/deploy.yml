@@ -1,4 +1,4 @@
-# Build the self-hosted Floway image, push it to GHCR, and deploy it to the VM
+# Build the self-hosted Floway images, push to GHCR, and deploy to the VM
 # over SSH. Fires when a PR is merged into `deployment` (a merge is a push) and
 # can be run manually to redeploy the current ref.
 name: Deploy
@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: ghcr.io/xiaoyinggee/floway
+  REGISTRY: ghcr.io/xiaoyinggee/floway
 
 jobs:
   build-and-push:
@@ -34,19 +34,33 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build from the repo root: the image needs the whole monorepo. Tag both a
-      # rolling `latest` and the immutable commit SHA; the deploy job pins SHA.
-      - name: Build and push
+      # Build each stage as a separate image. The web-builder stage is shared
+      # via cache; only the final app and nginx stages are pushed.
+      - name: Build and push app image
         uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
+          target: app
           push: true
           tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ${{ env.REGISTRY }}-app:latest
+            ${{ env.REGISTRY }}-app:${{ github.sha }}
+          cache-from: type=gha,scope=app
+          cache-to: type=gha,scope=app,mode=max
+
+      - name: Build and push nginx image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          target: nginx
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}-nginx:latest
+            ${{ env.REGISTRY }}-nginx:${{ github.sha }}
+          cache-from: type=gha,scope=nginx
+          cache-to: type=gha,scope=nginx,mode=max
 
   deploy:
     needs: build-and-push
@@ -63,14 +77,15 @@ jobs:
         env:
           GHCR_USER: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FLOWAY_IMAGE: ${{ env.IMAGE }}:${{ github.sha }}
+          FLOWAY_IMAGE_APP: ${{ env.REGISTRY }}-app:${{ github.sha }}
+          FLOWAY_IMAGE_NGINX: ${{ env.REGISTRY }}-nginx:${{ github.sha }}
           ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           port: ${{ secrets.SSH_PORT || 22 }}
-          envs: GHCR_USER,GHCR_TOKEN,FLOWAY_IMAGE,ADMIN_KEY
+          envs: GHCR_USER,GHCR_TOKEN,FLOWAY_IMAGE_APP,FLOWAY_IMAGE_NGINX,ADMIN_KEY
           script: |
             set -euo pipefail
             REPO="$HOME/codebase/floway"
@@ -83,8 +98,7 @@ jobs:
             git -C "$REPO" checkout -q -f FETCH_HEAD
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             cd "$REPO"
-            export FLOWAY_IMAGE ADMIN_KEY
-            # No -f: compose auto-merges docker-compose.yml + docker-compose.override.yml.
+            export FLOWAY_IMAGE_APP FLOWAY_IMAGE_NGINX ADMIN_KEY
             docker compose pull
             # The very first pipeline deploy inherits a `floway` container created
             # out-of-band (not labelled for this compose project), which collides
