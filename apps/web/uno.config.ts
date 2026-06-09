@@ -15,9 +15,10 @@ export default defineConfig({
     }),
     presetWebFonts({
       provider: 'google',
+      inlineImports: false,
       fonts: {
-        sans: [{ name: 'DM Sans', weights: ['300', '400', '500', '600', '700'] }, 'system-ui', 'sans-serif'],
-        mono: [{ name: 'JetBrains Mono', weights: ['300', '400', '500', '600'] }, 'monospace'],
+        sans: [{ name: 'DM Sans', weights: ['300', '400', '500', '600', '700'] }],
+        mono: [{ name: 'JetBrains Mono', weights: ['300', '400', '500', '600'] }],
       },
     }),
   ],
