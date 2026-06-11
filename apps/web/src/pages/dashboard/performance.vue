@@ -36,7 +36,7 @@ export const usePerformancePageData = defineBasicLoader(async () => {
   const api = useApi();
   const auth = useAuthStore();
   const view: PerformanceView = auth.canViewGlobalTelemetry ? 'all-by-user' : 'self-by-key';
-  const { start, end, bucket } = dashboardRangeQuery('today');
+  const { start, end, bucket } = dashboardRangeQuery('today', Date.now());
   const overviewRes = await callApi<PerformanceOverviewResponse>(() => api.api.performance.overview.$get({
     query: { start, end, bucket, metric_scope: 'request_total', timezone_offset_minutes: String(new Date().getTimezoneOffset()), view },
   }));
@@ -59,6 +59,9 @@ const initialOverview = usePerformancePageData();
 
 const performanceRange = ref<DashboardRange>('today');
 const loadedPerformanceRange = ref<DashboardRange>('today');
+// Buckets and the request window are derived from the same `loadedAt` so the
+// chart axis stays in lockstep with whichever data snapshot is currently shown.
+const loadedAt = ref(Date.now());
 const performanceMetricScope = ref<Scope>('request_total');
 const performanceChartView = ref<ChartView>('model');
 const performancePercentile = ref<PercentileKey>('p95Ms');
@@ -75,8 +78,9 @@ const load = async () => {
   const requestedRange = performanceRange.value;
   const requestedScope = performanceMetricScope.value;
   const requestedView = performanceView.value;
+  const requestedAt = Date.now();
   performanceLoading.value = true;
-  const { start, end, bucket } = dashboardRangeQuery(requestedRange);
+  const { start, end, bucket } = dashboardRangeQuery(requestedRange, requestedAt);
   const { data, error: err } = await callApi<PerformanceOverviewResponse>(() => api.api.performance.overview.$get({
     query: { start, end, bucket, metric_scope: requestedScope, timezone_offset_minutes: String(new Date().getTimezoneOffset()), view: requestedView },
   }));
@@ -86,6 +90,7 @@ const load = async () => {
   performanceError.value = null;
   overview.value = data;
   loadedPerformanceRange.value = requestedRange;
+  loadedAt.value = requestedAt;
 };
 
 watch([performanceRange, performanceMetricScope, performanceView], load);
@@ -116,7 +121,7 @@ const formatDuration = (ms: number | null) => {
 };
 
 const chartConfig = computed<ChartConfiguration<'line'>>(() => {
-  const { keys: bucketKeys, labels } = dashboardBuckets(loadedPerformanceRange.value);
+  const { keys: bucketKeys, labels } = dashboardBuckets(loadedPerformanceRange.value, loadedAt.value);
 
   const datasets = performanceChartView.value === 'model'
     ? (() => {

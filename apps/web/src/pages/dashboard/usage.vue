@@ -92,7 +92,7 @@ export const useUsagePageData = defineBasicLoader(async () => {
   const api = useApi();
   const auth = useAuthStore();
   const view: UsageView = auth.canViewGlobalTelemetry ? 'all-by-user' : 'self-by-key';
-  const { start, end } = dashboardRangeQuery('today');
+  const { start, end } = dashboardRangeQuery('today', Date.now());
   const [{ usage, search }] = await Promise.all([
     fetchUsageForView(api, view, start, end),
     useModelsStore().load(),
@@ -122,6 +122,9 @@ const modelsStore = useModelsStore();
 
 const tokenRange = ref<Range>('today');
 const loadedTokenRange = ref<Range>('today');
+// Buckets and the request window are derived from the same `loadedAt` so the
+// chart axis stays in lockstep with whichever data snapshot is currently shown.
+const loadedAt = ref(Date.now());
 const tokenChartMetric = ref<Metric>('total');
 const redactKeys = ref(false);
 const view = ref<UsageView>(initialUsageData.data.value.view);
@@ -149,15 +152,17 @@ const load = async () => {
   const requestId = ++usageRequestId;
   const requestedRange = tokenRange.value;
   const requestedView = view.value;
+  const requestedAt = Date.now();
   tokenLoading.value = true;
   searchUsageLoading.value = true;
-  const { start, end } = dashboardRangeQuery(requestedRange);
+  const { start, end } = dashboardRangeQuery(requestedRange, requestedAt);
   try {
     const { usage, search } = await fetchUsageForView(api, requestedView, start, end);
     if (requestId !== usageRequestId || tokenRange.value !== requestedRange || view.value !== requestedView) return;
     if (usage) data.value = usage;
     if (search) searchData.value = search;
     loadedTokenRange.value = requestedRange;
+    loadedAt.value = requestedAt;
   } finally {
     if (requestId === usageRequestId) {
       tokenLoading.value = false;
@@ -214,7 +219,7 @@ const formatHitRate = (cached: number, created: number) => {
   return `${((cached / denom) * 100).toFixed(1)}%`;
 };
 
-const buckets = computed(() => dashboardBuckets(loadedTokenRange.value));
+const buckets = computed(() => dashboardBuckets(loadedTokenRange.value, loadedAt.value));
 
 const TOKEN_CHART_METRICS: Record<Metric, { label: string; kind: 'count' | 'cost' | 'tokens' | 'percent' }> = {
   requests: { label: 'Requests', kind: 'count' },
