@@ -39,7 +39,7 @@ A Cloudflare account is required.
 ```bash
 pnpm install
 
-# Local Worker config (gitignored). Fill in account_id, database_id, name.
+# Local Worker config (gitignored). Replace every <YOUR_*> placeholder.
 cp wrangler.example.jsonc wrangler.jsonc
 pnpm wrangler login
 pnpm wrangler d1 create <DB_NAME>
