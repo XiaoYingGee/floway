@@ -98,9 +98,9 @@ export { directFetcher } from './options.ts';
 export { isAbortError } from './abort.ts';
 
 export {
-  compressBase64ImageToWebp,
-  compressImageDataUrlToWebp,
   isBase64ImageDataUrl,
+  memoizedBase64Compressor,
+  memoizedDataUrlCompressor,
 } from './image-helpers.ts';
 
 export { COMPACTION_TRIGGER, compactionResponse } from './compaction.ts';

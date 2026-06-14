@@ -67,3 +67,37 @@ test('leaves remote https image references untouched', async () => {
 
   assertEquals(imageUrl(ctx.payload), 'https://example.com/cat.png');
 });
+
+test('compresses each unique inline image only once when the same data URL repeats', async () => {
+  let calls = 0;
+  initImageProcessor({
+    compressToWebp: () => {
+      calls += 1;
+      return Promise.resolve(new Uint8Array([1, 2, 3]));
+    },
+  });
+
+  const ctx = invocation({
+    model: 'gpt-test',
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,BBBB' } },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+        ],
+      },
+    ],
+  });
+
+  await withInlineImagesCompressed(ctx, stubRequest, okEvents);
+
+  assertEquals(calls, 2);
+});

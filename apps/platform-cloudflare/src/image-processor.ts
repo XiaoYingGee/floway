@@ -13,13 +13,6 @@ import { getImageCacheStore, sha256Hex } from '@floway-dev/platform';
 // - https://getwebp.com/blog/screenshots-webp-settings-text-ui
 const WEBP_QUALITY = 82;
 
-const CACHE_KEY_PREFIX = 'imgwebp';
-
-// Hot images keep getting their TTL refreshed on every read, so a busy
-// conversation's recurring inline image stays cached as long as it is
-// actively referenced. Cold entries age out after one day.
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-
 // Minimal shapes of the Cloudflare bindings we depend on, hand-typed so the
 // runtime contract does not pull in the full @cloudflare/workers-types
 // surface. We use only the transform/output path of the Images binding;
@@ -50,37 +43,31 @@ interface ImageTransformationResult {
   image(): ReadableStream;
 }
 
-const streamFrom = (bytes: Uint8Array): ReadableStream =>
-  new ReadableStream({
-    start(controller) {
-      controller.enqueue(bytes);
-      controller.close();
-    },
-  });
-
-class CloudflareImageProcessor implements ImageProcessor {
-  constructor(private readonly images: ImagesBinding) {}
-
+export const createCloudflareImageProcessor = (images: ImagesBinding): ImageProcessor => ({
   async compressToWebp(input: Uint8Array, target: ImageDimensions | null): Promise<Uint8Array> {
     // Key on the original bytes plus the exact transform we will request, so
     // every distinct (source, target size, encoder params) combination is a
     // separate entry and a changed quality or per-model size never serves a
     // stale result.
     const targetKey = target ? `${target.width}x${target.height}` : 'orig';
-    const key = `${CACHE_KEY_PREFIX}:${await sha256Hex(input)}:${targetKey}:webp:q${WEBP_QUALITY}`;
+    const key = `imgwebp:${await sha256Hex(input)}:${targetKey}:webp:q${WEBP_QUALITY}`;
 
     const store = getImageCacheStore();
-    const cached = await store.get(key, CACHE_TTL_MS);
+    const cached = await store.get(key);
     if (cached) return cached;
 
-    let transformer = this.images.input(streamFrom(input));
+    const sourceStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(input);
+        controller.close();
+      },
+    });
+    let transformer = images.input(sourceStream);
     if (target) transformer = transformer.transform({ width: target.width, height: target.height, fit: 'scale-down' });
     const result = await transformer.output({ format: 'image/webp', quality: WEBP_QUALITY });
     const output = new Uint8Array(await new Response(result.image()).arrayBuffer());
 
-    await store.put(key, output, CACHE_TTL_MS);
+    await store.put(key, output);
     return output;
-  }
-}
-
-export const createCloudflareImageProcessor = (images: ImagesBinding): ImageProcessor => new CloudflareImageProcessor(images);
+  },
+});

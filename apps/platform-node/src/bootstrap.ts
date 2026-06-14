@@ -6,6 +6,7 @@ import { SqliteImageCache } from './sqlite-image-cache.ts';
 import { nodeRuntimeRootCAs } from './tls-trust.ts';
 import { addTrustedRootCAs } from '@floway-dev/http';
 import {
+  IMAGE_CACHE_POLICY,
   initEnv,
   initFileProvider,
   initImageCacheStore,
@@ -27,7 +28,7 @@ export const bootstrapNodePlatform = (opts: NodePlatformOptions): { db: SqlDatab
   initSocketDial(nodeSocketDial);
   addTrustedRootCAs(nodeRuntimeRootCAs);
   const db = createNodeSqliteDatabase(opts.dbPath);
-  initImageCacheStore(new SqliteImageCache(db));
+  initImageCacheStore(new SqliteImageCache(db, IMAGE_CACHE_POLICY));
   initImageProcessor(createSharpImageProcessor());
   return { db };
 };

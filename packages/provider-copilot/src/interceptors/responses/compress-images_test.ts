@@ -94,3 +94,42 @@ test('compresses base64 images inside function_call_output tool outputs', async 
   const output = (ctx.payload.input as Array<{ type: string; output?: Array<{ type: string; image_url?: string }> }>)[0].output;
   assertEquals(output?.find(part => part.type === 'input_image')?.image_url, 'data:image/webp;base64,AQID');
 });
+
+test('compresses each unique inline image only once when the same data URL appears multiple times', async () => {
+  let calls = 0;
+  initImageProcessor({
+    compressToWebp: () => {
+      calls += 1;
+      return Promise.resolve(new Uint8Array([1, 2, 3]));
+    },
+  });
+
+  const ctx = invocation({
+    model: 'gpt-test',
+    input: [
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_image', image_url: 'data:image/png;base64,AAAA', detail: 'auto' },
+          { type: 'input_image', image_url: 'data:image/png;base64,AAAA', detail: 'auto' },
+        ],
+      },
+      {
+        type: 'function_call_output',
+        call_id: 'call_1',
+        output: [{ type: 'input_image', image_url: 'data:image/png;base64,AAAA', detail: 'high' }],
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_image', image_url: 'data:image/png;base64,BBBB', detail: 'auto' }],
+      },
+    ],
+  });
+
+  await withInlineImagesCompressed(ctx, stubRequest, okEvents);
+
+  // Two unique data URLs across four targets → exactly two compress calls.
+  assertEquals(calls, 2);
+});

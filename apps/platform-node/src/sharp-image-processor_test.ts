@@ -112,17 +112,15 @@ test('cache hit short-circuits encode and returns stored bytes', async () => {
   assertEquals(calls.put, 0);
 });
 
-test('cache miss writes the encoded result with a positive TTL', async () => {
+test('cache miss writes the encoded result through the cache store', async () => {
   const calls = { get: 0, put: 0 };
-  let lastTtl: number | null = null;
   const cacheStore: ImageCacheStore = {
     get: () => {
       calls.get += 1;
       return Promise.resolve(null);
     },
-    put: (_k, _v, ttl) => {
+    put: () => {
       calls.put += 1;
-      lastTtl = ttl;
       return Promise.resolve();
     },
     sweepExpired: () => Promise.resolve(),
@@ -133,7 +131,6 @@ test('cache miss writes the encoded result with a positive TTL', async () => {
   assert(isWebp(out), 'output should be WebP');
   assertEquals(calls.get, 1);
   assertEquals(calls.put, 1);
-  assert(lastTtl !== null && lastTtl > 0, 'TTL should be a positive number');
 });
 
 test('cache key differs by target so a resized variant is a separate entry', async () => {

@@ -1,11 +1,25 @@
-import type { ImageCacheStore } from '@floway-dev/platform';
+import type { ImageCachePolicy, ImageCacheStore } from '@floway-dev/platform';
 
 // Minimal shape of the Cloudflare KV binding we depend on. Hand-typed so the
 // runtime contract does not pull in the full @cloudflare/workers-types
-// surface.
+// surface. We need `getWithMetadata` and `put` with a `metadata` field so the
+// store can stamp each entry with its write time and decide whether a hit
+// needs a TTL refresh — see the per-key write rate limit at
+// https://developers.cloudflare.com/kv/platform/limits/.
 export interface KvNamespace {
-  get(key: string, type: 'arrayBuffer'): Promise<ArrayBuffer | null>;
-  put(key: string, value: ArrayBuffer | ArrayBufferView, options?: { expirationTtl?: number }): Promise<void>;
+  getWithMetadata<TMetadata>(
+    key: string,
+    type: 'arrayBuffer',
+  ): Promise<{ value: ArrayBuffer | null; metadata: TMetadata | null }>;
+  put(
+    key: string,
+    value: ArrayBuffer | ArrayBufferView,
+    options?: { expirationTtl?: number; metadata?: unknown },
+  ): Promise<void>;
+}
+
+interface CacheEntryMetadata {
+  writtenAt: number;
 }
 
 // CF KV requires `expirationTtl` in seconds with a 60-second minimum
@@ -18,20 +32,32 @@ const KV_MIN_TTL_SECONDS = 60;
 const ttlSeconds = (ttlMs: number): number => Math.max(KV_MIN_TTL_SECONDS, Math.ceil(ttlMs / 1000));
 
 export class KvImageCache implements ImageCacheStore {
-  constructor(private readonly kv: KvNamespace) {}
+  constructor(private readonly kv: KvNamespace, private readonly policy: ImageCachePolicy) {}
 
-  async get(key: string, refreshTtlMs: number): Promise<Uint8Array | null> {
-    const buf = await this.kv.get(key, 'arrayBuffer');
-    if (!buf) return null;
-    // Refresh expiry by re-writing with a fresh `expirationTtl`. Awaited so
-    // semantics are deterministic on Workers, which would drop a
-    // fire-and-forget write without an explicit `waitUntil`.
-    await this.kv.put(key, buf, { expirationTtl: ttlSeconds(refreshTtlMs) });
-    return new Uint8Array(buf);
+  async get(key: string): Promise<Uint8Array | null> {
+    const { value, metadata } = await this.kv.getWithMetadata<CacheEntryMetadata>(key, 'arrayBuffer');
+    if (!value) return null;
+    const now = Date.now();
+    // Entries written by older deploys carry no `writtenAt` metadata; treat
+    // them as past the refresh threshold so the next read stamps the current
+    // metadata shape onto them.
+    const age = metadata ? now - metadata.writtenAt : Infinity;
+    if (age >= this.policy.refreshIfOlderThanMs) {
+      // Awaited so the refresh actually lands — Workers would otherwise drop
+      // a fire-and-forget write without an explicit `waitUntil`.
+      await this.kv.put(key, value, {
+        expirationTtl: ttlSeconds(this.policy.ttlMs),
+        metadata: { writtenAt: now } satisfies CacheEntryMetadata,
+      });
+    }
+    return new Uint8Array(value);
   }
 
-  async put(key: string, value: Uint8Array, ttlMs: number): Promise<void> {
-    await this.kv.put(key, value, { expirationTtl: ttlSeconds(ttlMs) });
+  async put(key: string, value: Uint8Array): Promise<void> {
+    await this.kv.put(key, value, {
+      expirationTtl: ttlSeconds(this.policy.ttlMs),
+      metadata: { writtenAt: Date.now() } satisfies CacheEntryMetadata,
+    });
   }
 
   // KV evicts via the per-key `expirationTtl` set at write time, so the

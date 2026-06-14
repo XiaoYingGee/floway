@@ -5,6 +5,7 @@ import { cloudflareSocketDial } from './socket-dial.ts';
 import { cloudflareRuntimeRootCAs } from './tls-trust.ts';
 import { addTrustedRootCAs } from '@floway-dev/http';
 import {
+  IMAGE_CACHE_POLICY,
   initEnv,
   initFileProvider,
   initImageCacheStore,
@@ -45,7 +46,7 @@ export const bootstrapCloudflarePlatform = (env: CloudflareEnv): { db: SqlDataba
     return String(value);
   });
   initFileProvider(new R2FileProvider(env.FILES));
-  initImageCacheStore(new KvImageCache(env.KV));
+  initImageCacheStore(new KvImageCache(env.KV, IMAGE_CACHE_POLICY));
   initImageProcessor(createCloudflareImageProcessor(env.IMAGES));
   initSocketDial(cloudflareSocketDial);
   addTrustedRootCAs(cloudflareRuntimeRootCAs);
