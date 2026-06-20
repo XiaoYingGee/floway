@@ -39,6 +39,7 @@ export type {
   UpstreamProviderKind,
   UpstreamRecord,
 } from './model.ts';
+export { ALL_PROVIDER_KINDS } from './model.ts';
 
 export type {
   ModelProvider,
