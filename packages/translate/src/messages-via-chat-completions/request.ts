@@ -2,6 +2,7 @@ import { type ChatCompletionsScalarReasoning, chatCompletionsScalarReasoningFrom
 import { openAiJsonSchemaCoreFromMessagesFormat } from '../shared/messages/structured-output.ts';
 import { resolveMessagesReasoningEffort } from '../shared/messages-via/reasoning-effort.ts';
 import { normalizeMessagesToolInputSchema } from '../shared/messages-via/tool-schema.ts';
+import { TranslatorInputError } from '../translator-input-error.ts';
 import type { ChatCompletionsPayload, ChatCompletionsContentPart, ChatCompletionsMessage, ChatCompletionsTool, ChatCompletionsToolCall } from '@floway-dev/protocols/chat-completions';
 import type {
   MessagesAssistantContentBlock,
@@ -20,12 +21,6 @@ import type {
 
 const toChatCompletionsContent = (content: string | MessagesUserContentBlock[] | MessagesAssistantContentBlock[]): string | ChatCompletionsContentPart[] | null => {
   if (typeof content === 'string') return content;
-
-  for (const block of content) {
-    if (block.type !== 'text' && block.type !== 'image') {
-      throw new Error(`Messages → Chat Completions translator does not accept ${block.type} content blocks in message content.`);
-    }
-  }
 
   if (!content.some(block => block.type === 'image')) {
     return content
@@ -119,7 +114,7 @@ const getClientTools = (tools?: MessagesPayload['tools']): MessagesClientTool[] 
   return clientTools?.length ? clientTools : undefined;
 };
 
-const translateMessagesUser = (message: MessagesUserMessage): ChatCompletionsMessage[] => {
+const translateMessagesUser = (message: MessagesUserMessage, messageIdx: number): ChatCompletionsMessage[] => {
   if (!Array.isArray(message.content)) {
     return [
       {
@@ -142,20 +137,24 @@ const translateMessagesUser = (message: MessagesUserMessage): ChatCompletionsMes
     pendingUserBlocks.length = 0;
   };
 
-  for (const block of message.content) {
-    if (block.type !== 'tool_result') {
-      pendingUserBlocks.push(block);
+  for (const [blockIdx, block] of message.content.entries()) {
+    if (block.type === 'tool_result') {
+      // Preserving source chronology matters more than keeping one Chat message,
+      // so interleaved user content and tool results become alternating messages.
+      flushPendingUserBlocks();
+      messages.push({
+        role: 'tool',
+        tool_call_id: block.tool_use_id,
+        content: toChatCompletionsToolResultContent(block.content),
+      });
       continue;
     }
 
-    // Preserving source chronology matters more than keeping one Chat message,
-    // so interleaved user content and tool results become alternating messages.
-    flushPendingUserBlocks();
-    messages.push({
-      role: 'tool',
-      tool_call_id: block.tool_use_id,
-      content: toChatCompletionsToolResultContent(block.content),
-    });
+    if (block.type !== 'text' && block.type !== 'image') {
+      throw new TranslatorInputError(`messages.${messageIdx}.content.${blockIdx}.type: '${(block as { type: string }).type}' content blocks are not supported on this model`);
+    }
+
+    pendingUserBlocks.push(block);
   }
 
   flushPendingUserBlocks();
@@ -163,7 +162,7 @@ const translateMessagesUser = (message: MessagesUserMessage): ChatCompletionsMes
   return messages;
 };
 
-const translateMessagesAssistant = (message: MessagesAssistantMessage): ChatCompletionsMessage[] => {
+const translateMessagesAssistant = (message: MessagesAssistantMessage, messageIdx: number): ChatCompletionsMessage[] => {
   if (!Array.isArray(message.content)) {
     return [
       {
@@ -180,7 +179,7 @@ const translateMessagesAssistant = (message: MessagesAssistantMessage): ChatComp
     scalarReasoning: null,
   };
 
-  for (const block of message.content) {
+  for (const [blockIdx, block] of message.content.entries()) {
     switch (block.type) {
     case 'text':
       pending.textParts.push(block.text);
@@ -202,7 +201,7 @@ const translateMessagesAssistant = (message: MessagesAssistantMessage): ChatComp
       });
       break;
     default:
-      throw new Error(`Messages → Chat Completions translator does not accept ${(block as { type: string }).type} assistant content blocks.`);
+      throw new TranslatorInputError(`messages.${messageIdx}.content.${blockIdx}.type: '${(block as { type: string }).type}' assistant content blocks are not supported on this model`);
     }
   }
 
@@ -239,12 +238,12 @@ const translateMessagesInput = (messages: MessagesMessage[], system: string | Me
 
   return [
     ...systemMessages,
-    ...messages.flatMap((message): ChatCompletionsMessage[] => {
+    ...messages.flatMap((message, messageIdx): ChatCompletionsMessage[] => {
       switch (message.role) {
-      case 'user': return translateMessagesUser(message);
-      case 'assistant': return translateMessagesAssistant(message);
+      case 'user': return translateMessagesUser(message, messageIdx);
+      case 'assistant': return translateMessagesAssistant(message, messageIdx);
       case 'system': return translateMessagesSystem(message);
-      default: throw new Error(`Messages → Chat Completions translator does not accept role ${(message as { role: string }).role}.`);
+      default: throw new TranslatorInputError(`messages.${messageIdx}.role: role '${(message as { role: string }).role}' is not supported on this model`);
       }
     }),
   ];

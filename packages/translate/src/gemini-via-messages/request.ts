@@ -13,6 +13,7 @@ import {
   geminiVisibleText,
 } from '../shared/gemini-via/gemini.ts';
 import { applyLastMessageCacheBreakpoint, applyLastSystemCacheBreakpoint, applyLastToolCacheBreakpoint } from '../shared/via-messages/cache-breakpoints.ts';
+import { TranslatorInputError } from '../translator-input-error.ts';
 import type { GeminiContent, GeminiPayload, GeminiGenerationConfig, GeminiPart, GeminiThinkingConfig } from '@floway-dev/protocols/gemini';
 import {
   MESSAGES_FALLBACK_MAX_TOKENS,
@@ -66,7 +67,7 @@ const buildUserMessage = (content: GeminiContent, turnIndex: number, unmatchedTo
       return;
     }
     default:
-      throw new Error(`Gemini → Messages translator does not accept ${kind} parts in user content.`);
+      throw new TranslatorInputError(`"${kind}" parts are not supported in user content.`);
     }
   });
 
@@ -136,7 +137,7 @@ const buildAssistantMessage = (content: GeminiContent, turnIndex: number, unmatc
       return;
     }
     default:
-      throw new Error(`Gemini → Messages translator does not accept ${kind} parts in model content.`);
+      throw new TranslatorInputError(`"${kind}" parts are not supported in model content.`);
     }
   });
 
@@ -254,7 +255,7 @@ export const buildTargetRequest = (
       message = buildUserMessage(content, turnIndex, unmatchedToolCallIds);
       break;
     default:
-      throw new Error(`Gemini → Messages translator does not accept ${(content as { role: string }).role} content roles.`);
+      throw new TranslatorInputError(`"${(content as { role: string }).role}" is not a supported content role.`);
     }
     if (message) request.messages.push(message);
   });
