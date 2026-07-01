@@ -17,7 +17,7 @@ import {
 import type { CodexAccountCredential } from './state.ts';
 import type { ResponsesCompactPayload, ResponsesPayload, ResponsesResult, ResponsesStreamEvent } from '@floway-dev/protocols/responses';
 import { parseResponsesStream } from '@floway-dev/protocols/responses';
-import { type ProviderStreamResult, streamingProviderCall, uuidV7, type UpstreamCallOptions, type UpstreamModel } from '@floway-dev/provider';
+import { type ProviderModel, type ProviderStreamResult, streamingProviderCall, uuidV7, type UpstreamCallOptions } from '@floway-dev/provider';
 
 export type ProviderCompactionResult =
   | { ok: true; result: ResponsesResult; modelKey: string }
@@ -38,7 +38,7 @@ export interface CodexCallEffects {
 interface CodexBackendCallBase {
   upstreamId: string;
   account: CodexAccountCredential;
-  model: UpstreamModel;
+  model: ProviderModel;
   headers: Headers;
   turnMetadata?: CodexTurnMetadataOptions;
   signal?: AbortSignal;

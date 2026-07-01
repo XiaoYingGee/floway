@@ -8,8 +8,8 @@ import type { ResponsesInvocation } from '../types.ts';
 import { eventFrame } from '@floway-dev/protocols/common';
 import type { ProtocolFrame } from '@floway-dev/protocols/common';
 import type { ResponsesResult, ResponsesStreamEvent } from '@floway-dev/protocols/responses';
-import { directFetcher, type EventResult, type ExecuteResult } from '@floway-dev/provider';
-import { assert, assertEquals } from '@floway-dev/test-utils';
+import { type EventResult, type ExecuteResult } from '@floway-dev/provider';
+import { assert, assertEquals, stubModelCandidate } from '@floway-dev/test-utils';
 
 // Dirty integration harness: mock the model registry so the image backend is a
 // pair of in-test stubs, then drive the whole shim (function-tool rewrite,
@@ -60,6 +60,13 @@ const defaultCandidates = vi.hoisted(() => () => [{
   model: {
     id: 'gpt-image-2',
     endpoints: { imagesGenerations: {}, imagesEdits: {} },
+    providerModels: {
+      u: {
+        id: 'gpt-image-2', limits: {}, kind: 'image',
+        endpoints: { imagesGenerations: {}, imagesEdits: {} },
+        enabledFlags: new Set<string>(),
+      },
+    },
   },
   fetcher: (request: Request) => fetch(request),
 }]);
@@ -132,19 +139,10 @@ const scriptedRun = (turns: ProtocolFrame<ResponsesStreamEvent>[][]) => {
 };
 
 const makeCtx = (input: unknown[], action: 'generate' | 'edit' | 'auto' = 'auto', extraTool: Record<string, unknown> = {}): ResponsesInvocation => ({
-  candidate: {
-    provider: {
-      upstream: 'test-upstream', kind: 'custom', name: 'test',
-      disabledPublicModelIds: [], modelPrefix: null,
-      instance: {} as never, supportsResponsesItemReference: false,
-    },
-    model: {
-      id: 'm', limits: {}, kind: 'chat',
-      endpoints: { responses: {} },
-      enabledFlags: new Set<string>(['responses-image-generation-shim']),
-    },
-    fetcher: directFetcher,
-  },
+  candidate: stubModelCandidate({
+    enabledFlags: new Set(['responses-image-generation-shim']),
+    model: { id: 'm', endpoints: { responses: {} } },
+  }),
   targetApi: 'responses',
   payload: { model: 'orchestrator', input, tools: [{ type: 'image_generation', action, ...extraTool }] } as never,
   headers: new Headers(),
@@ -375,18 +373,13 @@ test('resolveImageCandidate renders model_not_supported when image-kind candidat
   // The resolver produced an image-kind candidate but its `endpoints` does
   // not include the per-endpoint key the request needs (imagesGenerations).
   stub.nextResolutionOverride = {
-    candidates: [{
-      provider: {
-        upstream: 'u', kind: 'custom', name: 'wrong-endpoint',
-        disabledPublicModelIds: [], modelPrefix: null,
-        supportsResponsesItemReference: false,
-        provider: { getPricingForModelKey: () => null },
+    candidates: [stubModelCandidate({
+      model: {
+        id: 'gpt-image-2',
+        kind: 'image',
+        endpoints: { imagesEdits: {} },
       },
-      // Image-kind candidate without `imagesGenerations` — the endpoint
-      // filter inside resolveImageCandidate rejects it.
-      model: { id: 'gpt-image-2', endpoints: { imagesEdits: {} } },
-      fetcher: (request: Request) => fetch(request),
-    }],
+    })],
     sawModel: true,
     failedUpstreams: [],
   };

@@ -4,8 +4,8 @@ import { CODEX_ORIGINATOR, CODEX_USER_AGENT } from './constants.ts';
 import { callCodexResponses, callCodexResponsesCompact, type CodexCallEffects } from './fetch.ts';
 import type { CodexAccessTokenEntry, CodexAccountCredential, CodexQuotaSnapshotEntry, CodexUpstreamState } from './state.ts';
 import type { ResponsesResult } from '@floway-dev/protocols/responses';
-import { initProviderRepo, type Fetcher, type UpstreamModel, type UpstreamRecord } from '@floway-dev/provider';
-import { noopUpstreamCallOptions } from '@floway-dev/test-utils';
+import { initProviderRepo, type Fetcher, type UpstreamRecord } from '@floway-dev/provider';
+import { noopUpstreamCallOptions, stubProviderModel } from '@floway-dev/test-utils';
 
 const makeEffects = (): CodexCallEffects => ({
   persistRefreshTokenRotation: vi.fn(async () => {}),
@@ -13,9 +13,7 @@ const makeEffects = (): CodexCallEffects => ({
 });
 
 const activeAccount: CodexAccountCredential = { chatgptAccountId: 'acc', refresh_token: 'rt_v1', state: 'active', state_updated_at: '2026-01-01T00:00:00Z', openaiDeviceId: '11111111-2222-4333-8444-555555555555', accessToken: null, quotaSnapshot: null };
-const model: UpstreamModel = {
-  id: 'gpt-5.4', display_name: 'gpt-5.4', kind: 'chat', limits: {}, endpoints: { responses: {} }, enabledFlags: new Set(),
-};
+const model = stubProviderModel({ id: 'gpt-5.4', display_name: 'gpt-5.4', endpoints: { responses: {} } });
 
 const upstreamId = 'up_a';
 const UUID_V7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
