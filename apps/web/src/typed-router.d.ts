@@ -43,13 +43,16 @@ declare module 'vue-router/auto-routes' {
       Record<never, never>,
       Record<never, never>,
       | '/dashboard/'
-      | '/dashboard/keys'
+      | '/dashboard/keys/'
       | '/dashboard/models'
       | '/dashboard/performance'
+      | '/dashboard/requests/'
+      | '/dashboard/requests/[keyId]'
       | '/dashboard/settings'
       | '/dashboard/upstreams/[id]'
-      | '/dashboard/upstreams/new'
+      | '/dashboard/upstreams/new/[provider]'
       | '/dashboard/usage'
+      | '/dashboard/users'
     >,
     '/dashboard/': RouteRecordInfo<
       '/dashboard/',
@@ -58,8 +61,8 @@ declare module 'vue-router/auto-routes' {
       Record<never, never>,
       | never
     >,
-    '/dashboard/keys': RouteRecordInfo<
-      '/dashboard/keys',
+    '/dashboard/keys/': RouteRecordInfo<
+      '/dashboard/keys/',
       '/dashboard/keys',
       Record<never, never>,
       Record<never, never>,
@@ -79,6 +82,20 @@ declare module 'vue-router/auto-routes' {
       Record<never, never>,
       | never
     >,
+    '/dashboard/requests/': RouteRecordInfo<
+      '/dashboard/requests/',
+      '/dashboard/requests',
+      Record<never, never>,
+      Record<never, never>,
+      | never
+    >,
+    '/dashboard/requests/[keyId]': RouteRecordInfo<
+      '/dashboard/requests/[keyId]',
+      '/dashboard/requests/:keyId',
+      { keyId: ParamValue<true> },
+      { keyId: ParamValue<false> },
+      | never
+    >,
     '/dashboard/settings': RouteRecordInfo<
       '/dashboard/settings',
       '/dashboard/settings',
@@ -93,16 +110,23 @@ declare module 'vue-router/auto-routes' {
       { id: ParamValue<false> },
       | never
     >,
-    '/dashboard/upstreams/new': RouteRecordInfo<
-      '/dashboard/upstreams/new',
-      '/dashboard/upstreams/new',
-      Record<never, never>,
-      Record<never, never>,
+    '/dashboard/upstreams/new/[provider]': RouteRecordInfo<
+      '/dashboard/upstreams/new/[provider]',
+      '/dashboard/upstreams/new/:provider',
+      { provider: ParamValue<true> },
+      { provider: ParamValue<false> },
       | never
     >,
     '/dashboard/usage': RouteRecordInfo<
       '/dashboard/usage',
       '/dashboard/usage',
+      Record<never, never>,
+      Record<never, never>,
+      | never
+    >,
+    '/dashboard/users': RouteRecordInfo<
+      '/dashboard/users',
+      '/dashboard/users',
       Record<never, never>,
       Record<never, never>,
       | never
@@ -143,13 +167,16 @@ declare module 'vue-router/auto-routes' {
       routes:
         | '/dashboard'
         | '/dashboard/'
-        | '/dashboard/keys'
+        | '/dashboard/keys/'
         | '/dashboard/models'
         | '/dashboard/performance'
+        | '/dashboard/requests/'
+        | '/dashboard/requests/[keyId]'
         | '/dashboard/settings'
         | '/dashboard/upstreams/[id]'
-        | '/dashboard/upstreams/new'
+        | '/dashboard/upstreams/new/[provider]'
         | '/dashboard/usage'
+        | '/dashboard/users'
       views:
         | 'default'
     }
@@ -159,9 +186,9 @@ declare module 'vue-router/auto-routes' {
       views:
         | never
     }
-    'src/pages/dashboard/keys.vue': {
+    'src/pages/dashboard/keys/index.vue': {
       routes:
-        | '/dashboard/keys'
+        | '/dashboard/keys/'
       views:
         | never
     }
@@ -177,6 +204,18 @@ declare module 'vue-router/auto-routes' {
       views:
         | never
     }
+    'src/pages/dashboard/requests/index.vue': {
+      routes:
+        | '/dashboard/requests/'
+      views:
+        | never
+    }
+    'src/pages/dashboard/requests/[keyId].vue': {
+      routes:
+        | '/dashboard/requests/[keyId]'
+      views:
+        | never
+    }
     'src/pages/dashboard/settings.vue': {
       routes:
         | '/dashboard/settings'
@@ -189,15 +228,21 @@ declare module 'vue-router/auto-routes' {
       views:
         | never
     }
-    'src/pages/dashboard/upstreams/new.vue': {
+    'src/pages/dashboard/upstreams/new/[provider].vue': {
       routes:
-        | '/dashboard/upstreams/new'
+        | '/dashboard/upstreams/new/[provider]'
       views:
         | never
     }
     'src/pages/dashboard/usage.vue': {
       routes:
         | '/dashboard/usage'
+      views:
+        | never
+    }
+    'src/pages/dashboard/users.vue': {
+      routes:
+        | '/dashboard/users'
       views:
         | never
     }

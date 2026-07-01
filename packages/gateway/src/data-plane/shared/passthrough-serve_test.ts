@@ -8,8 +8,9 @@
 //   - its acceptBinding gate is `kind === 'embedding'`, satisfied by any
 //     embedding-only custom upstream, with no per-endpoint Copilot setup
 //     required;
-//   - its extractUsage reads OpenAI-style `usage.prompt_tokens`, so a
-//     2xx JSON body with that shape triggers a real usage write;
+//   - its extractBilling reads the OpenAI-style `usage.prompt_tokens` off
+//     a 2xx JSON body, so a body with that shape triggers a real usage
+//     write;
 //   - it shares the exact same forwardUpstreamResponse + scheduleUsageRecord
 //     path as the images endpoints — the behaviors under test are owned by
 //     passthroughServe, not the endpoint shape.
@@ -17,22 +18,21 @@
 import { test, vi } from 'vitest';
 
 import { buildCustomUpstreamRecord, flushAsyncWork, requestApp, setupAppTest } from '../../test-helpers.ts';
-import { clearModelsStore } from '@floway-dev/provider';
-import { clearCopilotTokenCache } from '@floway-dev/provider-copilot';
+import { clearInProcessCopilotTokenCache } from '@floway-dev/provider-copilot';
 import { jsonResponse, withMockedFetch, assertEquals, assertExists } from '@floway-dev/test-utils';
 
 const registerEmbeddingsUpstream = async (repo: Awaited<ReturnType<typeof setupAppTest>>['repo']): Promise<void> => {
   await repo.upstreams.deleteAll();
-  clearModelsStore();
-  await clearCopilotTokenCache();
+  clearInProcessCopilotTokenCache();
   await repo.upstreams.save(buildCustomUpstreamRecord({
     id: 'up_passthrough',
     name: 'Passthrough Embedding Provider',
     sortOrder: 100,
     config: {
       baseUrl: 'https://passthrough.example.com',
-      bearerToken: 'sk-passthrough',
-      endpoints: {  },
+      authStyle: 'bearer',
+      apiKey: 'sk-passthrough',
+      endpoints: {},
     },
   }));
 };
@@ -41,9 +41,6 @@ test('passthrough-serve: usage-record failure does not turn upstream 2xx into 50
   const { apiKey, repo } = await setupAppTest();
   await registerEmbeddingsUpstream(repo);
 
-  // Replace the usage repo's record method with a rejection so the
-  // scheduled usage write fails. The 200 from upstream must still reach
-  // the client unchanged; the failure is observable via console.error.
   repo.usage.record = () => Promise.reject(new Error('simulated SQL write failure'));
   const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
@@ -78,8 +75,6 @@ test('passthrough-serve: usage-record failure does not turn upstream 2xx into 50
       },
     );
 
-    // The scheduled write rejected, was caught, and logged. The exact
-    // first argument matches scheduleUsageRecord's wording.
     assertEquals(errorSpy.mock.calls.some(call => call[0] === 'Failed to record token usage:'), true);
   } finally {
     errorSpy.mockRestore();
@@ -123,13 +118,11 @@ test('passthrough-serve: non-JSON 2xx upstream body is forwarded verbatim with n
       },
     );
 
-    // safeJsonClone returned undefined for the binary body, so extractUsage
-    // was never called and no usage row was recorded.
     const usage = await repo.usage.listAll();
     assertEquals(usage.length, 0);
     // The parse failure is observable through console.warn so operators can
     // correlate missing usage rows against upstream body shape regressions.
-    assertEquals(warnSpy.mock.calls.some(call => typeof call[0] === 'string' && call[0].includes('passthrough-serve: failed to parse 2xx upstream body for embeddings')), true);
+    assertEquals(warnSpy.mock.calls.some(call => typeof call[0] === 'string' && call[0].includes('passthrough-serve: failed to parse 2xx upstream body for /embeddings')), true);
   } finally {
     warnSpy.mockRestore();
   }
@@ -181,7 +174,6 @@ test('passthrough-serve: response header allow-list forwards expected headers an
       assertEquals(response.headers.get('x-ratelimit-remaining'), '100');
       assertEquals(response.headers.get('retry-after'), '30');
       assertEquals(response.headers.get('cf-ray'), 'abc');
-      // Out-of-allow-list headers are stripped.
       assertEquals(response.headers.get('x-internal-secret'), null);
       assertEquals(response.headers.get('set-cookie'), null);
       await response.json();

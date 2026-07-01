@@ -26,7 +26,7 @@ const makeCtx = (
     max_tokens: 128,
     ...(thinking ? { thinking } : {}),
   },
-  headers: {},
+  headers: new Headers(),
   model: stubUpstreamModel({ endpoints: { messages: {} } }),
 });
 
@@ -93,7 +93,6 @@ test('withThinkingDisplayPromoted sends summarized upstream when thinking displa
         name: 'Error',
         message: 'stop',
         stack: '',
-        source_api: 'messages',
         target_api: 'messages',
       },
     }));

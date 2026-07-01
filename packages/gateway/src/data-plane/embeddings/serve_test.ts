@@ -1,8 +1,7 @@
 import { test } from 'vitest';
 
 import { buildCustomUpstreamRecord, copilotModels, flushAsyncWork, requestApp, setupAppTest } from '../../test-helpers.ts';
-import { clearModelsStore } from '@floway-dev/provider';
-import { clearCopilotTokenCache } from '@floway-dev/provider-copilot';
+import { clearInProcessCopilotTokenCache } from '@floway-dev/provider-copilot';
 import { jsonResponse, withMockedFetch, assertEquals, assertExists } from '@floway-dev/test-utils';
 
 test('/v1/embeddings wraps scalar string input for Copilot upstream', async () => {
@@ -27,6 +26,7 @@ test('/v1/embeddings wraps scalar string input for Copilot upstream', async () =
           token: 'copilot-access-token',
           expires_at: 4102444800,
           refresh_in: 3600,
+          endpoints: { api: 'https://api.individual.githubcopilot.com' },
         });
       }
       if (url.pathname === '/models') {
@@ -84,6 +84,7 @@ test('/v1/embeddings records usage under request model when upstream omits model
           token: 'copilot-access-token',
           expires_at: 4102444800,
           refresh_in: 3600,
+          endpoints: { api: 'https://api.individual.githubcopilot.com' },
         });
       }
       if (url.pathname === '/models') {
@@ -129,13 +130,9 @@ test('/v1/embeddings records usage under request model when upstream omits model
   const upstreamSuccess = performanceRows.find(row => row.metricScope === 'upstream_success');
   assertExists(requestTotal);
   assertExists(upstreamSuccess);
-  assertEquals(requestTotal.sourceApi, 'embeddings');
-  assertEquals(requestTotal.targetApi, 'embeddings');
   assertEquals(requestTotal.model, 'text-embedding-real');
   assertEquals(requestTotal.requests, 1);
   assertEquals(requestTotal.errors, 0);
-  assertEquals(upstreamSuccess.sourceApi, 'embeddings');
-  assertEquals(upstreamSuccess.targetApi, 'embeddings');
   assertEquals(upstreamSuccess.model, 'text-embedding-real');
   assertEquals(upstreamSuccess.requests, 1);
   assertEquals(upstreamSuccess.errors, 0);
@@ -156,6 +153,7 @@ test('/v1/embeddings records request and upstream performance', async () => {
           token: 'copilot-access-token',
           expires_at: 4102444800,
           refresh_in: 3600,
+          endpoints: { api: 'https://api.individual.githubcopilot.com' },
         });
       }
       if (url.pathname === '/models') {
@@ -198,8 +196,6 @@ test('/v1/embeddings records request and upstream performance', async () => {
     assertEquals(record.model, 'text-embedding-real');
     assertEquals(record.upstream, copilotUpstream.id);
     assertEquals(record.modelKey, 'text-embedding-real');
-    assertEquals(record.sourceApi, 'embeddings');
-    assertEquals(record.targetApi, 'embeddings');
     assertEquals(record.stream, false);
     assertEquals(record.requests, 1);
     assertEquals(record.errors, 0);
@@ -209,8 +205,7 @@ test('/v1/embeddings records request and upstream performance', async () => {
 test('/v1/embeddings routes to custom upstream when model is only declared there', async () => {
   const { apiKey, repo } = await setupAppTest();
   await repo.upstreams.deleteAll();
-  clearModelsStore();
-  await clearCopilotTokenCache();
+  clearInProcessCopilotTokenCache();
 
   await repo.upstreams.save(buildCustomUpstreamRecord({
     id: 'up_embed',
@@ -222,8 +217,9 @@ test('/v1/embeddings routes to custom upstream when model is only declared there
     disabledPublicModelIds: [],
     config: {
       baseUrl: 'https://embed.example.com',
-      bearerToken: 'sk-embed',
-      endpoints: {  },
+      authStyle: 'bearer',
+      apiKey: 'sk-embed',
+      endpoints: {},
     },
   }));
 
@@ -282,8 +278,7 @@ test('/v1/embeddings routes to custom upstream when model is only declared there
 test('/v1/embeddings rejects model on custom upstream without /embeddings capability', async () => {
   const { apiKey, repo } = await setupAppTest();
   await repo.upstreams.deleteAll();
-  clearModelsStore();
-  await clearCopilotTokenCache();
+  clearInProcessCopilotTokenCache();
 
   await repo.upstreams.save(buildCustomUpstreamRecord({
     id: 'up_chat_only',
@@ -295,7 +290,8 @@ test('/v1/embeddings rejects model on custom upstream without /embeddings capabi
     disabledPublicModelIds: [],
     config: {
       baseUrl: 'https://chat.example.com',
-      bearerToken: 'sk-chat',
+      authStyle: 'bearer',
+      apiKey: 'sk-chat',
       endpoints: { chatCompletions: {} },
     },
   }));
@@ -333,11 +329,14 @@ test('/v1/embeddings rejects model on custom upstream without /embeddings capabi
   );
 });
 
-test('/v1/embeddings preserves custom upstream /models HTTP errors', async () => {
+// A custom upstream whose `/v1/models` fetch rejects is treated as
+// temporarily empty: the request resolves to 404 model-missing with the
+// failing upstream's display name appended parenthetically, instead of
+// the gateway forwarding the upstream's raw HTTP status to the client.
+test('/v1/embeddings reports the failed upstream parenthetically when /v1/models rejects', async () => {
   const { apiKey, repo } = await setupAppTest();
   await repo.upstreams.deleteAll();
-  clearModelsStore();
-  await clearCopilotTokenCache();
+  clearInProcessCopilotTokenCache();
 
   await repo.upstreams.save(buildCustomUpstreamRecord({
     id: 'up_embed',
@@ -349,8 +348,9 @@ test('/v1/embeddings preserves custom upstream /models HTTP errors', async () =>
     disabledPublicModelIds: [],
     config: {
       baseUrl: 'https://embed.example.com',
-      bearerToken: 'sk-embed',
-      endpoints: {  },
+      authStyle: 'bearer',
+      apiKey: 'sk-embed',
+      endpoints: {},
     },
   }));
 
@@ -377,18 +377,24 @@ test('/v1/embeddings preserves custom upstream /models HTTP errors', async () =>
         }),
       });
 
-      assertEquals(response.status, 403);
+      assertEquals(response.status, 404);
       assertEquals(await response.json(), {
-        error: { message: 'bad embed key' },
+        error: {
+          message: 'Model custom-embed-model is not available on any configured upstream (models from upstream(s) "Embedding Provider" failed to load).',
+          type: 'api_error',
+        },
       });
     },
   );
 });
 
-test('/v1/embeddings preserves model-load errors hidden by another provider', async () => {
+// Even when a second upstream's catalog loads successfully (and so its
+// models are routable), the rejected upstream's name still surfaces in
+// the model-missing body so the operator can tell the failure apart
+// from a genuine "no upstream has this model" miss.
+test('/v1/embeddings reports the failed upstream even when a sibling upstream\'s catalog loads', async () => {
   const { apiKey, repo } = await setupAppTest();
-  clearModelsStore();
-  await clearCopilotTokenCache();
+  clearInProcessCopilotTokenCache();
 
   await repo.upstreams.save(buildCustomUpstreamRecord({
     id: 'up_embed',
@@ -400,8 +406,9 @@ test('/v1/embeddings preserves model-load errors hidden by another provider', as
     disabledPublicModelIds: [],
     config: {
       baseUrl: 'https://embed.example.com',
-      bearerToken: 'sk-embed',
-      endpoints: {  },
+      authStyle: 'bearer',
+      apiKey: 'sk-embed',
+      endpoints: {},
     },
   }));
 
@@ -417,9 +424,10 @@ test('/v1/embeddings preserves model-load errors hidden by another provider', as
           token: 'copilot-access-token',
           expires_at: 4102444800,
           refresh_in: 3600,
+          endpoints: { api: 'https://api.individual.githubcopilot.com' },
         });
       }
-      if (url.hostname === 'api.githubcopilot.com' && url.pathname === '/models') {
+      if (url.hostname === 'api.individual.githubcopilot.com' && url.pathname === '/models') {
         return jsonResponse(copilotModels([{ id: 'copilot-chat', supported_endpoints: ['/chat/completions'] }]));
       }
       if (url.hostname === 'embed.example.com' && url.pathname === '/v1/models') {
@@ -441,9 +449,9 @@ test('/v1/embeddings preserves model-load errors hidden by another provider', as
         }),
       });
 
-      assertEquals(response.status, 403);
+      assertEquals(response.status, 404);
       const body = await response.json();
-      assertEquals(body.error.message, 'bad embed key');
+      assertEquals(body.error.message, 'Model custom-embed-model is not available on any configured upstream (models from upstream(s) "Embedding Provider" failed to load).');
     },
   );
 });
@@ -463,6 +471,7 @@ test('/v1/embeddings rejects malformed body at the provider-independent boundary
           token: 'copilot-access-token',
           expires_at: 4102444800,
           refresh_in: 3600,
+          endpoints: { api: 'https://api.individual.githubcopilot.com' },
         });
       }
       if (url.pathname === '/models') {

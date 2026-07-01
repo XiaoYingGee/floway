@@ -1,26 +1,101 @@
+import { currentHour } from './hour.ts';
 import { getRepo } from '../../../repo/index.ts';
 import type { TokenUsage } from '../../../repo/types.ts';
-import type { BillingDimension } from '@floway-dev/protocols/common';
+import { BILLING_DIMENSIONS, type BillingDimension } from '@floway-dev/protocols/common';
 import type { TelemetryModelIdentity } from '@floway-dev/provider';
-
-const currentHour = (): string => new Date().toISOString().slice(0, 13);
-
-const BILLING_DIMENSIONS: readonly BillingDimension[] = ['input', 'input_cache_read', 'input_cache_write', 'input_image', 'output', 'output_image'];
 
 export const hasTokenUsage = (usage: TokenUsage): boolean => BILLING_DIMENSIONS.some(dimension => (usage[dimension] ?? 0) > 0);
 
+// Map an upstream-reported service tier onto the tier marker the gateway
+// stores on the usage row. `default` (OpenAI's response-side base value) and
+// `standard` (Anthropic's response-side base value) both denote base pricing
+// and collapse to null so they aggregate with rows that carry no tier at all.
+// Compared case-insensitively in case a future upstream stamps `'Default'`
+// or `'STANDARD'` (defensive — both protocols' SDKs ship the values in
+// lowercase today); non-base values pass through with their original
+// casing so per-tier overrides match the wire-stamped string verbatim.
+// https://developers.openai.com/api/docs/guides/priority-processing
+// https://docs.claude.com/en/api/service-tiers
+// https://docs.claude.com/en/build-with-claude/fast-mode
+export const billableServiceTier = (tier: string | null | undefined): string | null => {
+  if (tier == null) return null;
+  const normalized = tier.toLowerCase();
+  return normalized === 'default' || normalized === 'standard' ? null : tier;
+};
+
 // Drop zero / undefined dimensions so a usage map only carries the dimensions
-// actually billed.
+// actually billed. `tier` (a non-numeric service-tier marker) survives the
+// filter so per-tier pricing overrides resolve at recording time.
 export const tokenUsage = (counts: TokenUsage): TokenUsage => {
   const out: TokenUsage = {};
   for (const dimension of BILLING_DIMENSIONS) {
     const value = counts[dimension] ?? 0;
     if (value > 0) out[dimension] = value;
   }
+  if (counts.tier != null) out.tier = counts.tier;
   return out;
 };
 
-export const tokenUsageFromPromptTokenResponse = (usage: unknown): TokenUsage | null => {
+// Cache-read / cache-write token counts pulled from an OpenAI-shaped `usage`
+// block. The field name and nesting depth vary by upstream; this helper
+// hides the variants so the per-API extractors (chat-completions, completions)
+// see a single normalized pair regardless of which provider answered.
+//
+// Cache-read candidates, in order of preference:
+//   - `prompt_tokens_details.cached_tokens` — OpenAI canonical (vLLM, llama.cpp,
+//     SGLang, Gemini OpenAI-compat, xAI, Mistral, OpenRouter, Groq, Cerebras,
+//     Zhipu, Doubao, Qwen main, …).
+//   - `prompt_cache_hit_tokens`             — DeepSeek (paired with
+//     `prompt_cache_miss_tokens`; `prompt_tokens` is `hit + miss`).
+//   - `cached_tokens`                       — Moonshot / Kimi, Cohere v2 native,
+//     Qwen Singapore legacy (top-level, no wrapper).
+//
+// Cache-write candidates, in order of preference:
+//   - `prompt_tokens_details.cache_creation_input_tokens` — the Anthropic
+//     messages → chat-completions translation pair forwards the native
+//     Anthropic field name under OpenAI's wrapper.
+//   - `prompt_tokens_details.cache_write_tokens`           — OpenRouter
+//     (Anthropic / Gemini-explicit / Alibaba-routed).
+//
+// Each count is a subset of `prompt_tokens`, so subtracting them in the
+// caller recovers the disjoint bare-input dimension. Upstreams that report
+// no cache fields at all (Together, Perplexity, SiliconFlow, TGI, Ollama-
+// compat, plus most providers without a cache layer) fall through to zero,
+// leaving the whole prompt count on the bare input bucket.
+export interface OpenAICacheTokens {
+  readonly cacheRead: number;
+  readonly cacheWrite: number;
+}
+
+interface OpenAIUsageWithCacheVariants {
+  prompt_tokens_details?: {
+    cached_tokens?: unknown;
+    cache_creation_input_tokens?: unknown;
+    cache_write_tokens?: unknown;
+  };
+  prompt_cache_hit_tokens?: unknown;
+  cached_tokens?: unknown;
+}
+
+export const openAICacheTokensFromUsage = (usage: unknown): OpenAICacheTokens => {
+  if (!usage || typeof usage !== 'object') return { cacheRead: 0, cacheWrite: 0 };
+  const u = usage as OpenAIUsageWithCacheVariants;
+  return {
+    cacheRead: firstNumber([u.prompt_tokens_details?.cached_tokens, u.prompt_cache_hit_tokens, u.cached_tokens]),
+    cacheWrite: firstNumber([u.prompt_tokens_details?.cache_creation_input_tokens, u.prompt_tokens_details?.cache_write_tokens]),
+  };
+};
+
+const firstNumber = (candidates: readonly unknown[]): number => {
+  for (const candidate of candidates) {
+    if (typeof candidate === 'number') return candidate;
+  }
+  return 0;
+};
+
+export const tokenUsageFromEmbeddingsBody = (body: unknown): TokenUsage | null => {
+  if (!body || typeof body !== 'object') return null;
+  const { usage } = body as { usage?: unknown };
   if (!usage || typeof usage !== 'object') return null;
   const promptTokens = (usage as { prompt_tokens?: unknown }).prompt_tokens;
   return typeof promptTokens === 'number' ? tokenUsage({ input: promptTokens }) : null;
@@ -36,9 +111,10 @@ export const tokenUsageFromPromptTokenResponse = (usage: unknown): TokenUsage | 
 // When a details object is missing but its total is present, the whole total is
 // charged on the bare dimension rather than inventing a split. A present field
 // that is a non-number is treated as a malformed upstream payload (return
-// null) rather than silently coerced — matching the anti-fallback rule in
-// AGENTS.md.
-export const tokenUsageFromImagesResponse = (usage: unknown): TokenUsage | null => {
+// null) rather than silently coerced.
+export const tokenUsageFromImagesBody = (body: unknown): TokenUsage | null => {
+  if (!body || typeof body !== 'object') return null;
+  const { usage } = body as { usage?: unknown };
   if (!usage || typeof usage !== 'object') return null;
   const { input_tokens: inputTotal, output_tokens: outputTotal, input_tokens_details: inputDetails, output_tokens_details: outputDetails } = usage as ImagesUsageShape;
 
@@ -79,6 +155,7 @@ const splitModalityCounts = (
 };
 
 export const recordTokenUsage = async (keyId: string, modelIdentity: TelemetryModelIdentity, usage: TokenUsage): Promise<void> => {
+  const { tier, ...tokens } = usage;
   await Promise.all([
     getRepo().usage.record({
       keyId,
@@ -86,8 +163,9 @@ export const recordTokenUsage = async (keyId: string, modelIdentity: TelemetryMo
       upstream: modelIdentity.upstream,
       modelKey: modelIdentity.modelKey,
       hour: currentHour(),
+      tier: tier ?? null,
       requests: 1,
-      tokens: usage,
+      tokens,
       cost: modelIdentity.cost,
     }),
     (async () => {
@@ -99,11 +177,4 @@ export const recordTokenUsage = async (keyId: string, modelIdentity: TelemetryMo
       });
     })(),
   ]);
-};
-
-export const recordTokenUsageForApiKey = async (apiKeyId: string | undefined, modelIdentity: TelemetryModelIdentity, usage: TokenUsage): Promise<void> => {
-  // Dashboard playground requests authenticate with ADMIN_KEY and intentionally
-  // have no API key id; usage is not recorded for those.
-  if (!apiKeyId) return;
-  await recordTokenUsage(apiKeyId, modelIdentity, usage);
 };

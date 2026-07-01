@@ -1,8 +1,7 @@
 import { test } from 'vitest';
 
 import { buildCustomUpstreamRecord, copilotModels, requestApp, setupAppTest } from '../../test-helpers.ts';
-import { clearModelsStore } from '@floway-dev/provider';
-import { clearCopilotTokenCache } from '@floway-dev/provider-copilot';
+import { clearInProcessCopilotTokenCache } from '@floway-dev/provider-copilot';
 import { jsonResponse, withMockedFetch, assertEquals } from '@floway-dev/test-utils';
 
 test('/v1beta/models lists Copilot LLM models in Gemini model shape', async () => {
@@ -20,6 +19,7 @@ test('/v1beta/models lists Copilot LLM models in Gemini model shape', async () =
           token: 'copilot-access-token',
           expires_at: 4102444800,
           refresh_in: 3600,
+          endpoints: { api: 'https://api.individual.githubcopilot.com' },
         });
       }
       if (url.pathname === '/models') {
@@ -100,6 +100,7 @@ test('/v1beta/models/:modelId returns one Gemini model or Google RPC 404', async
           token: 'copilot-access-token',
           expires_at: 4102444800,
           refresh_in: 3600,
+          endpoints: { api: 'https://api.individual.githubcopilot.com' },
         });
       }
       if (url.pathname === '/models') {
@@ -135,8 +136,7 @@ test('/v1beta/models/:modelId returns one Gemini model or Google RPC 404', async
 test('/v1beta/models includes custom upstream LLM models', async () => {
   const { apiKey, repo } = await setupAppTest();
   await repo.upstreams.deleteAll();
-  clearModelsStore();
-  await clearCopilotTokenCache();
+  clearInProcessCopilotTokenCache();
 
   await repo.upstreams.save(buildCustomUpstreamRecord({
     id: 'up_custom',
@@ -145,7 +145,8 @@ test('/v1beta/models includes custom upstream LLM models', async () => {
     createdAt: '2026-05-01T00:00:00.000Z',
     config: {
       baseUrl: 'https://custom.example.com',
-      bearerToken: 'sk-custom',
+      authStyle: 'bearer',
+      apiKey: 'sk-custom',
       endpoints: { chatCompletions: {} },
     },
   }));
@@ -187,8 +188,7 @@ test('/v1beta/models includes custom upstream LLM models', async () => {
 test('/v1beta/models excludes custom upstream embedding-only models', async () => {
   const { apiKey, repo } = await setupAppTest();
   await repo.upstreams.deleteAll();
-  clearModelsStore();
-  await clearCopilotTokenCache();
+  clearInProcessCopilotTokenCache();
 
   await repo.upstreams.save(buildCustomUpstreamRecord({
     id: 'up_embed',
@@ -197,8 +197,9 @@ test('/v1beta/models excludes custom upstream embedding-only models', async () =
     createdAt: '2026-05-01T00:00:00.000Z',
     config: {
       baseUrl: 'https://embed.example.com',
-      bearerToken: 'sk-embed',
-      endpoints: {  },
+      authStyle: 'bearer',
+      apiKey: 'sk-embed',
+      endpoints: {},
     },
   }));
 
@@ -229,8 +230,7 @@ test('/v1beta/models excludes custom upstream embedding-only models', async () =
 test('/v1beta/models hides upstream identity when a provider returns an invalid model list', async () => {
   const { apiKey, repo } = await setupAppTest();
   await repo.upstreams.deleteAll();
-  clearModelsStore();
-  await clearCopilotTokenCache();
+  clearInProcessCopilotTokenCache();
 
   await repo.upstreams.save(buildCustomUpstreamRecord({
     id: 'up_secret_gemini_provider',
@@ -239,7 +239,8 @@ test('/v1beta/models hides upstream identity when a provider returns an invalid 
     createdAt: '2026-05-01T00:00:00.000Z',
     config: {
       baseUrl: 'https://gemini-secret.example.com',
-      bearerToken: 'sk-secret',
+      authStyle: 'bearer',
+      apiKey: 'sk-secret',
       endpoints: { chatCompletions: {} },
     },
   }));
@@ -273,8 +274,7 @@ test('/v1beta/models hides upstream identity when a provider returns an invalid 
 test('/v1beta/models hides upstream HTTP error bodies', async () => {
   const { apiKey, repo } = await setupAppTest();
   await repo.upstreams.deleteAll();
-  clearModelsStore();
-  await clearCopilotTokenCache();
+  clearInProcessCopilotTokenCache();
 
   await repo.upstreams.save(buildCustomUpstreamRecord({
     id: 'up_http_secret_gemini_provider',
@@ -283,7 +283,8 @@ test('/v1beta/models hides upstream HTTP error bodies', async () => {
     createdAt: '2026-05-01T00:00:00.000Z',
     config: {
       baseUrl: 'https://gemini-http-secret.example.com',
-      bearerToken: 'sk-secret',
+      authStyle: 'bearer',
+      apiKey: 'sk-secret',
       endpoints: { chatCompletions: {} },
     },
   }));
@@ -320,8 +321,7 @@ test('/v1beta/models hides upstream HTTP error bodies', async () => {
 test('/v1beta/models hides thrown upstream request errors', async () => {
   const { apiKey, repo } = await setupAppTest();
   await repo.upstreams.deleteAll();
-  clearModelsStore();
-  await clearCopilotTokenCache();
+  clearInProcessCopilotTokenCache();
 
   await repo.upstreams.save(buildCustomUpstreamRecord({
     id: 'up_throw_secret_gemini_provider',
@@ -330,7 +330,8 @@ test('/v1beta/models hides thrown upstream request errors', async () => {
     createdAt: '2026-05-01T00:00:00.000Z',
     config: {
       baseUrl: 'https://gemini-throw-secret.example.com',
-      bearerToken: 'sk-secret',
+      authStyle: 'bearer',
+      apiKey: 'sk-secret',
       endpoints: { chatCompletions: {} },
     },
   }));
@@ -364,8 +365,7 @@ test('/v1beta/models hides thrown upstream request errors', async () => {
 test('/v1beta/models hides malformed upstream response bodies', async () => {
   const { apiKey, repo } = await setupAppTest();
   await repo.upstreams.deleteAll();
-  clearModelsStore();
-  await clearCopilotTokenCache();
+  clearInProcessCopilotTokenCache();
 
   await repo.upstreams.save(buildCustomUpstreamRecord({
     id: 'up_malformed_secret_gemini_provider',
@@ -374,7 +374,8 @@ test('/v1beta/models hides malformed upstream response bodies', async () => {
     createdAt: '2026-05-01T00:00:00.000Z',
     config: {
       baseUrl: 'https://gemini-malformed-secret.example.com',
-      bearerToken: 'sk-secret',
+      authStyle: 'bearer',
+      apiKey: 'sk-secret',
       endpoints: { chatCompletions: {} },
     },
   }));

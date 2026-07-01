@@ -1,57 +1,65 @@
-import type { ModelProviderInstance, ProviderModelRecord } from './provider.ts';
+import type { UpstreamModel } from './model.ts';
+import type { Fetcher } from './options.ts';
+import type { ModelProviderInstance, ResponsesAction } from './provider.ts';
 import type { ChatCompletionsPayload } from '@floway-dev/protocols/chat-completions';
 import type { GeminiPayload } from '@floway-dev/protocols/gemini';
 import type { MessagesPayload } from '@floway-dev/protocols/messages';
 import type { ResponsesPayload } from '@floway-dev/protocols/responses';
 
-export type LlmTargetApi = 'messages' | 'responses' | 'chat-completions';
+export type ChatTargetApi = 'messages' | 'responses' | 'chat-completions';
 
-// The provider-binding decision the planner made for this attempt: which
-// upstream's binding to call and which target protocol to invoke on it.
-// The binding carries the upstream identity, the upstream model record,
-// the per-binding flag set; `provider` is the resolved upstream provider
-// instance the binding came from, retained alongside the binding so the
-// call site can register telemetry, invalidate caches, and dispatch the
-// upstream call without re-resolving the registry.
+// One (provider, model) pair the resolver produced for an inbound id,
+// plus the per-request `Fetcher` minted for the provider's upstream. The
+// pair is the smallest unit the dispatch layer needs to make a wire call:
+// `provider.provider.callXxx(model, body, ...)` — upstream id / upstream
+// name / provider kind / capability flags come off `provider.*`, model id
+// / providerData / endpoints off `model.*`.
+//
+// Resolution narrows by `model.kind` only — choosing the inbound target
+// protocol from `model.endpoints` is the attempt layer's job, not part of
+// the candidate.
 export interface ProviderCandidate {
   readonly provider: ModelProviderInstance;
-  readonly binding: ProviderModelRecord;
-  readonly targetApi: LlmTargetApi;
+  readonly model: UpstreamModel;
+  readonly fetcher: Fetcher;
 }
 
-// Per-protocol invocation shape passed to gateway-side interceptors. Carries
-// the source-shape request body (mutable so source-side interceptors can clean
-// it), the planner's binding decision, and the mutable HTTP-header bag the
-// source seeds empty. Gateway-side interceptors that derive trace headers
-// populate `headers`; the provider call passes it through to the wire fetch
-// unchanged, so workarounds that only need to set or drop a header (vision,
-// initiator, anthropic-beta, ...) stay at the owning interceptor boundary
-// instead of widening the provider call signature.
+// Per-protocol invocation shape passed to interceptors. Carries the
+// source-shape request body (mutable, so the body can be cleaned), the
+// candidate the attempt is dispatching against, the chat target protocol
+// the attempt picked for this candidate, and a mutable `Headers` instance
+// carried into the boundary chain — so workarounds that only need to set
+// or drop a header stay at the owning interceptor boundary instead of
+// widening the provider call signature.
 export interface MessagesInvocation {
   payload: MessagesPayload;
   readonly candidate: ProviderCandidate;
-  // `anthropicBeta` is an inbound Messages concept that crosses native
-  // Messages targets; translated targets (Responses, Chat Completions) do not
-  // consume it, so it stays optional and is only populated when the source
-  // protocol is Messages and the target is Messages.
-  readonly anthropicBeta?: readonly string[];
-  readonly headers: Record<string, string>;
+  readonly targetApi: ChatTargetApi;
+  readonly headers: Headers;
 }
 
 export interface ResponsesInvocation {
   payload: ResponsesPayload;
+  // Mutable action tag — interceptors can flip 'compact' to 'generate' so the
+  // inner provider call runs a normal summarization turn (see the
+  // responses-compact-shim) and the gateway derives snapshot mode from the
+  // post-chain action carried on the provider's tagged result.
+  action: ResponsesAction;
   readonly candidate: ProviderCandidate;
-  readonly headers: Record<string, string>;
+  readonly targetApi: ChatTargetApi;
+  readonly headers: Headers;
 }
 
 export interface ChatCompletionsInvocation {
   payload: ChatCompletionsPayload;
   readonly candidate: ProviderCandidate;
-  readonly headers: Record<string, string>;
+  readonly targetApi: ChatTargetApi;
+  readonly headers: Headers;
 }
 
 export interface GeminiInvocation {
   payload: GeminiPayload;
   readonly candidate: ProviderCandidate;
-  readonly headers: Record<string, string>;
+  readonly targetApi: ChatTargetApi;
+  readonly headers: Headers;
 }

@@ -16,6 +16,8 @@ const upstream = (overrides: Partial<UpstreamRecord> & Pick<UpstreamRecord, 'id'
   state: null,
   flagOverrides: {},
   disabledPublicModelIds: [],
+  proxyFallbackList: [],
+  modelPrefix: null,
   ...overrides,
 });
 
@@ -160,7 +162,7 @@ const exerciseSqlUpstreamRepo = async (repo: UpstreamRepo) => {
     sortOrder: 2,
     createdAt: '2026-05-21T10:00:02.000Z',
     updatedAt: '2026-05-21T10:00:02.000Z',
-    config: { baseUrl: 'https://custom.example/v1', bearerToken: 'sk-custom', endpoints: { chatCompletions: {} } },
+    config: { baseUrl: 'https://custom.example/v1', authStyle: 'bearer', apiKey: 'sk-custom', endpoints: { chatCompletions: {} } },
     flagOverrides: { 'z-fix': true, 'a-fix': true },
     disabledPublicModelIds: [],
   });
@@ -171,7 +173,7 @@ const exerciseSqlUpstreamRepo = async (repo: UpstreamRepo) => {
     sortOrder: 1,
     createdAt: '2026-05-21T10:00:03.000Z',
     updatedAt: '2026-05-21T10:00:03.000Z',
-    config: { githubToken: 'gho_d1', accountType: 'individual', user: { id: 1, login: 'copilot', name: null, avatar_url: 'https://avatars.test/1.png' } },
+    config: { githubToken: 'gho_d1', user: { id: 1, login: 'copilot', name: null, avatar_url: 'https://avatars.test/1.png' } },
   });
   const azure = upstream({
     id: 'up_azure_sql',
@@ -201,7 +203,7 @@ const exerciseSqlUpstreamRepo = async (repo: UpstreamRepo) => {
     sortOrder: 0,
     createdAt: '2099-01-01T00:00:00.000Z',
     updatedAt: '2026-05-21T10:00:04.000Z',
-    config: { baseUrl: 'https://updated.example/v1', bearerToken: 'sk-updated', endpoints: { responses: {} } },
+    config: { baseUrl: 'https://updated.example/v1', authStyle: 'bearer', apiKey: 'sk-updated', endpoints: { responses: {} } },
     flagOverrides: { 'm-fix': true, 'a-fix': true },
     disabledPublicModelIds: [],
   });
@@ -244,6 +246,8 @@ test('SQL upstream repo rejects malformed stored upstream JSON', async () => {
     state_json: null,
     flag_overrides: '{}',
     disabled_public_model_ids: '[]',
+    proxy_fallback_list_json: '[]',
+    model_prefix_json: null,
   });
 
   await assertRejects(() => new SqlRepo(db).upstreams.list(), Error, 'Malformed upstream config JSON for up_bad_config');
@@ -263,6 +267,8 @@ test('SQL upstream repo rejects malformed stored flag overrides JSON', async () 
     state_json: null,
     flag_overrides: '{bad json',
     disabled_public_model_ids: '[]',
+    proxy_fallback_list_json: '[]',
+    model_prefix_json: null,
   });
 
   await assertRejects(() => new SqlRepo(db).upstreams.getById('up_bad_fixes'), Error, 'Malformed upstream flag_overrides JSON for up_bad_fixes');
@@ -282,6 +288,8 @@ test('SQL upstream repo rejects array-shaped flag_overrides with helpful message
     state_json: null,
     flag_overrides: '[]',
     disabled_public_model_ids: '[]',
+    proxy_fallback_list_json: '[]',
+    model_prefix_json: null,
   });
 
   await assertRejects(
@@ -305,6 +313,8 @@ test('SQL upstream repo rejects non-boolean value in flag_overrides with helpful
     state_json: null,
     flag_overrides: '{"x": 1}',
     disabled_public_model_ids: '[]',
+    proxy_fallback_list_json: '[]',
+    model_prefix_json: null,
   });
 
   await assertRejects(
@@ -312,6 +322,73 @@ test('SQL upstream repo rejects non-boolean value in flag_overrides with helpful
     Error,
     'Upstream up_nonbool_fixes flag_overrides["x"] must be a boolean, got number',
   );
+});
+
+test('SQL upstream repo rejects malformed stored model_prefix_json', async () => {
+  const db = new FakeUpstreamsSqlDatabase();
+  db.rows.push({
+    id: 'up_bad_prefix_json',
+    provider: 'custom',
+    name: 'Bad Prefix JSON',
+    enabled: 1,
+    sort_order: 0,
+    created_at: '2026-05-21T10:00:00.000Z',
+    updated_at: '2026-05-21T10:00:00.000Z',
+    config_json: '{}',
+    state_json: null,
+    flag_overrides: '{}',
+    disabled_public_model_ids: '[]',
+    proxy_fallback_list_json: '[]',
+    model_prefix_json: '{not json',
+  });
+
+  await assertRejects(() => new SqlRepo(db).upstreams.getById('up_bad_prefix_json'), Error, 'Malformed upstream model_prefix_json for up_bad_prefix_json');
+});
+
+test('SQL upstream repo rejects shape-invalid model_prefix_json', async () => {
+  const db = new FakeUpstreamsSqlDatabase();
+  db.rows.push({
+    id: 'up_bad_prefix_shape',
+    provider: 'custom',
+    name: 'Bad Prefix Shape',
+    enabled: 1,
+    sort_order: 0,
+    created_at: '2026-05-21T10:00:00.000Z',
+    updated_at: '2026-05-21T10:00:00.000Z',
+    config_json: '{}',
+    state_json: null,
+    flag_overrides: '{}',
+    disabled_public_model_ids: '[]',
+    proxy_fallback_list_json: '[]',
+    // Prefix missing trailing slash — passes JSON.parse but fails the regex.
+    model_prefix_json: '{"prefix":"or","addressable":["unprefixed"],"listed":[]}',
+  });
+
+  await assertRejects(() => new SqlRepo(db).upstreams.getById('up_bad_prefix_shape'), Error, 'Invalid upstream model_prefix_json shape for up_bad_prefix_shape');
+});
+
+test('SQL upstream repo round-trips a non-null model_prefix', async () => {
+  const db = new FakeUpstreamsSqlDatabase();
+  const repo = new SqlRepo(db).upstreams;
+  const now = new Date().toISOString();
+  const record: UpstreamRecord = {
+    id: 'up_prefix_rt',
+    provider: 'custom',
+    name: 'Prefix Round-Trip',
+    enabled: true,
+    sortOrder: 0,
+    createdAt: now,
+    updatedAt: now,
+    config: { baseUrl: 'https://example.com', bearerToken: 'sk', authStyle: 'bearer', endpoints: { chatCompletions: {} }, modelsFetch: { enabled: true } },
+    state: null,
+    flagOverrides: {},
+    disabledPublicModelIds: [],
+    proxyFallbackList: [],
+    modelPrefix: { prefix: 'or/', addressable: ['unprefixed', 'prefixed'], listed: ['prefixed'] },
+  };
+  await repo.save(record);
+  const reloaded = await repo.getById('up_prefix_rt');
+  assertEquals(reloaded?.modelPrefix, { prefix: 'or/', addressable: ['unprefixed', 'prefixed'], listed: ['prefixed'] });
 });
 
 test('migration 0010 creates unified upstreams and rewrites legacy upstream identities', async () => {
@@ -415,6 +492,116 @@ test('migration 0010 creates unified upstreams and rewrites legacy upstream iden
   }
 });
 
+test('migration 0042 renames bearerToken to apiKey and backfills authStyle on legacy rows', async () => {
+  const db = await createMigratedSqlJsDatabase();
+  try {
+    for (const filename of [...migrationSqlByFilename.keys()].filter(f => f >= '0010_unified_upstreams.sql' && f < '0042_custom_apikey_rename.sql').toSorted()) {
+      applySqlJsFile(db, filename);
+    }
+
+    // Seed two custom rows mirroring real legacy shapes:
+    //   - up_legacy:     post-0010 row with bearerToken and no authStyle
+    //   - up_anthropic:  later row with bearerToken AND authStyle: 'anthropic'
+    // and a non-custom (azure) row that the migration must leave untouched.
+    db.run(`INSERT INTO upstreams (id, provider, name, enabled, sort_order, created_at, updated_at, config_json, flag_overrides, disabled_public_model_ids, proxy_fallback_list_json)
+            VALUES
+              ('up_legacy', 'custom', 'Legacy', 1, 0, '2026-05-21T00:00:00.000Z', '2026-05-21T00:00:00.000Z', json_object('baseUrl', 'https://a.example/v1', 'bearerToken', 'sk-legacy'), '[]', '[]', '[]'),
+              ('up_anthropic', 'custom', 'Anthropic', 1, 1, '2026-05-21T00:00:00.000Z', '2026-05-21T00:00:00.000Z', json_object('baseUrl', 'https://b.example/v1', 'bearerToken', 'sk-ant', 'authStyle', 'anthropic'), '[]', '[]', '[]'),
+              ('up_azure', 'azure', 'Azure', 1, 2, '2026-05-21T00:00:00.000Z', '2026-05-21T00:00:00.000Z', json_object('endpoint', 'https://az.example', 'apiKey', 'az-key'), '[]', '[]', '[]')`);
+
+    applySqlJsFile(db, '0042_custom_apikey_rename.sql');
+
+    const rows = sqlJsRows<{ id: string; bearerToken: unknown; apiKey: string; authStyle: string }>(
+      db,
+      `SELECT
+        id,
+        json_extract(config_json, '$.bearerToken') AS bearerToken,
+        json_extract(config_json, '$.apiKey') AS apiKey,
+        json_extract(config_json, '$.authStyle') AS authStyle
+       FROM upstreams
+       ORDER BY id`,
+    );
+
+    assertEquals(rows.find(r => r.id === 'up_legacy'), { id: 'up_legacy', bearerToken: null, apiKey: 'sk-legacy', authStyle: 'bearer' });
+    assertEquals(rows.find(r => r.id === 'up_anthropic'), { id: 'up_anthropic', bearerToken: null, apiKey: 'sk-ant', authStyle: 'anthropic' });
+    // Non-custom rows are untouched.
+    const azure = rows.find(r => r.id === 'up_azure');
+    assertEquals(azure?.bearerToken, null);
+    assertEquals(azure?.apiKey, 'az-key');
+    assertEquals(azure?.authStyle, null);
+  } finally {
+    db.close();
+  }
+});
+
+test('migration 0044 rewrites pathOverrides keys to the OpenAI-canonical /path/fragment form', async () => {
+  const db = await createMigratedSqlJsDatabase();
+  try {
+    for (const filename of [...migrationSqlByFilename.keys()].filter(f => f >= '0010_unified_upstreams.sql' && f < '0044_custom_pathoverrides_slash_keys.sql').toSorted()) {
+      applySqlJsFile(db, filename);
+    }
+
+    // Seed three rows: a custom upstream carrying every legacy underscore key,
+    // a custom upstream with no pathOverrides at all (must stay untouched),
+    // and a non-custom row that the migration must skip.
+    db.run(`INSERT INTO upstreams (id, provider, name, enabled, sort_order, created_at, updated_at, config_json, flag_overrides, disabled_public_model_ids, proxy_fallback_list_json)
+            VALUES
+              ('up_overrides', 'custom', 'With Overrides', 1, 0, '2026-05-21T00:00:00.000Z', '2026-05-21T00:00:00.000Z',
+                json_object('baseUrl', 'https://a.example', 'authStyle', 'bearer', 'apiKey', 'sk-a',
+                  'pathOverrides', json_object(
+                    'completions', '/p/completions',
+                    'chat_completions', '/p/chat/completions',
+                    'responses', '/p/responses',
+                    'messages', '/p/messages',
+                    'embeddings', '/p/embeddings',
+                    'images_generations', '/p/images/generations',
+                    'images_edits', '/p/images/edits'
+                  )
+                ), '[]', '[]', '[]'),
+              ('up_blank', 'custom', 'No Overrides', 1, 1, '2026-05-21T00:00:00.000Z', '2026-05-21T00:00:00.000Z',
+                json_object('baseUrl', 'https://b.example', 'authStyle', 'bearer', 'apiKey', 'sk-b'),
+                '[]', '[]', '[]'),
+              ('up_azure', 'azure', 'Azure', 1, 2, '2026-05-21T00:00:00.000Z', '2026-05-21T00:00:00.000Z',
+                json_object('endpoint', 'https://az.example', 'apiKey', 'az-key',
+                  'pathOverrides', json_object('chat_completions', '/should/stay')
+                ), '[]', '[]', '[]')`);
+
+    applySqlJsFile(db, '0044_custom_pathoverrides_slash_keys.sql');
+
+    const overrides = sqlJsRows<{ overrides: string }>(
+      db,
+      `SELECT json_extract(config_json, '$.pathOverrides') AS overrides FROM upstreams WHERE id = 'up_overrides'`,
+    );
+    assertEquals(JSON.parse(overrides[0].overrides), {
+      '/completions': '/p/completions',
+      '/chat/completions': '/p/chat/completions',
+      '/responses': '/p/responses',
+      '/messages': '/p/messages',
+      '/embeddings': '/p/embeddings',
+      '/images/generations': '/p/images/generations',
+      '/images/edits': '/p/images/edits',
+    });
+
+    // A row without pathOverrides is left alone — the field stays absent
+    // rather than getting an empty `{}` shell.
+    const blank = sqlJsRows<{ overrides: unknown }>(
+      db,
+      `SELECT json_extract(config_json, '$.pathOverrides') AS overrides FROM upstreams WHERE id = 'up_blank'`,
+    );
+    assertEquals(blank[0].overrides, null);
+
+    // Non-custom rows are out of scope; an azure row's stale snake_case key
+    // is intentionally preserved (no other migration touches it).
+    const azure = sqlJsRows<{ overrides: string }>(
+      db,
+      `SELECT json_extract(config_json, '$.pathOverrides') AS overrides FROM upstreams WHERE id = 'up_azure'`,
+    );
+    assertEquals(JSON.parse(azure[0].overrides), { chat_completions: '/should/stay' });
+  } finally {
+    db.close();
+  }
+});
+
 type FakeUpstreamRow = {
   id: string;
   provider: string;
@@ -427,6 +614,8 @@ type FakeUpstreamRow = {
   state_json: string | null;
   flag_overrides: string;
   disabled_public_model_ids: string;
+  proxy_fallback_list_json: string;
+  model_prefix_json: string | null;
 };
 
 class FakeUpstreamsSqlPreparedStatement {
@@ -496,7 +685,7 @@ class FakeUpstreamsSqlDatabase implements SqlDatabase {
   }
 
   upsert(binds: unknown[]): void {
-    const [id, provider, name, enabled, sortOrder, createdAt, updatedAt, configJson, stateJson, flagOverrides, disabledPublicModelIds] = binds as [string, string, string, number, number, string, string, string, string | null, string, string];
+    const [id, provider, name, enabled, sortOrder, createdAt, updatedAt, configJson, stateJson, flagOverrides, disabledPublicModelIds, proxyFallbackListJson, modelPrefixJson] = binds as [string, string, string, number, number, string, string, string, string | null, string, string, string, string | null];
     const existingIndex = this.rows.findIndex(candidate => candidate.id === id);
     const preservedCreatedAt = existingIndex >= 0 ? this.rows[existingIndex].created_at : createdAt;
     const row = {
@@ -511,6 +700,8 @@ class FakeUpstreamsSqlDatabase implements SqlDatabase {
       state_json: stateJson,
       flag_overrides: flagOverrides,
       disabled_public_model_ids: disabledPublicModelIds,
+      proxy_fallback_list_json: proxyFallbackListJson,
+      model_prefix_json: modelPrefixJson,
     };
     if (existingIndex >= 0) {
       this.rows[existingIndex] = row;

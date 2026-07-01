@@ -1,28 +1,43 @@
 import { test } from 'vitest';
 
 import { fetchCopilotModels } from './fetch-models.ts';
-import { clearCopilotTokenCache } from './index.ts';
-import { ProviderModelsUnavailableError, initProviderRepo } from '@floway-dev/provider';
-import { assertEquals, jsonResponse, memoryCacheRepo, withMockedFetch } from '@floway-dev/test-utils';
+import { clearInProcessCopilotTokenCache } from './index.ts';
+import { ProviderModelsUnavailableError, initProviderRepo, directFetcher, type UpstreamRecord } from '@floway-dev/provider';
+import { assertEquals, jsonResponse, withMockedFetch } from '@floway-dev/test-utils';
 
 const installRepoAndConfig = async () => {
-  const cache = memoryCacheRepo();
+  const id = 'up_copilot_fetch_models_test';
+  const githubToken = `ghu_${crypto.randomUUID().replace(/-/g, '')}`;
+  const stub: UpstreamRecord = {
+    id,
+    provider: 'copilot',
+    name: 'fetch-models-test',
+    enabled: true,
+    sortOrder: 0,
+    createdAt: '2026-03-15T00:00:00.000Z',
+    updatedAt: '2026-03-15T00:00:00.000Z',
+    state: null,
+    flagOverrides: {},
+    disabledPublicModelIds: [],
+    proxyFallbackList: [],
+    modelPrefix: null,
+    config: { githubToken, user: { id: 1, login: 't', name: null, avatar_url: '' } },
+  };
   initProviderRepo(() => ({
-    cache,
     upstreams: {
-      getById: async () => null,
-      saveState: async () => ({ updated: false }),
+      getById: async () => stub,
+      saveState: async () => ({ updated: true }),
     },
   }));
-  await clearCopilotTokenCache();
-  return { githubToken: `ghu_${crypto.randomUUID().replace(/-/g, '')}`, accountType: 'individual' as const };
+  clearInProcessCopilotTokenCache();
+  return { id, githubToken };
 };
 
 const copilotTokenResponse = (request: Request): Response | null => {
   const url = new URL(request.url);
   if (url.hostname === 'update.code.visualstudio.com') return jsonResponse(['1.110.1']);
   if (url.pathname === '/copilot_internal/v2/token') {
-    return jsonResponse({ token: 'copilot-access-token', expires_at: 4102444800, refresh_in: 3600 });
+    return jsonResponse({ token: 'copilot-access-token', expires_at: 4102444800, refresh_in: 3600, endpoints: { api: 'https://api.individual.githubcopilot.com' } });
   }
   return null;
 };
@@ -39,7 +54,7 @@ test('fetchCopilotModels returns the parsed response on 2xx', async () => {
       throw new Error(`Unhandled fetch ${request.url}`);
     },
     async () => {
-      const result = await fetchCopilotModels(config);
+      const result = await fetchCopilotModels(config, directFetcher);
       assertEquals(result.data[0].id, 'cm-1');
     },
   );
@@ -58,7 +73,7 @@ test('fetchCopilotModels throws ProviderModelsUnavailableError with httpResponse
       throw new Error(`Unhandled fetch ${request.url}`);
     },
     async () => {
-      try { await fetchCopilotModels(config); } catch (e) { thrown = e; }
+      try { await fetchCopilotModels(config, directFetcher); } catch (e) { thrown = e; }
     },
   );
   if (!(thrown instanceof ProviderModelsUnavailableError)) throw new Error('expected ProviderModelsUnavailableError');
@@ -79,7 +94,7 @@ test('fetchCopilotModels throws ProviderModelsUnavailableError with null httpRes
       throw new Error(`Unhandled fetch ${request.url}`);
     },
     async () => {
-      try { await fetchCopilotModels(config); } catch (e) { thrown = e; }
+      try { await fetchCopilotModels(config, directFetcher); } catch (e) { thrown = e; }
     },
   );
   if (!(thrown instanceof ProviderModelsUnavailableError)) throw new Error('expected ProviderModelsUnavailableError');
@@ -102,7 +117,7 @@ test('fetchCopilotModels tags the request with the model-access intent and omits
       throw new Error(`Unhandled fetch ${request.url}`);
     },
     async () => {
-      await fetchCopilotModels(config);
+      await fetchCopilotModels(config, directFetcher);
     },
   );
 

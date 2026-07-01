@@ -1,12 +1,13 @@
 .claude/
 .worktrees/
-.wrangler/
+.wrangler
 .eslintcache
 node_modules/
 docs/superpowers
 .superpowers
 apps/web/dist/
 .dev.vars
+.env
 /wrangler.jsonc
 
 # Local node-target dev runtime (sqlite db + uploaded files). One under the

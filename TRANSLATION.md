@@ -36,7 +36,7 @@ translators.
 2. translated `/v1/messages`
 3. translated `/responses`
 
-If no provider binding exposes a capability-backed Chat plan, the gateway
+If no upstream's catalog advertises a capability-backed Chat target, the gateway
 returns a source-shaped unsupported-model error. It does not invent legacy
 model-name routing outside provider capability metadata. Copilot Claude models
 still route through Messages because the Copilot provider does not expose Chat
@@ -49,8 +49,8 @@ support for them.
 2. translated `/v1/messages`
 3. translated `/responses`
 
-If no provider binding exposes a capability-backed Gemini generation plan, the
-gateway returns a Gemini-shaped unsupported-model error.
+If no upstream's catalog advertises a capability-backed Gemini generation target,
+the gateway returns a Gemini-shaped unsupported-model error.
 
 ## Boundary Rules
 
@@ -109,6 +109,41 @@ gateway returns a Gemini-shaped unsupported-model error.
   Messages. Custom Messages providers receive the caller's `cache_control`
   object unchanged.
 - rewrites Copilot context-window errors into the compact Messages error shape
+
+### Messages — Claude Code provider boundary chain
+
+Claude Code (Claude.ai subscription) bills `/v1/messages` requests against
+the operator's plan only when the wire matches a real `claude-cli` session.
+The boundary detects already-CC-shaped traffic up front and lets it pass
+through verbatim, so the operator's own session fingerprint reaches
+Anthropic untouched. Anything else — third-party Messages clients, other
+adapters, translated Chat/Responses/Gemini sources — runs through the full
+re-mimicry chain so the upstream still accepts and bills it as plan
+traffic.
+
+Re-mimicry runs in this order:
+
+- backfills required `max_tokens` and `temperature` defaults so the rest of
+  the chain and the downstream fingerprint compute see the fully-formed CC
+  wire shape
+- synthesizes `metadata.user_id` (legacy `user_<sha>_account_<uuid>_session_<uuid>`
+  or new JSON `{device_id, account_uuid, session_id}` shape, picked from the
+  inbound request) before system text is hoisted, so two conversations
+  sharing a system prompt do not collide on session id
+- hoists the caller's `system` text into a synthetic user/assistant pair so
+  the next three injectors own `payload.system`
+- injects `system[0]`: per-request CC billing/identity block carrying the
+  `cc_version` fingerprint and a `cch=<hash>` cache marker (sha256 + slice
+  algorithm, salt `59cf53e54c78`, indices `[4, 7, 20]` — verified unchanged
+  v2.1.10 → v2.1.181)
+- injects `system[1]`: canonical CC identity text
+- injects `system[2]`: cached boilerplate default template, marked
+  `cache_control: { type: "ephemeral" }`. Demoted to non-cached when the
+  caller is already at the cache-breakpoint cap.
+
+Header shaping (UA, `X-Stainless-*`, `anthropic-beta`) and the dated
+upstream model id are set in the provider's fetch path, not as interceptor
+steps.
 
 ### Responses — gateway interceptors
 

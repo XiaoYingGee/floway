@@ -3,8 +3,10 @@
 
 import type { Context } from 'hono';
 
+import { createGatewayCtxFromHono } from '../chat/shared/gateway-ctx.ts';
+import { readRequestBody } from '../chat/shared/request-body.ts';
 import { passthroughApiError, passthroughServe } from '../shared/passthrough-serve.ts';
-import { tokenUsageFromPromptTokenResponse } from '../shared/telemetry/usage.ts';
+import { tokenUsageFromEmbeddingsBody } from '../shared/telemetry/usage.ts';
 
 interface EmbeddingsRequestBody {
   model?: unknown;
@@ -12,11 +14,11 @@ interface EmbeddingsRequestBody {
   [key: string]: unknown;
 }
 
-const prepareEmbeddingsRequest = (body: string): { type: 'ok'; body: Record<string, unknown>; model: string } | { type: 'invalid'; message: string } => {
+const prepareEmbeddingsRequest = (bytes: Uint8Array): { type: 'ok'; body: Record<string, unknown>; model: string } | { type: 'invalid'; message: string } => {
   let request: EmbeddingsRequestBody;
 
   try {
-    const parsed = JSON.parse(body) as unknown;
+    const parsed = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       return {
         type: 'invalid',
@@ -42,19 +44,28 @@ const prepareEmbeddingsRequest = (body: string): { type: 'ok'; body: Record<stri
 };
 
 export const embeddings = async (c: Context): Promise<Response> => {
-  const request = prepareEmbeddingsRequest(await c.req.text());
-  if (request.type === 'invalid') return passthroughApiError(c, request.message, 400);
+  const requestBody = await readRequestBody(c);
+  const ctx = createGatewayCtxFromHono(c, { wantsStream: false, requestBody });
+  const request = prepareEmbeddingsRequest(requestBody.bytes);
+  if (request.type === 'invalid') {
+    ctx.dump?.error('gateway');
+    const response = passthroughApiError(c, request.message, 400);
+    return (ctx.dump?.finalize(response) ?? response);
+  }
 
-  return await passthroughServe({
+  ctx.dump?.requestedModel(request.model);
+  const response = await passthroughServe({
     c,
-    sourceApi: 'embeddings',
+    ctx,
+    sourceApi: '/embeddings',
     model: request.model,
-    bindingServesEndpoint: binding => binding.upstreamModel.endpoints.embeddings !== undefined,
-    call: async binding => {
+    kind: 'embedding',
+    modelServesEndpoint: model => model.endpoints.embeddings !== undefined,
+    call: async (provider, model, opts) => {
       const { model: _model, ...body } = request.body;
-      return await binding.provider.callEmbeddings(binding.upstreamModel, body);
+      return await provider.provider.callEmbeddings(model, body, undefined, opts);
     },
-    extractUsage: tokenUsageFromPromptTokenResponse,
-    noBindingMessage: modelId => `Model ${modelId} does not support the /embeddings endpoint.`,
+    response: { format: 'json', extractBilling: tokenUsageFromEmbeddingsBody },
   });
+  return (ctx.dump?.finalize(response) ?? response);
 };

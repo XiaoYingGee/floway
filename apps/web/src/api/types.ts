@@ -1,28 +1,36 @@
-// Control-plane DTOs the SPA consumes. These mirror the serialized shapes that
-// the gateway emits from the unified /api endpoints — keeping them here (rather
-// than re-using internal repo types) prevents the bundler from pulling Worker
-// runtime code into the browser bundle.
+// Control-plane DTOs the SPA consumes — serialized shapes the gateway emits at /api.
 
-export type UpstreamProviderKind = 'custom' | 'azure' | 'copilot' | 'codex';
+import type {
+  BillingDimension,
+  ModelEndpointKey,
+  ModelEndpoints,
+  ModelKind,
+  ModelPricing,
+} from '@floway-dev/protocols/common';
+import type { AddressableForm, ModelPrefixConfig } from '@floway-dev/provider/model-prefix';
 
-export type ModelKind = 'chat' | 'embedding' | 'image';
+export type { BillingDimension, ModelEndpointKey, ModelEndpoints, ModelKind, ModelPricing };
+export type { AddressableForm, ModelPrefixConfig };
 
-// Structured per-endpoint capability map. Mirrors @floway-dev/protocols
-// ModelEndpoints: a present key means the model is served by that endpoint.
-export interface ModelEndpoints {
-  chatCompletions?: {};
-  responses?: {};
-  messages?: {};
-  embeddings?: {};
-  imagesGenerations?: {};
-  imagesEdits?: {};
+export type UpstreamProviderKind = 'custom' | 'azure' | 'copilot' | 'codex' | 'claude-code' | 'ollama';
+
+export interface ProxyFallbackEntry {
+  id: string;
+  colos?: string[];
 }
 
-export type ModelEndpointKey = keyof ModelEndpoints;
-
-// USD per million tokens, keyed by billing dimension. Mirrors
-// @floway-dev/protocols ModelPricing; every key is optional.
-export type ModelPricing = Partial<Record<'input' | 'input_cache_read' | 'input_cache_write' | 'input_image' | 'output' | 'output_image', number>>;
+// Mutable variant of @floway-dev/protocols/common ChatModelInfo. The editor
+// mutates these arrays in place during reasoning-level/modality edits, so
+// dropping `readonly` here is intentional — the wire shape stays readonly.
+export interface UpstreamChatConfig {
+  modalities?: { input: ('text' | 'image')[]; output: ('text' | 'image')[] };
+  reasoning?: {
+    effort?: { supported: string[]; default: string };
+    budget_tokens?: { min?: number; max?: number };
+    adaptive?: true;
+    mandatory?: true;
+  };
+}
 
 export interface UpstreamModelConfig {
   upstreamModelId: string;
@@ -30,9 +38,10 @@ export interface UpstreamModelConfig {
   kind: ModelKind;
   endpoints: ModelEndpoints;
   display_name?: string;
-  limits?: { max_context_window_tokens?: number; max_prompt_tokens?: number; max_output_tokens?: number };
+  limits?: ModelLimits;
   cost?: ModelPricing;
   flagOverrides?: { enabled: boolean; values: Record<string, boolean> };
+  chat?: UpstreamChatConfig;
 }
 
 export interface CustomModelsFetch {
@@ -40,9 +49,8 @@ export interface CustomModelsFetch {
   endpoint?: string;
 }
 
-// Raw model entries returned by the draft /models browse endpoint
-// (POST /api/upstreams/fetch-models). Permissive superset of the OpenAI,
-// Anthropic, and floway-native /models shapes the backend parser admits.
+// Raw model entries returned by POST /api/upstreams/fetch-models; permissive
+// superset over the shapes the backend accepts.
 export interface CustomRawModel {
   id: string;
   display_name?: string;
@@ -51,17 +59,17 @@ export interface CustomRawModel {
   owned_by?: string;
   limits?: ModelLimits;
   cost?: ModelPricing;
-  kind?: 'chat' | 'embedding' | 'image';
+  kind?: ModelKind;
 }
 
 export interface CustomUpstreamConfig {
   baseUrl: string;
-  authStyle: 'bearer' | 'anthropic';
+  authStyle: 'bearer' | 'anthropic' | 'none';
   endpoints: ModelEndpoints;
   pathOverrides?: Record<string, string>;
   modelsFetch: CustomModelsFetch;
   models: UpstreamModelConfig[];
-  bearerTokenSet?: boolean;
+  apiKeySet?: boolean;
 }
 
 export interface AzureUpstreamConfig {
@@ -78,9 +86,18 @@ export interface CopilotUser {
 }
 
 export interface CopilotUpstreamConfig {
-  accountType: 'individual' | 'business' | 'enterprise';
   user: CopilotUser;
   githubTokenSet?: boolean;
+}
+
+// Per-tier data-plane host GitHub last routed our PAT to. Populated on the
+// first successful token exchange and refreshed alongside the bearer token
+// (matches vscode-copilot-chat domainServiceImpl.ts). Null on a freshly-
+// imported upstream that hasn't completed a token exchange — but the import
+// path mints one synchronously, so a null here in steady state means
+// something is wrong (PAT revoked, network blocked).
+export interface CopilotUpstreamState {
+  copilotToken: { baseUrl: string } | null;
 }
 
 // Account-pool identities derived from the id_token at codex import. v1
@@ -96,7 +113,16 @@ export interface CodexAccountIdentity {
 }
 
 export interface CodexUpstreamConfig {
-  accounts: CodexAccountIdentity[];
+  accounts: [CodexAccountIdentity];
+}
+
+export interface OllamaUpstreamConfig {
+  baseUrl: string;
+  // apiKeySet mirrors customConfig.apiKeySet — the wire never carries the
+  // real secret, only a flag the dashboard uses to render the "leave blank to
+  // keep" hint and the "••••••••" placeholder.
+  apiKeySet?: boolean;
+  models: UpstreamModelConfig[];
 }
 
 export interface CodexAccountCredentialState {
@@ -126,9 +152,103 @@ export interface CodexQuotaSnapshot {
   ratelimited_until?: string;
 }
 
-export interface UpstreamRecord {
+// Claude Code identity + state shapes. Mirror the redacted projections in
+// packages/gateway/src/control-plane/upstreams/serialize.ts: refreshToken
+// lives in state and surfaces only as the boolean `refreshTokenSet`, and
+// accessToken.token is dropped while expiresAt / refreshedAt remain so the
+// dashboard can display a relative-time badge.
+export interface ClaudeCodeAccountIdentity {
+  // null when the access token lacks the `user:profile` scope (personal
+  // accounts whose CLI flow did not request it). Dashboard substitutes the
+  // accountUuid short prefix in that case.
+  email: string | null;
+  accountUuid: string;
+  organizationUuid: string | null;
+  // CLI-canonical plan name derived from `organization.organization_type`.
+  // null for personal accounts (no organization block) and for unrecognized
+  // organization_type values. Dashboard combines this with rateLimitTier
+  // below for display ("Max 5×", "Max 20×").
+  subscriptionType: 'pro' | 'max' | 'team' | 'enterprise' | null;
+  // Raw `organization.rate_limit_tier` from Anthropic — e.g.
+  // 'default_claude_max_5x'. Free-form so a new tier does not break ingest.
+  rateLimitTier: string | null;
+}
+
+export interface ClaudeCodeUpstreamConfig {
+  accounts: [ClaudeCodeAccountIdentity];
+}
+
+export interface ClaudeCodeAccessTokenSummary {
+  expiresAt: number;
+  refreshedAt: string;
+}
+
+// Anthropic's `anthropic-ratelimit-unified-*` snapshot. The wire shape is
+// frozen at the gateway boundary in @floway-dev/provider-claude-code's
+// quota.ts; mirror it so the dashboard renders the structured slices and
+// can show the raw header map under a debug disclosure.
+export interface ClaudeCodeQuotaWindow {
+  status: string | null;
+  reset: string | null;
+  utilization: number | null;
+}
+
+export interface ClaudeCodeQuotaSevenDay extends ClaudeCodeQuotaWindow {
+  surpassedThreshold: boolean | null;
+}
+
+export interface ClaudeCodeQuotaOverage extends ClaudeCodeQuotaWindow {
+  disabledReason: string | null;
+}
+
+export interface ClaudeCodeQuotaSnapshotData {
+  status: string | null;
+  reset: string | null;
+  fallbackAvailable: boolean | null;
+  fallbackPercentage: number | null;
+  representativeClaim: string | null;
+  overage: ClaudeCodeQuotaOverage | null;
+  fiveHour: ClaudeCodeQuotaWindow | null;
+  sevenDay: ClaudeCodeQuotaSevenDay | null;
+  raw: Record<string, string>;
+}
+
+export interface ClaudeCodeQuotaSnapshotEntry {
+  fetchedAt: number;
+  data: ClaudeCodeQuotaSnapshotData;
+}
+
+// Live `/api/oauth/usage` probe response cached on the credential. Distinct
+// slot from `quotaSnapshot` because the wire shape is owned by Anthropic and
+// evolves on their schedule — `data` is `unknown` so a new field never
+// blocks dashboard parse. The dashboard walks the known three windows
+// (`five_hour`, `seven_day`, `seven_day_sonnet`) and renders anything else
+// raw under a debug disclosure.
+export interface ClaudeCodeUsageProbeSnapshotEntry {
+  fetchedAt: number;
+  data: unknown;
+}
+
+export interface ClaudeCodeAccountCredentialSummary {
+  accountUuid: string;
+  // `oauth` is the full Claude Code sign-in (rotating refresh token).
+  // `setup-token` is the inference-only long-lived bearer (no refresh).
+  tokenKind: 'oauth' | 'setup-token';
+  state: 'active' | 'session_terminated' | 'refresh_failed';
+  stateMessage?: string;
+  stateUpdatedAt: string;
+  refreshTokenSet: boolean;
+  accessToken: ClaudeCodeAccessTokenSummary | null;
+  quotaSnapshot: ClaudeCodeQuotaSnapshotEntry | null;
+  usageProbeSnapshot: ClaudeCodeUsageProbeSnapshotEntry | null;
+}
+
+export interface ClaudeCodeUpstreamState {
+  accounts: ClaudeCodeAccountCredentialSummary[];
+}
+
+interface UpstreamRecordBase {
   id: string;
-  provider: UpstreamProviderKind;
   name: string;
   enabled: boolean;
   sort_order: number;
@@ -139,20 +259,57 @@ export interface UpstreamRecord {
   // unroutable, but their per-model metadata stays editable. May include ids no
   // longer present in the live model list.
   disabled_public_model_ids: string[];
-  config: CustomUpstreamConfig | AzureUpstreamConfig | CopilotUpstreamConfig | CodexUpstreamConfig;
-  // Codex is the only provider that ships gateway-managed state on the row
-  // today; the other providers serialize this as null.
-  state: CodexUpstreamState | null;
-  // Present only for provider === 'codex'; serialized inline so the dashboard
-  // renders the quota panel without a follow-up fetch.
-  codex_quota?: CodexQuotaSnapshot | null;
+  // Ordered fallback dial-list. Each entry pins a proxy id (or the literal
+  // string `'direct'` for "no proxy") and an optional `colos` whitelist that
+  // scopes the entry to specific location tags (Cloudflare colos / the Node
+  // `RUNTIME_LOCATION` env var). Empty/missing whitelist means "active in
+  // all locations". Empty top-level list means "always direct".
+  proxy_fallback_list: ProxyFallbackEntry[];
+  // Per-upstream model name prefix. When set, this upstream's models can be
+  // addressed in two forms (`unprefixed` and `prefixed`) and listed in either
+  // — see `@floway-dev/provider/model-prefix` for the field semantics. Null
+  // means "no prefix configured; the upstream advertises and accepts only
+  // the bare upstream id."
+  model_prefix: ModelPrefixConfig | null;
+  // SWR models-cache freshness joined from the models_cache table. Both inner
+  // values are null on a row that has never been warmed; lastError is set
+  // when the most recent warm failed but a prior fetch still populates
+  // fetchedAt.
+  modelsCache: {
+    fetchedAt: number | null;
+    lastError: { message: string; at: number } | null;
+  };
 }
+
+// Provider-keyed discriminated union: each variant pins `provider` and the
+// matching `config` / `state` shape, so `switch (record.provider)` narrows
+// both fields without an `as` cast. Codex's `codex_quota` field rides on the
+// codex variant only.
+export type UpstreamRecord =
+  | (UpstreamRecordBase & { provider: 'custom'; config: CustomUpstreamConfig; state: null })
+  | (UpstreamRecordBase & { provider: 'azure'; config: AzureUpstreamConfig; state: null })
+  | (UpstreamRecordBase & { provider: 'copilot'; config: CopilotUpstreamConfig; state: CopilotUpstreamState | null })
+  | (UpstreamRecordBase & { provider: 'codex'; config: CodexUpstreamConfig; state: CodexUpstreamState | null; codex_quota?: CodexQuotaSnapshot | null })
+  | (UpstreamRecordBase & { provider: 'claude-code'; config: ClaudeCodeUpstreamConfig; state: ClaudeCodeUpstreamState | null })
+  | (UpstreamRecordBase & { provider: 'ollama'; config: OllamaUpstreamConfig; state: null });
 
 export interface FlagDef {
   id: string;
   label: string;
   description: string;
   defaultFor: UpstreamProviderKind[];
+}
+
+// Importing the gateway's source-of-truth type as the actual definition (rather
+// than redeclaring the shape) makes any future field rename a compile error
+// here instead of a runtime mismatch the next time someone refreshes the page.
+export type { SerializedProxyRecord as ProxyRecord, SerializedBackoffRow as BackoffRow } from '@floway-dev/gateway/control-plane/proxies/serialize';
+
+// 409 body returned by DELETE /api/proxies/:id when the row is referenced
+// by an upstream's fallback list.
+export interface ProxyConflictBody {
+  error: string;
+  referencing_upstream_ids?: string[];
 }
 
 export interface ApiKey {
@@ -162,6 +319,7 @@ export interface ApiKey {
   created_at: string;
   last_used_at: string | null;
   upstream_ids: string[] | null;
+  dump_retention_seconds: number | null;
 }
 
 export interface ModelEndpointInfo {
@@ -181,7 +339,7 @@ export interface PublicModel {
   limits?: ModelLimits;
   endpoints?: Record<string, ModelEndpointInfo>;
   cost?: ModelPricing;
-  kind?: 'chat' | 'embedding' | 'image';
+  kind?: ModelKind;
 }
 
 export interface ControlPlaneModel extends PublicModel {
@@ -189,9 +347,10 @@ export interface ControlPlaneModel extends PublicModel {
 }
 
 export interface SearchConfig {
-  provider: 'disabled' | 'tavily' | 'microsoft-grounding';
+  provider: 'disabled' | 'tavily' | 'microsoft-grounding' | 'jina';
   tavily: { apiKey: string };
   microsoftGrounding: { apiKey: string };
+  jina: { apiKey: string };
 }
 
 export interface CopilotQuotaSnapshot {

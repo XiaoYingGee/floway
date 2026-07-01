@@ -5,27 +5,71 @@ import {
   CODEX_OAUTH_USER_AGENT,
   CODEX_REDIRECT_URI,
 } from '../constants.ts';
+import type { Fetcher } from '@floway-dev/provider';
 
 export interface CodexOAuthTokens {
   access_token: string;
   refresh_token: string;
   id_token: string;
-  // Lifetime in seconds; the server's clock + this number define expires_at.
+  // Lifetime in seconds, relative to the server's clock at issue time.
   expires_in: number;
 }
 
-// Terminal error: refresh_token is dead, operator must re-import. Distinct from
-// generic OAuth 4xx so the request lifecycle can mark the upstream
-// `refresh_failed` instead of merely surfacing the upstream message.
+// Terminal error: refresh_token is dead, operator must re-import. Distinct
+// from generic OAuth 4xx so callers can react to session-termination
+// separately from a transient upstream message. `code` carries the raw OAuth
+// `error` value (`invalid_grant`, `app_session_terminated`, etc.) so the
+// refresh-race recovery in the access-token cache can single out
+// `invalid_grant` — the only terminal code that might mean "a sibling
+// worker just rotated the refresh token, and our copy is stale" — from
+// codes that signal genuine credential death under any race scenario.
 export class CodexOAuthSessionTerminatedError extends Error {
-  constructor(public readonly upstreamMessage: string) {
-    super(`Codex OAuth session terminated: ${upstreamMessage}`);
+  readonly code: string;
+  readonly upstreamMessage: string;
+  constructor(args: { code: string; message: string }) {
+    super(`Codex OAuth session terminated: ${args.message}`);
     this.name = 'CodexOAuthSessionTerminatedError';
+    this.code = args.code;
+    this.upstreamMessage = args.message;
   }
 }
 
-const codexTokenRequest = async (body: URLSearchParams, terminalCodes: ReadonlySet<string>): Promise<CodexOAuthTokens> => {
-  const response = await fetch(CODEX_OAUTH_TOKEN_URL, {
+// Terminal codes accepted on the authorization-code exchange. This is OUR
+// classification (codex-rs/login/src/server.rs does not split errors into
+// terminal vs recoverable on this path), but `app_session_terminated`
+// observably means the upstream account is gone — there is nothing the
+// operator can do besides re-import after fixing the underlying account.
+// `invalid_grant` on exchange typically means the operator pasted a stale
+// or wrong callback URL, which is recoverable by restarting the PKCE flow
+// rather than re-importing, so it stays out of this set.
+const EXCHANGE_TERMINAL_OAUTH_CODES: ReadonlySet<string> = new Set([
+  'app_session_terminated',
+]);
+
+// Terminal codes on the refresh path: every one of these signals a dead
+// refresh_token that only operator re-import recovers. Aligned with
+// sub2api's `isNonRetryableRefreshError`
+// (backend/internal/service/token_refresh_service.go:429-451), which shares
+// the same list across OpenAI/Claude/Gemini OAuth — Codex is OpenAI OAuth,
+// so the set carries over verbatim. `invalid_grant` is included even though
+// the refresh-race recovery in access-token-cache.ts may re-classify it
+// when a sibling rotation is detected; from the OAuth wire's perspective
+// it is still a terminal signal.
+const REFRESH_TERMINAL_OAUTH_CODES: ReadonlySet<string> = new Set([
+  'app_session_terminated',
+  'invalid_grant',
+  'invalid_refresh_token',
+  'invalid_client',
+  'unauthorized_client',
+  'access_denied',
+]);
+
+const codexTokenRequest = async (
+  body: URLSearchParams,
+  terminalCodes: ReadonlySet<string>,
+  fetcher: Fetcher,
+): Promise<CodexOAuthTokens> => {
+  const response = await fetcher(CODEX_OAUTH_TOKEN_URL, {
     method: 'POST',
     headers: {
       'content-type': 'application/x-www-form-urlencoded',
@@ -60,7 +104,7 @@ const codexTokenRequest = async (body: URLSearchParams, terminalCodes: ReadonlyS
     if (message === null && typeof root?.detail === 'string') message = root.detail as string;
     message ??= rawText.slice(0, 256);
     if (code && terminalCodes.has(code)) {
-      throw new CodexOAuthSessionTerminatedError(message);
+      throw new CodexOAuthSessionTerminatedError({ code, message });
     }
     throw new Error(`Codex OAuth /token returned ${response.status}: ${message}`);
   }
@@ -82,7 +126,19 @@ const codexTokenRequest = async (body: URLSearchParams, terminalCodes: ReadonlyS
   };
 };
 
-export const exchangeCodexAuthorizationCode = async (opts: { code: string; codeVerifier: string }): Promise<CodexOAuthTokens> => {
+// PKCE exchange runs before the upstream record exists, so there is no
+// persisted proxy chain to read here — the caller must supply the fetcher
+// explicitly. Making `fetcher` required (rather than defaulting to direct
+// egress) keeps every call site honest: callers that want direct egress
+// pass `directFetcher` themselves, and the import path can't accidentally
+// bypass an operator-configured proxy.
+export const exchangeCodexAuthorizationCode = async (opts: { code: string; codeVerifier: string; fetcher: Fetcher }): Promise<CodexOAuthTokens> => {
+  // auth.openai.com rejects exchanges that include a `state` parameter with
+  // 400 unknown_parameter (live-probed). The upstream Codex CLI's
+  // `exchange_code_for_tokens` in codex-rs/login/src/server.rs deliberately
+  // omits it — we mirror that. (Anthropic's analogous endpoint, by
+  // contrast, requires `state` on exchange — handled separately in
+  // provider-claude-code.)
   const body = new URLSearchParams({
     grant_type: 'authorization_code',
     client_id: CODEX_CLIENT_ID,
@@ -90,25 +146,23 @@ export const exchangeCodexAuthorizationCode = async (opts: { code: string; codeV
     redirect_uri: CODEX_REDIRECT_URI,
     code_verifier: opts.codeVerifier,
   });
-  // Only `app_session_terminated` is terminal here — `invalid_grant` on
-  // exchange typically means the operator pasted a stale or wrong callback
-  // URL, which is recoverable by restarting the PKCE flow rather than
-  // re-importing.
-  return await codexTokenRequest(body, new Set(['app_session_terminated']));
+  return await codexTokenRequest(body, EXCHANGE_TERMINAL_OAUTH_CODES, opts.fetcher);
 };
 
-export const refreshCodexAccessToken = async (refreshToken: string): Promise<CodexOAuthTokens> => {
+// `fetcher` is required because the refresh has an associated upstream
+// and must flow through that upstream's proxy-aware fallback chain rather
+// than direct egress.
+export const refreshCodexAccessToken = async (refreshToken: string, fetcher: Fetcher): Promise<CodexOAuthTokens> => {
   const body = new URLSearchParams({
     grant_type: 'refresh_token',
     refresh_token: refreshToken,
     client_id: CODEX_CLIENT_ID,
     scope: CODEX_OAUTH_SCOPE,
   });
-  // OAuth `invalid_grant` on the refresh path is unambiguous — the
-  // refresh_token has been replayed, revoked, or expired. Same recovery as
-  // `app_session_terminated`: the operator must re-import a fresh auth.json.
-  // The error text varies ("Your refresh token has already been used to
-  // generate a new access token", "Token is no longer valid", etc.); the code
-  // is the stable signal.
-  return await codexTokenRequest(body, new Set(['app_session_terminated', 'invalid_grant']));
+  // OAuth `invalid_grant` on the refresh path is ambiguous on its own — it
+  // can mean a genuinely revoked/expired refresh_token, *or* that a sibling
+  // worker raced us, won the rotation, and our copy is now stale. The
+  // access-token cache's `recoverFromRefreshRace` distinguishes by re-reading
+  // upstream state; the other codes here always mean credential death.
+  return await codexTokenRequest(body, REFRESH_TERMINAL_OAUTH_CODES, fetcher);
 };

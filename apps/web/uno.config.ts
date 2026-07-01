@@ -15,10 +15,9 @@ export default defineConfig({
     }),
     presetWebFonts({
       provider: 'google',
-      inlineImports: false,
       fonts: {
-        sans: [{ name: 'DM Sans', weights: ['300', '400', '500', '600', '700'] }],
-        mono: [{ name: 'JetBrains Mono', weights: ['300', '400', '500', '600'] }],
+        sans: { name: 'DM Sans', weights: ['300', '400', '500', '600', '700'] },
+        mono: { name: 'JetBrains Mono', weights: ['300', '400', '500', '600'] },
       },
     }),
   ],
@@ -39,6 +38,9 @@ export default defineConfig({
         amber: '#ffd740',
         rose: '#ff5252',
         violet: '#a78bfa',
+        // Anthropic's brand coral — used to distinguish the Claude Code
+        // provider card from the rose-toned Ollama card next to it.
+        orange: '#ff7a59',
       },
     },
     fontFamily: {

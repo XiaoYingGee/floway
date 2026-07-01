@@ -3,45 +3,40 @@
 //   1. OpenAI:       { object: 'list', data: [{ id, object?, owned_by?, created? }] }
 //   2. Anthropic:    { data: [{ type: 'model', id, display_name?, created_at? }],
 //                      has_more, first_id, last_id }     (no top-level `object`)
-//   3. floway's own /models (superset of 1+2 with display_name,
-//      created_at, limits, cost, kind).
+//   3. OpenAI/Anthropic superset with optional display_name, created_at,
+//      limits, cost, kind on the model and a `data` array on the container.
 //
-// The parser is intentionally tolerant: a model is admitted if it has a string
-// `id`; everything else is best-effort metadata. The container is admitted if
-// `data` is an array. We do NOT read any per-model endpoint hint — endpoint
-// routing for an auto custom model is inferred by the provider (Tier 1 reads
-// the published `kind` here if the upstream emits it; Tier 2 falls back to an id
-// heuristic; the chat default takes the per-upstream `endpoints` config).
+// A model is admitted if it has a string `id`; everything else is best-
+// effort metadata. The container is admitted if `data` is an array.
 
 import type { CustomUpstreamConfig } from './config.ts';
 import { customFetchModels } from './fetch.ts';
-import type { ModelKind, ModelPricing } from '@floway-dev/protocols/common';
-import { ProviderModelsUnavailableError } from '@floway-dev/provider';
+import { BILLING_DIMENSIONS, type ModelKind, type ModelPricing } from '@floway-dev/protocols/common';
+import { chatField, fetchUpstreamModels, type Fetcher, type UpstreamChatModelConfig } from '@floway-dev/provider';
 
 export interface CustomRawModel {
   id: string;
-  // OpenAI / our-gateway use `created` (unix seconds). Anthropic / our-gateway
-  // also expose `created_at` (ISO-8601). We carry both and let the projection
-  // step decide which to use.
+  // OpenAI uses `created` (unix seconds). Anthropic uses `created_at`
+  // (ISO-8601). We carry both and let the projection step decide.
   created?: number;
   created_at?: string;
-  // OpenAI uses no display name. Anthropic / our-gateway use `display_name`.
-  // Some OpenAI-compat upstreams use the non-standard `name`.
   display_name?: string;
+  // Non-standard OpenAI-compat alternative for the display name.
   name?: string;
   owned_by?: string;
-  // floway-only superset fields.
+  // Optional superset fields, absent on minimal OpenAI-compat upstreams.
   limits?: {
     max_output_tokens?: number;
     max_context_window_tokens?: number;
     max_prompt_tokens?: number;
   };
   cost?: ModelPricing;
-  // Tier 1 embedding-vs-chat signal: present when the upstream is another
-  // floway and emits its own ModelKind. Other OpenAI-compat providers
-  // (OpenAI, Anthropic, Groq, DeepSeek) never set this; the provider's id
-  // heuristic (Tier 2) then takes over.
+  // Optional ModelKind published by Floway upstreams; absent on plain
+  // OpenAI-compat upstreams.
   kind?: ModelKind;
+  // Optional chat metadata from Floway-shaped upstreams; absent on plain
+  // OpenAI-compat upstreams.
+  chat?: UpstreamChatModelConfig;
 }
 
 export interface CustomModelsResponse {
@@ -66,14 +61,12 @@ const parseLimits = (value: unknown): CustomRawModel['limits'] => {
   return Object.keys(limits).length > 0 ? limits : undefined;
 };
 
-const PRICING_DIMENSIONS: readonly (keyof ModelPricing)[] = ['input', 'input_cache_read', 'input_cache_write', 'input_image', 'output', 'output_image'];
-
 const parseCost = (value: unknown): ModelPricing | undefined => {
   // Admit any subset of billing dimensions advertised on the upstream's
   // /v1/models cost block; drop the whole block when none are present.
   if (!isRecord(value)) return undefined;
   const cost: ModelPricing = {};
-  for (const dimension of PRICING_DIMENSIONS) {
+  for (const dimension of BILLING_DIMENSIONS) {
     const rate = optionalNumberField(value[dimension]);
     if (rate !== undefined) cost[dimension] = rate;
   }
@@ -105,6 +98,11 @@ const parseRawModel = (value: unknown): CustomRawModel | null => {
   if (cost !== undefined) model.cost = cost;
   const kind = parseKind(value.kind);
   if (kind !== undefined) model.kind = kind;
+  // Attempt to parse chat metadata; silently skip on malformed data.
+  try {
+    const chat = chatField(value.chat, `${value.id}.chat`);
+    if (chat !== undefined) model.chat = chat;
+  } catch { /* skip */ }
   return model;
 };
 
@@ -118,32 +116,8 @@ const parseCustomModelsResponse = (value: unknown): CustomModelsResponse | null 
   return { data };
 };
 
-export const fetchCustomModels = async (config: CustomUpstreamConfig): Promise<CustomModelsResponse> => {
-  let response: Response;
-  try {
-    response = await customFetchModels(config, { method: 'GET' });
-  } catch (cause) {
-    throw new ProviderModelsUnavailableError(null, cause);
-  }
-
-  if (!response.ok) {
-    const body = await response.text();
-    throw new ProviderModelsUnavailableError({
-      status: response.status,
-      headers: new Headers(response.headers),
-      body,
-    });
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = await response.json();
-  } catch (cause) {
-    throw new ProviderModelsUnavailableError(null, cause);
-  }
-  const result = parseCustomModelsResponse(parsed);
-  if (!result) {
-    throw new ProviderModelsUnavailableError(null, new Error('Invalid /models response shape'));
-  }
-  return result;
-};
+export const fetchCustomModels = (config: CustomUpstreamConfig, fetcher: Fetcher): Promise<CustomModelsResponse> =>
+  fetchUpstreamModels(
+    () => customFetchModels(config, { method: 'GET' }, { fetcher }),
+    parseCustomModelsResponse,
+  );

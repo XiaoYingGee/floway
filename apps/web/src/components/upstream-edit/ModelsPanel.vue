@@ -1,18 +1,21 @@
 <script setup lang="ts">
-// Right-side composite that owns the model row reconciliation: keeps the
-// merged manual+auto list in sync with the props, and hands the selected
-// row down to ModelEditor.
+// Owns the model row reconciliation: keeps the merged manual+auto list in
+// sync with the props, and hands the selected row down to ModelEditor.
 
-import { Button } from '@floway-dev/ui';
 import { computed, reactive, ref, watch } from 'vue';
 
-import type { FlagDef, UpstreamModelConfig, UpstreamProviderKind } from '../../api/types.ts';
 import ModelEditor from './ModelEditor.vue';
-import ModelsGrid from './ModelsGrid.vue';
 import { newUiId, type Row, seedFromAuto } from './modelRows.ts';
+import ModelsGrid from './ModelsGrid.vue';
+import type { FlagDef, UpstreamModelConfig, UpstreamProviderKind } from '../../api/types.ts';
+import { Button } from '@floway-dev/ui';
 
 const manualModels = defineModel<UpstreamModelConfig[]>({ required: true });
 const disabledIds = defineModel<string[]>('disabledIds', { required: true });
+
+const emit = defineEmits<{
+  'update:invalid': [invalid: boolean];
+}>();
 
 const props = withDefaults(defineProps<{
   autoModels?: UpstreamModelConfig[];
@@ -35,6 +38,26 @@ const selectedUiId = ref<string | null>(null);
 // uiIds whose upstreamModelId is fixed (they were seeded from an auto twin
 // and must keep shadowing it). Pure-manual rows have no such constraint.
 const lockedUpstreamId = reactive(new Set<string>());
+
+// Validity entries persist across row selection changes — switching away
+// from an invalid row keeps it in the map so save stays blocked. Entries
+// are dropped only when the row itself is removed.
+const rowValidity = reactive(new Map<string, boolean>());
+
+const anyInvalid = computed(() => Array.from(rowValidity.values()).some(v => !v));
+watch(anyInvalid, v => emit('update:invalid', v), { immediate: true });
+
+const onRowValidityChange = (uiId: string, valid: boolean) => {
+  rowValidity.set(uiId, valid);
+};
+
+// Drop validity state for rows that are removed so stale entries do not block save.
+watch(rows, next => {
+  const live = new Set(next.map(r => r.uiId));
+  for (const id of rowValidity.keys()) {
+    if (!live.has(id)) rowValidity.delete(id);
+  }
+}, { deep: false });
 
 // Reconcile the unified row list from the persisted manual models and the
 // live auto list. Existing rows keep their position and uiId when their
@@ -95,8 +118,7 @@ const reconcile = () => {
 watch([manualModels, () => props.autoModels], reconcile, { immediate: true, deep: false });
 
 const selectedRow = computed<Row | null>(() =>
-  selectedUiId.value === null ? null : rows.value.find(r => r.uiId === selectedUiId.value) ?? null,
-);
+  selectedUiId.value === null ? null : rows.value.find(r => r.uiId === selectedUiId.value) ?? null);
 
 const emitManual = () => {
   manualModels.value = rows.value
@@ -147,7 +169,7 @@ const setMode = (uiId: string, mode: 'auto' | 'manual') => {
 
 const patchConfig = (patch: Partial<UpstreamModelConfig>) => {
   const row = selectedRow.value;
-  if (!row || row.kind !== 'manual') return;
+  if (row?.kind !== 'manual') return;
   Object.assign(row.config, patch);
   for (const key of Object.keys(patch) as (keyof UpstreamModelConfig)[]) {
     if (patch[key] === undefined) delete (row.config as unknown as Record<string, unknown>)[key];
@@ -294,6 +316,7 @@ watch(manualModels, () => {
         @patch-config="patchConfig"
         @set-mode="next => selectedRow && setMode(selectedRow.uiId, next)"
         @remove="selectedRow && removeRow(selectedRow.uiId)"
+        @validity-change="valid => selectedRow && onRowValidityChange(selectedRow.uiId, valid)"
       />
     </div>
   </div>

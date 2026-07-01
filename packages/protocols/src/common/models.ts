@@ -1,27 +1,46 @@
 // Disjoint billing dimensions a single request can be charged on. Every count
 // keyed by these is non-overlapping: a prompt token is counted under exactly
-// one of `input`, `input_cache_read`, `input_cache_write`, or `input_image`,
-// never several at once.
+// one of `input`, `input_cache_read`, `input_cache_write`,
+// `input_cache_write_1h`, or `input_image`, never several at once.
 //
 // Convention borrowed from models.dev and LiteLLM: bare `input`/`output` mean
 // the text modality AND act as the fallback rate for any modality without a
 // dedicated rate; the `_image` variants are the image modality. There are no
 // image cache dimensions on purpose — a live probe of Azure gpt-image-2
 // confirmed its usage object never emits cached fields.
-export type BillingDimension = 'input' | 'input_cache_read' | 'input_cache_write' | 'input_image' | 'output' | 'output_image';
+//
+// `input_cache_write` is the generic cache-write bucket — protocols without
+// a TTL distinction land all their writes here, and on Anthropic it covers
+// the default (5-minute) TTL bucket. `input_cache_write_1h` is the explicit
+// 1-hour bucket Anthropic surfaces under
+// `cache_creation.ephemeral_1h_input_tokens` (extended-cache-ttl-2025-04-11).
+// They are disjoint subsets of `cache_creation_input_tokens`.
+export type BillingDimension = 'input' | 'input_cache_read' | 'input_cache_write' | 'input_cache_write_1h' | 'input_image' | 'output' | 'output_image';
+
+// Iteration form of BillingDimension; the type union is the source of truth.
+export const BILLING_DIMENSIONS: readonly BillingDimension[] = ['input', 'input_cache_read', 'input_cache_write', 'input_cache_write_1h', 'input_image', 'output', 'output_image'];
 
 // Per-model pricing in USD per million tokens, aligned with the sst/models.dev
 // `Cost` schema (https://github.com/sst/models.dev/blob/main/packages/core/src/schema.ts).
 // Keys are billing dimensions: bare `input`/`output` are the text/fallback rate
 // and `_image` keys are the image modality. Every key is optional; an absent key
 // falls back per `unitPriceForDimension` (modality → bare, cached → uncached).
-export type ModelPricing = Partial<Record<BillingDimension, number>>;
+//
+// `tiers` carries per-request service-tier overrides (Anthropic fast mode,
+// OpenAI priority/flex). Each tier key is the wire-value the upstream stamps
+// on the usage object (`fast`, `priority`, `flex`, ...). Resolve through
+// `resolveEffectivePricing(pricing, usage.tier)` before any unit-price lookup.
+export interface ModelPricing extends Partial<Record<BillingDimension, number>> {
+  tiers?: Record<string, Partial<Record<BillingDimension, number>>>;
+}
 
 // Resolve the USD-per-million-tokens unit price for one dimension against a
 // pricing snapshot, applying the LiteLLM-style fallback chain: a modality with
-// no dedicated rate falls back to the bare text rate, and cached input falls
-// back to uncached input. Returns null when even the fallback base is absent
-// (or the whole snapshot is null), which aggregation treats as cost 0.
+// no dedicated rate falls back to the bare text rate, cached input falls back
+// to uncached input, and the 1-hour cache write falls back to the 5-minute
+// cache write before reaching uncached input. Returns null when even the
+// fallback base is absent (or the whole snapshot is null), which aggregation
+// treats as cost 0.
 export const unitPriceForDimension = (pricing: ModelPricing | null, dimension: BillingDimension): number | null => {
   if (!pricing) return null;
   switch (dimension) {
@@ -31,6 +50,8 @@ export const unitPriceForDimension = (pricing: ModelPricing | null, dimension: B
     return pricing.input_cache_read ?? pricing.input ?? null;
   case 'input_cache_write':
     return pricing.input_cache_write ?? pricing.input ?? null;
+  case 'input_cache_write_1h':
+    return pricing.input_cache_write_1h ?? pricing.input_cache_write ?? pricing.input ?? null;
   case 'input_image':
     return pricing.input_image ?? pricing.input ?? null;
   case 'output':
@@ -40,40 +61,57 @@ export const unitPriceForDimension = (pricing: ModelPricing | null, dimension: B
   }
 };
 
+// Fold the per-tier override (if any) into a flat ModelPricing snapshot, so
+// every downstream `unitPriceForDimension` call sees one self-contained map.
+// Per-dimension shallow merge: overlay keys win, omitted keys inherit the
+// base rate (and then flow through `unitPriceForDimension`'s fallback chain).
+// Returns a fresh object that never carries `tiers` — recursion would not
+// match any real billing surface. An unknown or absent tier returns the base
+// snapshot unchanged (sans `tiers`), so old usage rows with no tier carry on
+// pricing identically to before.
+export const resolveEffectivePricing = (pricing: ModelPricing | null, tier: string | null | undefined): ModelPricing | null => {
+  if (!pricing) return null;
+  const { tiers, ...base } = pricing;
+  const override = tier != null ? tiers?.[tier] : undefined;
+  return override ? { ...base, ...override } : base;
+};
+
 // High-level endpoint-family discriminator. A model belongs to exactly one
 // kind; cross-cutting features (vision, function calling, structured
 // outputs) are orthogonal and modeled separately when needed.
 //
 // Convention borrowed from Together AI's `type` field on /v1/models, which
 // chooses a single string enum because each model id in practice maps to
-// one endpoint family. We renamed `type` to `kind` to avoid colliding with
-// Anthropic's `type: 'model'` object discriminator already on PublicModel.
+// one endpoint family. Field is named `kind` rather than `type` because
+// PublicModel already carries Anthropic's `type: 'model'` discriminator.
 //
-// Together AI's live /v1/models is known to emit at least these values:
-//
-//   chat        — instruction-tuned chat models (vision LLMs are also `chat`)
-//   language    — base / text-completion models
-//   code        — code-completion models
-//   image       — text-to-image AND image-to-image (one type, switched by
-//                 presence of an input image in the request)
-//   embedding   — vector embedding models
-//   moderation  — Llama-Guard-style classifiers (routed via /v1/completions)
-//   rerank      — query/document re-rankers
-//   audio       — text-to-speech models
-//   transcribe  — speech-to-text models
-//   video       — text-to-video models
-//
-// This list is open-ended and has grown reactively: Together's published
-// OpenAPI schema still lists only the first 7, but the live API has
-// emitted at least `audio`, `transcribe`, and `video` in production, each
-// landing in the official together-python SDK only after response
-// validation broke downstream (PRs #241, #341, #383). New values may
-// appear at any time.
-//
-// We adopt the same vocabulary because the names are already established
-// in the ecosystem. Add a value here only when we actually route that
-// endpoint family — do not pre-declare for future capabilities.
+// Add a value here only when we actually route that endpoint family — do
+// not pre-declare for future capabilities.
 export type ModelKind = 'chat' | 'embedding' | 'image';
+
+export type Modality = 'text' | 'image';
+
+// Operator-configured chat capability metadata. Lives in protocols because it
+// flows verbatim onto PublicModel.chat (the wire DTO) and is also re-exported
+// by @floway-dev/provider as UpstreamChatModelConfig for the catalog side; one
+// definition serves both surfaces.
+export interface ChatModelInfo {
+  modalities?: {
+    input: readonly Modality[];
+    output: readonly Modality[];
+  };
+  reasoning?: {
+    // Discrete effort levels — a closed set of named presets (e.g. low/medium/high).
+    effort?: { supported: readonly string[]; default: string };
+    // Operator-supplied token budget. Bounds are optional; absent bounds mean
+    // "operator can supply a budget, but legal range is unknown".
+    budget_tokens?: { min?: number; max?: number };
+    // Model-controlled adaptive depth — the model decides how much reasoning to do.
+    adaptive?: boolean;
+    // Always-on reasoning — the model cannot be instructed to skip it.
+    mandatory?: boolean;
+  };
+}
 
 // Public DTO served at /v1/models and /models. Single superset shape — OpenAI's
 // and Anthropic's /models field names do not overlap, so one payload satisfies
@@ -96,6 +134,7 @@ export interface PublicModel {
   };
   kind: ModelKind;
   cost?: ModelPricing;
+  chat?: ChatModelInfo;
 }
 
 export interface PublicModelsResponse {

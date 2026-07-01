@@ -1,50 +1,51 @@
 import { useLocalStorage } from '@vueuse/core';
 import { defineStore } from 'pinia';
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 
-// We persist the full auth identity (key + isAdmin flag + the API key
-// metadata returned by /auth/login for the non-admin path) so a refresh keeps
-// the dashboard rendering the right view without a round trip.
-export interface AuthIdentity {
-  key: string;
+export interface AuthUser {
+  id: number;
+  username: string;
   isAdmin: boolean;
-  keyId?: string;
-  keyName?: string;
-  keyHint?: string;
+  canViewGlobalTelemetry: boolean;
+  upstreamIds: string[] | null;
 }
 
-const STORAGE_KEY = 'floway-auth';
-
+// Only the session token is persisted. Everything else (admin flag, telemetry
+// visibility, upstream cap) is server-authoritative and must be re-fetched
+// from /auth/me on every app boot — caching it in localStorage lets stale
+// permissions linger after an admin promotes/demotes the actor or rotates
+// their upstream cap.
 export const useAuthStore = defineStore('auth', () => {
-  const identity = useLocalStorage<AuthIdentity | null>(STORAGE_KEY, null, {
-    serializer: {
-      read: raw => {
-        if (!raw) return null;
-        try {
-          return JSON.parse(raw) as AuthIdentity;
-        } catch {
-          return null;
-        }
-      },
-      write: value => value === null ? '' : JSON.stringify(value),
-    },
-  });
+  const token = useLocalStorage<string | null>('floway-token', null);
+  const user = ref<AuthUser | null>(null);
 
-  const isAuthenticated = computed(() => identity.value !== null);
-  const isAdmin = computed(() => identity.value?.isAdmin === true);
-  const authKey = computed(() => identity.value?.key ?? null);
-  const apiKeyInfo = computed(() => {
-    const v = identity.value;
-    if (!v || v.isAdmin) return null;
-    return { id: v.keyId, name: v.keyName, hint: v.keyHint };
-  });
+  const isAuthenticated = computed(() => token.value !== null && user.value !== null);
+  const isAdmin = computed(() => user.value?.isAdmin === true);
+  const canViewGlobalTelemetry = computed(() => user.value?.canViewGlobalTelemetry === true);
+  const currentUser = computed(() => user.value);
+  const authToken = computed(() => token.value);
 
-  const setAuth = (next: AuthIdentity) => {
-    identity.value = next;
+  const setAuth = (next: { token: string; user: AuthUser }) => {
+    token.value = next.token;
+    user.value = next.user;
+  };
+  const setUser = (next: AuthUser) => {
+    if (token.value === null) throw new Error('setUser called without an authenticated session');
+    user.value = next;
   };
   const clearAuth = () => {
-    identity.value = null;
+    token.value = null;
+    user.value = null;
   };
 
-  return { identity, isAuthenticated, isAdmin, authKey, apiKeyInfo, setAuth, clearAuth };
+  return {
+    isAuthenticated,
+    isAdmin,
+    authToken,
+    currentUser,
+    canViewGlobalTelemetry,
+    setAuth,
+    setUser,
+    clearAuth,
+  };
 });
