@@ -1,5 +1,0 @@
-# Build output and runtime state — never committed.
-dist/
-data/
-.env
-*.log
