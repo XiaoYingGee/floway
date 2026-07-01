@@ -1,6 +1,10 @@
-# Build the self-hosted Floway images, push to GHCR, and deploy to the VM
-# over SSH. Fires when a PR is merged into `deployment` (a merge is a push) and
-# can be run manually to redeploy the current ref.
+# Build the self-hosted Floway images, push to GHCR, and blue-green deploy to
+# the VM over SSH. Fires when a PR is merged into `deployment` (a merge is a
+# push) and can be run manually to redeploy the current ref.
+#
+# Blue-green flow: start the new version alongside the old one, wait for its
+# healthcheck, switch infra-nginx upstream, then tear down the old version.
+# The old version keeps serving traffic until the new one is confirmed healthy.
 name: Deploy
 
 on:
@@ -34,78 +38,115 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build each stage as a separate image. The web-builder stage is shared
-      # via cache; only the final app and nginx stages are pushed.
-      - name: Build and push app image
+      - name: Build and push server image
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: Dockerfile
-          target: app
+          file: docker/Dockerfile
+          target: server
           push: true
           tags: |
-            ${{ env.REGISTRY }}-app:latest
-            ${{ env.REGISTRY }}-app:${{ github.sha }}
-          cache-from: type=gha,scope=app
-          cache-to: type=gha,scope=app,mode=max
+            ${{ env.REGISTRY }}-server:latest
+            ${{ env.REGISTRY }}-server:${{ github.sha }}
+          cache-from: type=gha,scope=server
+          cache-to: type=gha,scope=server,mode=max
 
-      - name: Build and push nginx image
+      - name: Build and push web image
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: Dockerfile
-          target: nginx
+          file: docker/Dockerfile
+          target: web
           push: true
           tags: |
-            ${{ env.REGISTRY }}-nginx:latest
-            ${{ env.REGISTRY }}-nginx:${{ github.sha }}
-          cache-from: type=gha,scope=nginx
-          cache-to: type=gha,scope=nginx,mode=max
+            ${{ env.REGISTRY }}-web:latest
+            ${{ env.REGISTRY }}-web:${{ github.sha }}
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,scope=web,mode=max
 
   deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
-      # Deploy on the VM by updating its checkout of the deployment source and
-      # running its own compose (base docker-compose.yml + the host-specific
-      # docker-compose.override.yml, which binds the service to loopback only).
-      # The run-scoped GITHUB_TOKEN authenticates both the private-repo fetch and
-      # the GHCR pull — valid for the workflow's lifetime, so no creds persist on
-      # the VM. The image is the SHA built by build-and-push.
-      - name: Update source and restart on VM
+      - name: Blue-green deploy on VM
         uses: appleboy/ssh-action@v1.2.0
         env:
           GHCR_USER: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FLOWAY_IMAGE_APP: ${{ env.REGISTRY }}-app:${{ github.sha }}
-          FLOWAY_IMAGE_NGINX: ${{ env.REGISTRY }}-nginx:${{ github.sha }}
+          FLOWAY_IMAGE_SERVER: ${{ env.REGISTRY }}-server:${{ github.sha }}
+          FLOWAY_IMAGE_WEB: ${{ env.REGISTRY }}-web:${{ github.sha }}
           ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           port: ${{ secrets.SSH_PORT || 22 }}
-          envs: GHCR_USER,GHCR_TOKEN,FLOWAY_IMAGE_APP,FLOWAY_IMAGE_NGINX,ADMIN_KEY
+          command_timeout: 10m
+          envs: GHCR_USER,GHCR_TOKEN,FLOWAY_IMAGE_SERVER,FLOWAY_IMAGE_WEB,ADMIN_KEY
           script: |
             set -euo pipefail
             REPO="$HOME/codebase/floway"
-            # Self-bootstrap: turn the existing source dir into a git checkout on
-            # first run. Host-specific files (docker-compose.override.yml) stay
-            # untracked and survive the forced checkout.
+            NGINX_CONF="/data/infra/nginx/conf.d/floway.conf"
+
+            # --- fetch source & pull images ---
             [ -d "$REPO/.git" ] || git -C "$REPO" init -q
             git -C "$REPO" fetch --depth 1 \
               "https://x-access-token:${GHCR_TOKEN}@github.com/XiaoYingGee/floway.git" deployment
             git -C "$REPO" checkout -q -f FETCH_HEAD
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             cd "$REPO"
-            export FLOWAY_IMAGE_APP FLOWAY_IMAGE_NGINX ADMIN_KEY
-            docker compose pull
-            # The very first pipeline deploy inherits a `floway` container created
-            # out-of-band (not labelled for this compose project), which collides
-            # on the pinned container_name. Fall back to removing it and retrying;
-            # the /data/floway bind mount keeps all state. Subsequent deploys are
-            # compose-managed and recreate in place without the fallback.
-            docker compose up -d --remove-orphans \
-              || { docker rm -f floway >/dev/null 2>&1 || true; docker compose up -d --remove-orphans; }
+
+            # --- determine active slot ---
+            if docker ps --format '{{.Names}}' | grep -q 'floway-blue-web'; then
+              OLD_SLOT=blue; NEW_SLOT=green
+            else
+              OLD_SLOT=green; NEW_SLOT=blue
+            fi
+            echo "Deploying: ${OLD_SLOT} -> ${NEW_SLOT}"
+
+            export FLOWAY_IMAGE_SERVER FLOWAY_IMAGE_WEB ADMIN_KEY
+
+            # --- start new version (old keeps running) ---
+            COMPOSE_PROJECT_NAME="floway-${NEW_SLOT}" SLOT="${NEW_SLOT}" \
+              docker compose -f docker/docker-compose.yml -f docker-compose.override.yml pull
+            COMPOSE_PROJECT_NAME="floway-${NEW_SLOT}" SLOT="${NEW_SLOT}" \
+              docker compose -f docker/docker-compose.yml -f docker-compose.override.yml up -d --remove-orphans
+
+            # --- wait for healthcheck ---
+            echo "Waiting for floway-${NEW_SLOT}-app to become healthy..."
+            TRIES=0
+            while [ $TRIES -lt 30 ]; do
+              STATUS=$(docker inspect "floway-${NEW_SLOT}-app" --format '{{.State.Health.Status}}' 2>/dev/null || echo "missing")
+              if [ "$STATUS" = "healthy" ]; then
+                echo "New version is healthy"
+                break
+              fi
+              TRIES=$((TRIES + 1))
+              sleep 2
+            done
+
+            if [ "$STATUS" != "healthy" ]; then
+              echo "ERROR: new version failed healthcheck after 60s, tearing down"
+              COMPOSE_PROJECT_NAME="floway-${NEW_SLOT}" SLOT="${NEW_SLOT}" \
+                docker compose -f docker/docker-compose.yml -f docker-compose.override.yml down
+              docker image prune -f
+              docker logout ghcr.io
+              exit 1
+            fi
+
+            # --- switch traffic ---
+            sed -i "s/floway-${OLD_SLOT}-web/floway-${NEW_SLOT}-web/" "$NGINX_CONF"
+            docker exec infra-nginx nginx -s reload
+            echo "Traffic switched to ${NEW_SLOT}"
+
+            # --- drain old connections & tear down ---
+            sleep 5
+            if docker ps --format '{{.Names}}' | grep -q "floway-${OLD_SLOT}-"; then
+              COMPOSE_PROJECT_NAME="floway-${OLD_SLOT}" SLOT="${OLD_SLOT}" \
+                docker compose -f docker/docker-compose.yml -f docker-compose.override.yml down
+              echo "Old version (${OLD_SLOT}) removed"
+            fi
+
             docker image prune -f
             docker logout ghcr.io
+            echo "Deploy complete: ${NEW_SLOT} is live"
