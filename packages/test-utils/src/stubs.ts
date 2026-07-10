@@ -1,4 +1,4 @@
-import { directFetcher, type InternalModel, type ProviderInstance, type Provider, type ProviderModel, type ModelCandidate, type TelemetryModelIdentity, type UpstreamCallOptions } from '@floway-dev/provider';
+import { directFetcher, type FlagId, type InternalModel, type ProviderInstance, type Provider, type ProviderModel, type ModelCandidate, type TelemetryModelIdentity, type UpstreamCallOptions } from '@floway-dev/provider';
 
 // No-op UpstreamCallOptions factory for tests calling provider methods
 // directly: identity recordUpstreamLatency satisfies the contract without
@@ -24,7 +24,7 @@ export const stubProviderModel = (overrides: Partial<ProviderModel> = {}): Provi
   limits: {},
   kind: 'chat',
   endpoints: { chatCompletions: {}, responses: {}, messages: {} },
-  enabledFlags: new Set<string>(),
+  enabledFlags: new Set<FlagId>(),
   ...overrides,
 });
 
@@ -33,8 +33,13 @@ export const stubProviderModel = (overrides: Partial<ProviderModel> = {}): Provi
 // the entry mirrors the outer metadata so tests that resolve
 // `providerModelOf(candidate)` see a coherent shape without extra ceremony.
 // Callers that need a specific per-upstream shape pass `providerModels`
-// explicitly.
-export const stubInternalModel = (overrides: Partial<InternalModel> = {}, upstream = 'test-upstream'): InternalModel => {
+// explicitly. Every stub is a real-row `InternalModel`; alias-row fixtures
+// belong on the alias-listing side and construct their `InternalModel`
+// directly with `aliasedFrom`.
+export const stubInternalModel = (
+  overrides: Partial<Omit<InternalModel, 'aliasedFrom' | 'providerModels'>> & { readonly providerModels?: Record<string, ProviderModel> } = {},
+  upstream = 'test-upstream',
+): InternalModel => {
   const base = {
     id: overrides.id ?? 'test-model',
     limits: overrides.limits ?? {},
@@ -91,9 +96,9 @@ export const stubProvider = (overrides: Partial<ProviderInstance> = {}): Provide
 // through `overrides.model` replaces both the default entry and those
 // shortcuts wholesale.
 export const stubModelCandidate = (overrides: {
-  model?: Partial<InternalModel>;
+  model?: Partial<Omit<InternalModel, 'aliasedFrom' | 'providerModels'>> & { readonly providerModels?: Record<string, ProviderModel> };
   provider?: Provider;
-  enabledFlags?: ReadonlySet<string>;
+  enabledFlags?: ReadonlySet<FlagId>;
   providerData?: unknown;
 } = {}): ModelCandidate => {
   const provider = overrides.provider ?? {
@@ -106,18 +111,18 @@ export const stubModelCandidate = (overrides: {
     supportsResponsesItemReference: false,
   };
   const modelOverrides = overrides.model ?? {};
-  const outerMeta: Partial<InternalModel> = {
+  const outerMeta = {
     id: modelOverrides.id ?? 'test-model',
     limits: modelOverrides.limits ?? {},
     kind: modelOverrides.kind ?? 'chat',
     endpoints: modelOverrides.endpoints ?? { chatCompletions: {}, responses: {}, messages: {} },
-  };
+  } as const;
   const providerModel = stubProviderModel({
     id: outerMeta.id,
     limits: outerMeta.limits,
     kind: outerMeta.kind,
     endpoints: outerMeta.endpoints,
-    enabledFlags: overrides.enabledFlags ?? new Set<string>(),
+    enabledFlags: overrides.enabledFlags ?? new Set<FlagId>(),
     ...(overrides.providerData !== undefined ? { providerData: overrides.providerData } : {}),
   });
   return {

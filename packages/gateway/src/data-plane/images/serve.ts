@@ -10,7 +10,8 @@
 
 import type { Context } from 'hono';
 
-import { createGatewayCtxFromHono } from '../chat/shared/gateway-ctx.ts';
+import { backgroundSchedulerFromContext } from '../../runtime/background.ts';
+import { createGatewayCtxFromHono, finalizeGatewayResponse } from '../chat/shared/gateway-ctx.ts';
 import { readRequestBody } from '../chat/shared/request-body.ts';
 import { passthroughApiError, passthroughServe } from '../shared/passthrough-serve.ts';
 import { tokenUsageFromImagesBody } from '../shared/telemetry/usage.ts';
@@ -44,12 +45,11 @@ const prepareImagesGenerationsRequest = (bytes: Uint8Array): PreparedRequest => 
 
 export const imagesGenerations = async (c: Context): Promise<Response> => {
   const requestBody = await readRequestBody(c);
-  const ctx = createGatewayCtxFromHono(c, { wantsStream: false, requestBody });
+  const ctx = createGatewayCtxFromHono(c, { wantsStream: false, requestBody, backgroundScheduler: backgroundSchedulerFromContext(c) });
   const request = prepareImagesGenerationsRequest(requestBody.bytes);
   if (request.type === 'invalid') {
     ctx.dump?.error('gateway');
-    const response = passthroughApiError(c, request.message, 400);
-    return (ctx.dump?.finalize(response) ?? response);
+    return finalizeGatewayResponse(ctx, passthroughApiError(c, request.message, 400));
   }
 
   ctx.dump?.requestedModel(request.model);
@@ -66,7 +66,7 @@ export const imagesGenerations = async (c: Context): Promise<Response> => {
     },
     response: { format: 'json', extractBilling: tokenUsageFromImagesBody },
   });
-  return (ctx.dump?.finalize(response) ?? response);
+  return finalizeGatewayResponse(ctx, response);
 };
 
 export const imagesEdits = async (c: Context): Promise<Response> => {
@@ -74,7 +74,7 @@ export const imagesEdits = async (c: Context): Promise<Response> => {
   // c.req.raw.body internally; re-parsing from the captured bytes via a fresh
   // Response keeps the dump capture honest without a second read on the wire.
   const requestBody = await readRequestBody(c);
-  const ctx = createGatewayCtxFromHono(c, { wantsStream: false, requestBody });
+  const ctx = createGatewayCtxFromHono(c, { wantsStream: false, requestBody, backgroundScheduler: backgroundSchedulerFromContext(c) });
   let form: FormData;
   try {
     form = await new Response(requestBody.bytes as BodyInit, { headers: { 'content-type': c.req.header('content-type') ?? '' } }).formData();
@@ -83,15 +83,13 @@ export const imagesEdits = async (c: Context): Promise<Response> => {
     // parser's error text. The wording is enough for a client to know
     // they sent the wrong content type or a malformed body.
     ctx.dump?.error('gateway');
-    const response = passthroughApiError(c, 'Image edits request body must be a valid multipart/form-data payload.', 400);
-    return (ctx.dump?.finalize(response) ?? response);
+    return finalizeGatewayResponse(ctx, passthroughApiError(c, 'Image edits request body must be a valid multipart/form-data payload.', 400));
   }
 
   const modelRaw = form.get('model');
   if (typeof modelRaw !== 'string' || modelRaw.length === 0) {
     ctx.dump?.error('gateway');
-    const response = passthroughApiError(c, 'Image edits request body must include a model field.', 400);
-    return (ctx.dump?.finalize(response) ?? response);
+    return finalizeGatewayResponse(ctx, passthroughApiError(c, 'Image edits request body must include a model field.', 400));
   }
 
   ctx.dump?.requestedModel(modelRaw);
@@ -117,5 +115,5 @@ export const imagesEdits = async (c: Context): Promise<Response> => {
     },
     response: { format: 'json', extractBilling: tokenUsageFromImagesBody },
   });
-  return (ctx.dump?.finalize(response) ?? response);
+  return finalizeGatewayResponse(ctx, response);
 };

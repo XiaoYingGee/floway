@@ -42,7 +42,7 @@ import type {
   ResponsesToolChoice,
   ResponsesWebSearchAction,
 } from '@floway-dev/protocols/responses';
-import { type EventResult, type ExecuteResult } from '@floway-dev/provider';
+import { type EventResult, type ExecuteResult, type FlagId } from '@floway-dev/provider';
 import { assert, assertEquals, assertFalse, stubModelCandidate } from '@floway-dev/test-utils';
 import type { CanonicalResponsesPayload } from '@floway-dev/translate/via-responses/responses-items';
 
@@ -303,7 +303,7 @@ const makeStubDeps = (overrides: DepsOverrides = {}): {
 
 interface InvocationOverrides {
   targetApi?: 'responses' | 'messages' | 'chat-completions';
-  enabledFlags?: ReadonlySet<string>;
+  enabledFlags?: ReadonlySet<FlagId>;
   payload?: Partial<ResponsesPayload>;
 }
 
@@ -337,6 +337,7 @@ const makeGatewayCtx = (apiKeyId: string = 'k1'): ChatGatewayCtx => ({
   runtimeLocation: 'TEST',
   currentColo: 'TEST',
   dump: null,
+  responseHeaders: new Headers(),
   backgroundScheduler: () => {},
   requestStartedAt: 0,
   store: createNonResponsesSourceStore(apiKeyId),
@@ -443,7 +444,7 @@ test('shim no-ops when targetApi=responses and flag is off', async () => {
   const shim = withResponsesWebSearchShim;
   const inv = makeInvocation({
     targetApi: 'responses',
-    enabledFlags: new Set<string>(),
+    enabledFlags: new Set<FlagId>(),
   });
   const originalPayload = inv.payload;
   const script = scriptedRun([messageTurn('hi back')]);
@@ -462,7 +463,7 @@ test('shim activates when targetApi=responses and flag is on', async () => {
   const shim = withResponsesWebSearchShim;
   const inv = makeInvocation({
     targetApi: 'responses',
-    enabledFlags: new Set<string>(['responses-web-search-shim']),
+    enabledFlags: new Set<FlagId>(['responses-web-search-shim']),
   });
   const script = scriptedRun([messageTurn('done')]);
 
@@ -476,7 +477,7 @@ test('shim activates when targetApi=responses and flag is on', async () => {
 test('shim activates when targetApi=messages and flag is off', async () => {
   makeStubDeps();
   const shim = withResponsesWebSearchShim;
-  const inv = makeInvocation({ targetApi: 'messages', enabledFlags: new Set<string>() });
+  const inv = makeInvocation({ targetApi: 'messages', enabledFlags: new Set<FlagId>() });
   const script = scriptedRun([messageTurn('done')]);
 
   await runShimAndDrain(shim, inv, makeGatewayCtx(), script.run);
@@ -487,7 +488,7 @@ test('shim activates when targetApi=messages and flag is off', async () => {
 test('shim activates when targetApi=chat-completions and flag is off', async () => {
   makeStubDeps();
   const shim = withResponsesWebSearchShim;
-  const inv = makeInvocation({ targetApi: 'chat-completions', enabledFlags: new Set<string>() });
+  const inv = makeInvocation({ targetApi: 'chat-completions', enabledFlags: new Set<FlagId>() });
   const script = scriptedRun([messageTurn('done')]);
 
   await runShimAndDrain(shim, inv, makeGatewayCtx(), script.run);
@@ -3873,7 +3874,7 @@ test('responses target with flag on: function_call_output is plain-text formatte
   const shim = withResponsesWebSearchShim;
   const inv = makeInvocation({
     targetApi: 'responses',
-    enabledFlags: new Set<string>(['responses-web-search-shim']),
+    enabledFlags: new Set<FlagId>(['responses-web-search-shim']),
   });
   const script = scriptedRun([
     searchCallTurn(0, 'call_1', 'q1'),
@@ -4487,6 +4488,7 @@ test('downstream AbortSignal threads through to provider search / fetchPage and 
     runtimeLocation: 'TEST',
     currentColo: 'TEST',
     dump: null,
+    responseHeaders: new Headers(),
     backgroundScheduler: () => {},
     requestStartedAt: 0,
     store: createNonResponsesSourceStore('k1'),

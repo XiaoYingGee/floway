@@ -1,6 +1,7 @@
+import type { FlagId, FlagOverrides } from './flags.ts';
 import type { UpstreamChatModelConfig } from './model-config.ts';
 import type { ModelPrefixConfig } from './model-prefix.ts';
-import type { ModelKind, ModelEndpoints, ModelPricing } from '@floway-dev/protocols/common';
+import type { AliasSelection, AliasTarget, ModelKind, ModelEndpoints, ModelPricing } from '@floway-dev/protocols/common';
 
 export const ALL_PROVIDER_KINDS = ['copilot', 'custom', 'azure', 'codex', 'claude-code', 'ollama'] as const;
 export type UpstreamProviderKind = typeof ALL_PROVIDER_KINDS[number];
@@ -31,7 +32,7 @@ export interface UpstreamRecord {
   // Runtime state managed by the gateway autonomous flows; null when a
   // provider has no autonomous state.
   state: unknown;
-  flagOverrides: Record<string, boolean>;
+  flagOverrides: FlagOverrides;
   // Public model ids the operator switched off for this upstream. Orthogonal to
   // every per-model metadata field and uniform across provider kinds: a disabled
   // id is hidden from the catalog and unroutable, but its row metadata stays
@@ -94,36 +95,69 @@ interface ModelMetadata {
 // The neutral internal model shape consumed across the gateway. Metadata fields
 // surface the public identity of the model; `endpoints` and `kind` reflect the
 // OR-union across every contributing upstream so the gateway as a whole reaches
-// the union. Per-upstream provider state lives inside `providerModels[<upstream>]`,
-// not as flat fields, so the same public id can carry independent state from
-// every upstream that surfaces it.
+// the union.
 //
-// Per-candidate rows produced by `enumerateRealModelCandidates` carry a single
-// upstream's wire capability; a merged catalog row (the projection `getModels`
-// returns) carries the OR-union across every upstream emitting under the same
-// public id — the gateway as a whole reaches the union, translating where the
-// dispatched upstream's native wire does not match. Per-request dispatch reads
-// the chosen upstream's `ProviderModel` off the candidate's `providerModels`
-// map; listing endpoints (`/v1/models`, `/models`, `/v1beta/models`, and the
-// control-plane catalog) project the merged row.
-export interface InternalModel extends ModelMetadata {
-  // Every upstream that surfaces this public id contributes one entry, keyed
-  // by upstream id, storing that upstream's `ProviderModel` verbatim. A
-  // per-candidate row (single upstream in the map) is what dispatch reads
-  // through `providerModelOf`; the merged catalog row aggregates every
-  // contributing upstream so the control plane can render the reverse index
-  // without a second walk.
-  providerModels: Record<string, ProviderModel>;
+// A row is exactly one of two mutually-exclusive kinds:
+//   • Real row — carries `providerModels`, keyed on upstream id. Per-request
+//     dispatch reads the chosen upstream's `ProviderModel` off this map via
+//     `providerModelOf(candidate)`. A per-candidate row (from
+//     `enumerateRealModelCandidates`) narrows the map to the single dispatched
+//     upstream; the merged catalog row from `getModels` aggregates every
+//     contributing upstream.
+//   • Alias row — carries `aliasedFrom`, the operator-defined alias record.
+//     Alias rows appear in listings but never dispatch directly; the resolver
+//     walks the alias's targets and yields real-row candidates instead.
+//
+// The two carriers are exclusive: a row is either real or alias, never both.
+// `providerModelOf` throws with distinct messages for each miss so a mis-used
+// alias row surfaces the correct diagnostic.
+export type InternalModel = ModelMetadata & (
+  | { readonly providerModels: Record<string, ProviderModel>; readonly aliasedFrom?: never }
+  | { readonly providerModels?: never; readonly aliasedFrom: InternalAliasedFrom }
+);
+
+// Alias-side payload carried on alias-synthesized `InternalModel` rows.
+// Mirrors the operator's `ModelAliasRecord` at the point the row was
+// synthesized: `selection` is the walk mode the resolver honors at request
+// time, and `targets` is the configured target list — projected as-is on
+// admin surfaces and filtered to the caller-reachable subset on data-plane
+// / non-admin surfaces. `AliasTarget.rules` on each entry rides through to
+// the picked candidate's request as the rule overlay. The alias's `name`
+// and `kind` live on the enclosing `InternalModel` (`id`, `kind`), so this
+// sidecar carries only the alias-specific fields.
+export interface InternalAliasedFrom {
+  readonly selection: AliasSelection;
+  readonly targets: readonly AliasTarget[];
 }
 
 // Per-upstream projection returned by every provider's `getProvidedModels` and
 // the shape every provider's `callXxx(model, ...)` takes at dispatch time.
 // Carries the same metadata as `InternalModel` plus `providerData` (the opaque
 // per-provider wire carrier — Copilot's raw variant list, Claude Code's dated
-// upstream id, ...) and `enabledFlags` (the effective flag set for the model
-// on the emitting upstream). Providers only ever see their own emission —
+// upstream id, ...), `enabledFlags` (the effective flag set for the model
+// on the emitting upstream, already resolved through every layer), and
+// `flagOverrides` (optional dashboard-only view of the per-model layer
+// that fed into `enabledFlags`). Providers only ever see their own emission —
 // the surrounding `InternalModel` map is assembled by the registry.
 export interface ProviderModel extends ModelMetadata {
   providerData?: unknown;
-  enabledFlags: ReadonlySet<string>;
+  enabledFlags: ReadonlySet<FlagId>;
+  // Provider's per-model flag call as a sparse override — each entry
+  // states the provider's opinion for that flag on this specific
+  // model. Absent when the provider has no per-model call on this
+  // model; when present, the map is non-empty (producers elide empty
+  // overlays before emission). Populated only for providers with a
+  // per-model rule (Copilot's Claude < 4.8 demote clause is the current
+  // example); other providers leave it undefined.
+  //
+  // The data plane consumes the already-resolved `enabledFlags` and
+  // never re-layers this. The field exists so the dashboard's
+  // auto-row flag view can render a per-flag pill showing which flags
+  // the provider itself calls on this specific model —
+  // reshapeModelForDashboard projects it onto the wire as the auto-row
+  // counterpart to the operator-authored
+  // `UpstreamModelConfig.flagOverrides` on manual rows. The two
+  // occupy the same layer-3 slot; the source is carried by the
+  // enclosing row type (auto vs manual), not by the field name.
+  flagOverrides?: FlagOverrides;
 }

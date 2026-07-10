@@ -69,7 +69,7 @@ test('memory upstream repo saves, lists, updates, deletes, and clears rows', asy
     createdAt: '2099-01-01T00:00:00.000Z',
     updatedAt: '2026-05-21T10:00:04.000Z',
     config: { nested: { value: 'updated' }, endpoints: { responses: {} } },
-    flagOverrides: { 'retry-tool-use': true },
+    flagOverrides: { 'retry-cyber-policy': true },
     disabledPublicModelIds: [],
   });
   await repo.save(updatedCustom);
@@ -107,16 +107,16 @@ test('memory upstream repo deeply clones configs and flag overrides at the repo 
         headers: ['authorization'],
       },
     },
-    flagOverrides: { 'z-fix': true, 'a-fix': true },
+    flagOverrides: { 'vendor-deepseek': true, 'demote-developer-to-system': true },
     disabledPublicModelIds: [],
   });
 
   await repo.save(original);
-  original.flagOverrides['mutated-after-save'] = true;
+  original.flagOverrides['strip-billing-attribution'] = true;
   (original.config as { nested: { headers: string[] } }).nested.headers.push('mutated-after-save');
 
   const saved = await repo.getById('up_custom_clone');
-  assertEquals(saved?.flagOverrides, { 'a-fix': true, 'z-fix': true });
+  assertEquals(saved?.flagOverrides, { 'demote-developer-to-system': true, 'vendor-deepseek': true });
   assertEquals(saved?.config, {
     nested: {
       baseUrl: 'https://example.test/v1',
@@ -125,10 +125,10 @@ test('memory upstream repo deeply clones configs and flag overrides at the repo 
   });
 
   const listed = await repo.list();
-  listed[0].flagOverrides['mutated-after-list'] = true;
+  listed[0].flagOverrides['responses-web-search-shim'] = true;
   (listed[0].config as { nested: { headers: string[] } }).nested.headers.push('mutated-after-list');
 
-  assertEquals((await repo.getById('up_custom_clone'))?.flagOverrides, { 'a-fix': true, 'z-fix': true });
+  assertEquals((await repo.getById('up_custom_clone'))?.flagOverrides, { 'demote-developer-to-system': true, 'vendor-deepseek': true });
   assertEquals((await repo.getById('up_custom_clone'))?.config, {
     nested: {
       baseUrl: 'https://example.test/v1',
@@ -146,12 +146,12 @@ test('memory upstream repo sorts flag overrides by key when saving rows', async 
       kind: 'copilot',
       sortOrder: 0,
       createdAt: '2026-05-21T10:00:00.000Z',
-      flagOverrides: { 'z-fix': true, 'a-fix': false, 'm-fix': true },
+      flagOverrides: { 'vendor-deepseek': true, 'demote-developer-to-system': false, 'messages-web-search-shim': true },
       disabledPublicModelIds: [],
     }),
   );
 
-  assertEquals((await repo.getById('up_copilot_fixes'))?.flagOverrides, { 'a-fix': false, 'm-fix': true, 'z-fix': true });
+  assertEquals((await repo.getById('up_copilot_fixes'))?.flagOverrides, { 'demote-developer-to-system': false, 'messages-web-search-shim': true, 'vendor-deepseek': true });
 });
 
 const exerciseSqlUpstreamRepo = async (repo: UpstreamRepo) => {
@@ -163,7 +163,7 @@ const exerciseSqlUpstreamRepo = async (repo: UpstreamRepo) => {
     createdAt: '2026-05-21T10:00:02.000Z',
     updatedAt: '2026-05-21T10:00:02.000Z',
     config: { baseUrl: 'https://custom.example/v1', authStyle: 'bearer', apiKey: 'sk-custom', endpoints: { chatCompletions: {} } },
-    flagOverrides: { 'z-fix': true, 'a-fix': true },
+    flagOverrides: { 'vendor-deepseek': true, 'demote-developer-to-system': true },
     disabledPublicModelIds: [],
   });
   const copilot = upstream({
@@ -193,7 +193,7 @@ const exerciseSqlUpstreamRepo = async (repo: UpstreamRepo) => {
     (await repo.list()).map(row => row.id),
     ['up_azure_sql', 'up_copilot_sql', 'up_custom_sql'],
   );
-  assertEquals((await repo.getById('up_custom_sql'))?.flagOverrides, { 'a-fix': true, 'z-fix': true });
+  assertEquals((await repo.getById('up_custom_sql'))?.flagOverrides, { 'demote-developer-to-system': true, 'vendor-deepseek': true });
   assertEquals(await repo.getById('missing'), null);
 
   await repo.save({
@@ -204,7 +204,7 @@ const exerciseSqlUpstreamRepo = async (repo: UpstreamRepo) => {
     createdAt: '2099-01-01T00:00:00.000Z',
     updatedAt: '2026-05-21T10:00:04.000Z',
     config: { baseUrl: 'https://updated.example/v1', authStyle: 'bearer', apiKey: 'sk-updated', endpoints: { responses: {} } },
-    flagOverrides: { 'm-fix': true, 'a-fix': true },
+    flagOverrides: { 'messages-web-search-shim': true, 'demote-developer-to-system': true },
     disabledPublicModelIds: [],
   });
   assertEquals(
@@ -641,6 +641,137 @@ test('migration 0047 backfills openaiDeviceId on legacy Codex rows and leaves po
     assertEquals(rows.find(r => r.id === 'up_codex_imported')?.deviceId, 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee');
     // Non-codex rows have no state_json; the json_extract returns null.
     assertEquals(rows.find(r => r.id === 'up_custom')?.deviceId, null);
+  } finally {
+    db.close();
+  }
+});
+
+test('migration 0048 rebuckets Codex quota snapshots by active limit', async () => {
+  const db = await createMigratedSqlJsDatabase();
+  try {
+    for (const filename of [...migrationSqlByFilename.keys()].filter(f => f >= '0010_unified_upstreams.sql' && f < '0048_codex_quota_snapshot_active_limit_map.sql').toSorted()) {
+      applySqlJsFile(db, filename);
+    }
+
+    db.run(`INSERT INTO upstreams (id, provider, name, enabled, sort_order, created_at, updated_at, config_json, state_json, flag_overrides, disabled_public_model_ids, proxy_fallback_list_json)
+            VALUES
+              ('up_codex_premium', 'codex', 'Codex Premium', 1, 0, '2026-06-05T00:00:00.000Z', '2026-06-05T00:00:00.000Z',
+                json_object('accounts', json_array(json_object('email', 'a@b.com', 'chatgptAccountId', 'acc-premium', 'chatgptUserId', 'usr', 'planType', 'plus'))),
+                json_object('accounts', json_array(json_object(
+                  'accessToken', NULL,
+                  'chatgptAccountId', 'acc-premium',
+                  'openaiDeviceId', '11111111-2222-4333-8444-555555555555',
+                  'quotaSnapshot', json_extract(json_object(
+                    'premium', json_object(
+                      'data', json_object('active_limit', 'premium', 'observed_at', '2026-06-05T00:00:00.000Z', 'primary_used_percent', 42),
+                      'fetchedAt', 1700000000000
+                    )
+                  ), '$.premium'),
+                  'refresh_token', 'rt',
+                  'state', 'active',
+                  'state_updated_at', '2026-06-05T00:00:00.000Z'
+                ))),
+                '[]', '[]', '[]'),
+              ('up_codex_missing_limit', 'codex', 'Codex Missing Limit', 1, 1, '2026-06-05T00:00:00.000Z', '2026-06-05T00:00:00.000Z',
+                json_object('accounts', json_array(json_object('email', 'a@b.com', 'chatgptAccountId', 'acc-missing', 'chatgptUserId', 'usr', 'planType', 'plus'))),
+                json_object('accounts', json_array(json_object(
+                  'accessToken', NULL,
+                  'chatgptAccountId', 'acc-missing',
+                  'openaiDeviceId', '22222222-3333-4444-8555-666666666666',
+                  'quotaSnapshot', json_extract(json_object(
+                    'unknown', json_object(
+                      'data', json_object('observed_at', '2026-06-05T01:00:00.000Z'),
+                      'fetchedAt', 1700000001000
+                    )
+                  ), '$.unknown'),
+                  'refresh_token', 'rt',
+                  'state', 'active',
+                  'state_updated_at', '2026-06-05T00:00:00.000Z'
+                ))),
+                '[]', '[]', '[]'),
+              ('up_codex_unsafe_limit', 'codex', 'Codex Unsafe Limit', 1, 2, '2026-06-05T00:00:00.000Z', '2026-06-05T00:00:00.000Z',
+                json_object('accounts', json_array(json_object('email', 'a@b.com', 'chatgptAccountId', 'acc-unsafe', 'chatgptUserId', 'usr', 'planType', 'plus'))),
+                json_object('accounts', json_array(json_object(
+                  'accessToken', NULL,
+                  'chatgptAccountId', 'acc-unsafe',
+                  'openaiDeviceId', '33333333-4444-4555-8666-777777777777',
+                  'quotaSnapshot', json_extract(json_object(
+                    'unknown', json_object(
+                      'data', json_object('active_limit', 'constructor', 'observed_at', '2026-06-05T02:00:00.000Z'),
+                      'fetchedAt', 1700000002000
+                    )
+                  ), '$.unknown'),
+                  'refresh_token', 'rt',
+                  'state', 'active',
+                  'state_updated_at', '2026-06-05T00:00:00.000Z'
+                ))),
+                '[]', '[]', '[]'),
+              ('up_codex_map', 'codex', 'Codex Map', 1, 3, '2026-06-05T00:00:00.000Z', '2026-06-05T00:00:00.000Z',
+                json_object('accounts', json_array(json_object('email', 'a@b.com', 'chatgptAccountId', 'acc-map', 'chatgptUserId', 'usr', 'planType', 'plus'))),
+                json_object('accounts', json_array(json_object(
+                  'accessToken', NULL,
+                  'chatgptAccountId', 'acc-map',
+                  'openaiDeviceId', '44444444-5555-4666-8777-888888888888',
+                  'quotaSnapshot', json_object(
+                    'premium', json_object('data', json_object('active_limit', 'premium', 'observed_at', '2026-06-05T03:00:00.000Z'), 'fetchedAt', 1700000003000)
+                  ),
+                  'refresh_token', 'rt',
+                  'state', 'active',
+                  'state_updated_at', '2026-06-05T00:00:00.000Z'
+                ))),
+                '[]', '[]', '[]'),
+              ('up_custom', 'custom', 'Custom', 1, 4, '2026-06-05T00:00:00.000Z', '2026-06-05T00:00:00.000Z',
+                json_object('baseUrl', 'https://a.example/v1', 'apiKey', 'k', 'authStyle', 'bearer'),
+                json_object('accounts', json_array(json_object('quotaSnapshot', json_object('premium', json_object('data', json_object('active_limit', 'premium'), 'fetchedAt', 1))))),
+                '[]', '[]', '[]')`);
+
+    applySqlJsFile(db, '0048_codex_quota_snapshot_active_limit_map.sql');
+
+    const rows = sqlJsRows<{ id: string; stateJson: string; snapshot: string }>(
+      db,
+      `SELECT
+        id,
+        state_json AS stateJson,
+        json_extract(state_json, '$.accounts[0].quotaSnapshot') AS snapshot
+       FROM upstreams
+       ORDER BY id`,
+    );
+    const snapshotFor = (id: string): unknown => JSON.parse(rows.find(r => r.id === id)!.snapshot);
+
+    assertEquals(snapshotFor('up_codex_premium'), {
+      premium: {
+        data: { active_limit: 'premium', observed_at: '2026-06-05T00:00:00.000Z', primary_used_percent: 42 },
+        fetchedAt: 1700000000000,
+      },
+    });
+    assertEquals(rows.find(r => r.id === 'up_codex_premium')!.stateJson, JSON.stringify({
+      accounts: [{
+        accessToken: null,
+        chatgptAccountId: 'acc-premium',
+        openaiDeviceId: '11111111-2222-4333-8444-555555555555',
+        quotaSnapshot: {
+          premium: {
+            data: { active_limit: 'premium', observed_at: '2026-06-05T00:00:00.000Z', primary_used_percent: 42 },
+            fetchedAt: 1700000000000,
+          },
+        },
+        refresh_token: 'rt',
+        state: 'active',
+        state_updated_at: '2026-06-05T00:00:00.000Z',
+      }],
+    }));
+    assertEquals(snapshotFor('up_codex_missing_limit'), {
+      unknown: { data: { observed_at: '2026-06-05T01:00:00.000Z' }, fetchedAt: 1700000001000 },
+    });
+    assertEquals(snapshotFor('up_codex_unsafe_limit'), {
+      unknown: { data: { active_limit: 'constructor', observed_at: '2026-06-05T02:00:00.000Z' }, fetchedAt: 1700000002000 },
+    });
+    assertEquals(snapshotFor('up_codex_map'), {
+      premium: { data: { active_limit: 'premium', observed_at: '2026-06-05T03:00:00.000Z' }, fetchedAt: 1700000003000 },
+    });
+    assertEquals(snapshotFor('up_custom'), {
+      premium: { data: { active_limit: 'premium' }, fetchedAt: 1 },
+    });
   } finally {
     db.close();
   }

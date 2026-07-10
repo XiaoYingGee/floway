@@ -9,7 +9,7 @@
 //
 // When both are present, the newer `fetchedAt` wins for the 5h/7d window
 // chips: the probe is the official CC `/status` source and is fresher right
-// after the operator hits Refresh; the header-derived snapshot is fresher
+// after a Refresh click; the header-derived snapshot is fresher
 // after any real model call. We never merge fields from the two — they shape
 // the same windows differently and a half-and-half view would mislead.
 
@@ -18,16 +18,16 @@ import { computed } from 'vue';
 import type { ClaudeCodeAccountCredentialSummary, ClaudeCodeAccountIdentity, ClaudeCodeQuotaWindow, UpstreamRecord } from '../../api/types.ts';
 import { formatClaudeCodeSubscriptionType } from '../../lib/claude-code-format.ts';
 import { providerSwatchClass } from '../upstreams/provider-meta.ts';
-import { Badge, Button, Spinner } from '@floway-dev/ui';
+import { Badge, Button } from '@floway-dev/ui';
 
 type ClaudeCodeUpstreamRecord = Extract<UpstreamRecord, { kind: 'claude-code' }>;
 
 const props = defineProps<{
   record: ClaudeCodeUpstreamRecord;
-  // True while the parent's probe-quota request is in flight; binds the
-  // Refresh button's loading state. The card never gates Refresh on the
-  // tokenKind axis — `/api/oauth/usage` answers under inference-only
-  // scopes too, so setup-token credentials can probe.
+  // True while the parent's probe request is in flight; binds the Refresh
+  // button's loading state. The card never gates Refresh on the tokenKind
+  // axis — `/api/oauth/usage` answers under inference-only scopes too, so
+  // setup-token credentials can probe.
   probing: boolean;
 }>();
 
@@ -215,7 +215,7 @@ const accessTokenExpiry = computed(() => {
 // Hide the `out_of_credits` reason because it's the steady state pair of
 // `overage.status: rejected` — every plan account without purchased credits
 // reports it. Any other value (a code we haven't seen, a future Anthropic
-// signal) surfaces verbatim so operators see it.
+// signal) surfaces verbatim in place.
 const unexpectedDisabledReason = computed<string | null>(() => {
   const reason = quota.value?.overage?.disabledReason;
   if (!reason || reason === 'out_of_credits') return null;
@@ -285,8 +285,7 @@ const probeFetchedAtIso = computed<string | null>(() => {
       <p v-if="!hasAnyWindow" class="text-xs text-gray-500">No quota snapshot yet. Click Refresh to call <code class="font-mono text-[11px]">/api/oauth/usage</code> or wait for the next Claude Code call to populate headers.</p>
       <p v-else class="text-[11px] uppercase tracking-wide text-gray-500">Rate-limit windows</p>
       <Button size="sm" variant="secondary" :loading="probing" :disabled="probing" @click="emit('refresh-quota')">
-        <Spinner v-if="probing" class="size-3.5" />
-        <i v-else class="i-lucide-refresh-cw size-3.5" />
+        <i v-if="!probing" class="i-lucide-refresh-cw size-3.5" />
         Refresh quota
       </Button>
     </div>

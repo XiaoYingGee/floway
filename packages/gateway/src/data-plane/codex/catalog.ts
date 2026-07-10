@@ -9,7 +9,7 @@
 //      user-agent, GitHub 404 (unreleased version), network error
 //
 // The bundled snapshot is a frozen copy of
-//   https://github.com/openai/codex/blob/rust-v0.136.0/codex-rs/models-manager/models.json
+//   https://github.com/openai/codex/blob/rust-v0.144.1/codex-rs/models-manager/models.json
 // (Apache-2.0). It is the working fallback for cold starts, clients running
 // unreleased prerelease builds, and operators behind network egress
 // restrictions. Refresh it whenever a newer codex release ships material
@@ -20,7 +20,7 @@
 
 import bundledCatalog from './catalog/bundled.json' with { type: 'json' };
 
-interface CatalogModel {
+export interface CatalogModel {
   slug: string;
   [key: string]: unknown;
 }
@@ -35,7 +35,7 @@ const inMemoryCache = new Map<string, CodexCatalog>();
 
 const bundled = bundledCatalog as unknown as CodexCatalog;
 
-export const parseCodexVersion = (userAgent: string | undefined): string | null =>
+const parseCodexVersion = (userAgent: string | undefined): string | null =>
   userAgent?.match(VERSION_FROM_USER_AGENT)?.[1] ?? null;
 
 const fetchCodexCatalog = async (version: string): Promise<CodexCatalog | null> => {

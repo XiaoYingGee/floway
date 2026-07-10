@@ -6,7 +6,7 @@ import { createNonResponsesSourceStore } from '../../responses/items/store.ts';
 import type { ChatGatewayCtx } from '../../shared/gateway-ctx.ts';
 import type { ProtocolFrame } from '@floway-dev/protocols/common';
 import type { MessagesPayload, MessagesStreamEvent } from '@floway-dev/protocols/messages';
-import { type ExecuteResult, eventResult } from '@floway-dev/provider';
+import { type ExecuteResult, eventResult, type FlagId } from '@floway-dev/provider';
 import { stubModelCandidate, testTelemetryModelIdentity, assertEquals } from '@floway-dev/test-utils';
 
 const stubCtx: ChatGatewayCtx = {
@@ -16,6 +16,7 @@ const stubCtx: ChatGatewayCtx = {
   runtimeLocation: 'TEST',
   currentColo: 'TEST',
   dump: null,
+  responseHeaders: new Headers(),
   backgroundScheduler: () => {},
   requestStartedAt: 0,
   store: createNonResponsesSourceStore('test-key'),
@@ -26,7 +27,7 @@ const okEvents = (): Promise<ExecuteResult<ProtocolFrame<MessagesStreamEvent>>> 
 
 const invocation = (
   payload: MessagesPayload,
-  enabledFlags: ReadonlySet<string> = new Set(['disable-reasoning-on-forced-tool-choice']),
+  enabledFlags: ReadonlySet<FlagId> = new Set(['disable-reasoning-on-forced-tool-choice']),
 ): MessagesInvocation => ({
   payload,
   candidate: stubModelCandidate({

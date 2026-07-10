@@ -8,6 +8,7 @@ import {
 } from './models.ts';
 import { pricingForClaudeCodeModelKey } from './pricing.ts';
 import type { ClaudeCodeProviderData } from './types.ts';
+import type { FlagId } from '@floway-dev/provider';
 
 const SAMPLE_API_MODELS: ClaudeCodeApiModel[] = [
   { id: 'claude-fable-5', display_name: 'Claude Fable 5', max_input_tokens: 1_000_000 },
@@ -39,7 +40,7 @@ describe('chatFromCapabilities', () => {
       effort: { supported: false },
       thinking: { types: { enabled: { supported: true } } },
     });
-    expect(chat).toEqual({ reasoning: { budget_tokens: {} } });
+    expect(chat).toEqual({ reasoning: { budget_tokens: { min: 1024 } } });
   });
 
   // Case 2: effort with 4 levels + xhigh=false + max=true, both thinking types (mirrors Opus 4.6)
@@ -58,7 +59,7 @@ describe('chatFromCapabilities', () => {
     expect(chat).toEqual({
       reasoning: {
         effort: { supported: ['low', 'medium', 'high', 'max'], default: 'medium' },
-        budget_tokens: {},
+        budget_tokens: { min: 1024 },
         adaptive: true,
       },
     });
@@ -107,7 +108,7 @@ describe('chatFromCapabilities', () => {
       modalities: { input: ['text', 'image'], output: ['text'] },
       reasoning: {
         effort: { supported: ['low', 'medium', 'high'], default: 'medium' },
-        budget_tokens: {},
+        budget_tokens: { min: 1024 },
         adaptive: true,
       },
     });
@@ -124,7 +125,7 @@ describe('chatFromCapabilities', () => {
       image_input: { supported: false },
       thinking: { types: { enabled: { supported: true } } },
     });
-    expect(chat).toEqual({ reasoning: { budget_tokens: {} } });
+    expect(chat).toEqual({ reasoning: { budget_tokens: { min: 1024 } } });
   });
 
   // Case 8: default selection — 'medium' preferred; fallback to first
@@ -155,7 +156,7 @@ describe('chatFromCapabilities', () => {
 });
 
 describe('buildClaudeCodeCatalog', () => {
-  const models = buildClaudeCodeCatalog(SAMPLE_API_MODELS, new Set<string>());
+  const models = buildClaudeCodeCatalog(SAMPLE_API_MODELS, new Set<FlagId>());
 
   test('publishes each model under its public alias (date-stripped where applicable)', () => {
     expect(models.map(m => m.id)).toEqual([
@@ -201,7 +202,7 @@ describe('buildClaudeCodeCatalog', () => {
   });
 
   test('forwards the supplied enabledFlags set onto every model', () => {
-    const flags = new Set(['custom-flag-a', 'custom-flag-b']);
+    const flags: ReadonlySet<FlagId> = new Set(['demote-developer-to-system', 'retry-cyber-policy']);
     const built = buildClaudeCodeCatalog(SAMPLE_API_MODELS, flags);
     for (const m of built) {
       expect(m.enabledFlags).toBe(flags);
@@ -232,7 +233,7 @@ describe('buildClaudeCodeCatalog', () => {
       modalities: { input: ['text', 'image'], output: ['text'] },
       reasoning: {
         effort: { supported: ['low', 'medium', 'high', 'max'], default: 'medium' },
-        budget_tokens: {},
+        budget_tokens: { min: 1024 },
         adaptive: true,
       },
     });

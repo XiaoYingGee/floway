@@ -18,16 +18,14 @@
 import { z } from 'zod';
 
 import { normalizeDisabledPublicModelIds } from '../repo/disabled-public-models.ts';
-import { MODEL_PREFIX_MAX_LENGTH, MODEL_PREFIX_REGEX, OPTIONAL_FLAGS, parseFlagOverridesWire } from '@floway-dev/provider';
+import { type FlagOverrides, MODEL_PREFIX_MAX_LENGTH, MODEL_PREFIX_REGEX, parseFlagOverridesWire } from '@floway-dev/provider';
 
 // --- shared atoms ---
 
-const knownFlagIds = new Set<string>(OPTIONAL_FLAGS.map(f => f.id));
-
 // Reuse the runtime parseFlagOverridesWire so unknown-id and type errors
 // carry the canonical messages. z.unknown() → transform keeps the
-// schema-validated output typed as Record<string, boolean> for the RPC client.
-const flagOverridesSchema = z.unknown().transform((value, ctx): Record<string, boolean> => {
+// schema-validated output typed as FlagOverrides for the RPC client.
+const flagOverridesSchema = z.unknown().transform((value, ctx): FlagOverrides => {
   try {
     return parseFlagOverridesWire(value);
   } catch (e) {
@@ -35,11 +33,6 @@ const flagOverridesSchema = z.unknown().transform((value, ctx): Record<string, b
     return z.NEVER;
   }
 });
-
-const flagOverrideValuesSchema = z.record(z.string(), z.boolean()).refine(
-  overrides => Object.keys(overrides).every(id => knownFlagIds.has(id)),
-  'Unknown flag id in model flag overrides',
-);
 
 // Like flag_overrides, the disabled-models field normalizes at the API edge so a
 // create/update response echoes exactly what gets persisted (trimmed, de-duped).
@@ -122,6 +115,14 @@ const chatSchema = z.object({
   reasoning: reasoningSchema.optional(),
 });
 
+// Shared limits shape used by both the upstream-model schema and the
+// alias's announced-metadata override.
+const limitsSchema = z.object({
+  max_context_window_tokens: z.number().optional(),
+  max_prompt_tokens: z.number().optional(),
+  max_output_tokens: z.number().optional(),
+});
+
 // Mirrors the runtime UpstreamModelConfig in @floway-dev/provider.
 // Azure and custom upstreams share this per-model entry; the canonical
 // per-model endpoint validation lives in the runtime validator.
@@ -134,23 +135,12 @@ const upstreamModelSchema = z.object({
   cost: z.object({
     ...pricingDimensionShape,
     // See ModelPricing.tiers in @floway-dev/protocols/common for semantics.
-    tiers: z.record(
-      z.string().min(1),
-      z.object(pricingDimensionShape).refine(
-        t => Object.values(t).some(v => v !== undefined),
-        { message: 'tier overlay must declare at least one rate' },
-      ),
-    ).optional(),
+    // An empty overlay is legal — it declares the tier without changing any
+    // rate, so every dimension inherits base pricing.
+    tiers: z.record(z.string().min(1), z.object(pricingDimensionShape)).optional(),
   }).optional(),
-  flagOverrides: z.object({
-    enabled: z.boolean(),
-    values: flagOverrideValuesSchema,
-  }).optional(),
-  limits: z.object({
-    max_context_window_tokens: z.number().optional(),
-    max_prompt_tokens: z.number().optional(),
-    max_output_tokens: z.number().optional(),
-  }).optional(),
+  flagOverrides: flagOverridesSchema.optional(),
+  limits: limitsSchema.optional(),
   chat: chatSchema.optional(),
 }).refine(
   m => m.chat === undefined || m.kind === undefined || m.kind === 'chat',
@@ -179,16 +169,6 @@ const azureConfigSchema = z.object({
   endpoint: z.string().min(1),
   apiKey: z.string().optional(),
   models: z.array(upstreamModelSchema).min(1, 'models must be a non-empty array'),
-});
-
-const copilotConfigSchema = z.object({
-  githubToken: z.string().min(1),
-  user: z.object({
-    login: z.string(),
-    avatar_url: z.string(),
-    name: z.string().nullable(),
-    id: z.number(),
-  }),
 });
 
 const ollamaConfigSchema = z.object({
@@ -308,22 +288,20 @@ const upstreamBaseFields = {
 };
 
 // Create accepts a discriminated union on `kind` for per-provider config
-// validation. Copilot upstreams normally originate from the device-flow poll
-// endpoint, but POST also accepts them for the import flow. `enabled` and
-// `sort_order` are optional — the handler defaults them to `true` and
-// `nextSortOrder()` respectively when omitted.
-//
-// `codex` and `claude-code` are listed here so the handler can return the
-// canonical "use POST /api/upstreams/<kind>-import" 400 instead of the
-// cryptic zod "invalid discriminator value" message. The `config` slot is
-// `unknown()` because the real config is derived from the OAuth flow, not
-// from anything posted against this endpoint.
+// validation. `enabled` and `sort_order` are optional — the handler
+// defaults them to `true` and to one past the current max sort order
+// when omitted.
 export const createUpstreamBody = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('custom'), ...upstreamBaseFields, config: customConfigSchema }),
   z.object({ kind: z.literal('azure'), ...upstreamBaseFields, config: azureConfigSchema }),
-  z.object({ kind: z.literal('copilot'), ...upstreamBaseFields, config: copilotConfigSchema }),
-  z.object({ kind: z.literal('codex'), ...upstreamBaseFields, config: z.unknown() }),
-  z.object({ kind: z.literal('claude-code'), ...upstreamBaseFields, config: z.unknown() }),
+  // Copilot / Codex / Claude Code carry OAuth-derived credentials that the
+  // create page populates via the corresponding OAuth-exchange helper
+  // before Save. `state` is accepted here as an opaque payload; the
+  // per-kind assertXxxUpstreamRecord in the handler narrows it once the
+  // request lands.
+  z.object({ kind: z.literal('copilot'), ...upstreamBaseFields, config: z.unknown(), state: z.unknown().optional() }),
+  z.object({ kind: z.literal('codex'), ...upstreamBaseFields, config: z.unknown(), state: z.unknown().optional() }),
+  z.object({ kind: z.literal('claude-code'), ...upstreamBaseFields, config: z.unknown(), state: z.unknown().optional() }),
   z.object({ kind: z.literal('ollama'), ...upstreamBaseFields, config: ollamaConfigSchema }),
 ]);
 
@@ -345,193 +323,113 @@ export const updateUpstreamBody = z.object({
   disabled_public_model_ids: disabledPublicModelIdsSchema.optional(),
   proxy_fallback_list: proxyFallbackListSchema.optional(),
   model_prefix: modelPrefixSchema.optional(),
-  config: z.unknown().optional(),
+  // Patches only carry field diffs, not per-kind shape validation — the
+  // handler dispatches on the existing row's kind and enforces the shape
+  // there (Copilot/Codex/Claude Code reject a config patch outright, since
+  // OAuth-managed slices belong to the action endpoints; the rest run
+  // through `assertXxxUpstreamRecord`). `z.record(z.unknown())` blocks
+  // primitives / arrays / null from reaching the handler as `config`.
+  config: z.record(z.string(), z.unknown()).optional(),
 });
 
-// Draft /models browse: accepts an in-progress upstream config so callers can
-// fetch the upstream's live model list before saving. `id` is present in
-// edit mode so the handler can substitute the stored secret when the secret
-// is left blank ("keep the stored secret"). Discriminated by `kind` so
-// each provider's draft preview surfaces a typed catalog.
-export const fetchModelsBody = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('custom'), id: z.string().optional(), config: customConfigSchema }),
-  z.object({ kind: z.literal('ollama'), id: z.string().optional(), config: ollamaConfigSchema }),
-]);
-
-// --- copilot device flow ---
-
-export const copilotAuthPollBody = z.object({
-  device_code: z.string().min(1),
-  // Edit-form override routing every GitHub-side call through the
-  // operator's in-progress chain. See proxy-resolution.ts.
+// Shared envelope for the record-body action contract used by every
+// action endpoint (OAuth exchange/refresh, quota, probe, list-models,
+// etc.). The client posts its full draft record; the server reads only
+// fields relevant to the specific action (credentials in config/state,
+// proxy_fallback_list for routing) and produces a targeted patch. Kind
+// and id validation is deferred to the handler so a single schema
+// serves every provider.
+export const upstreamRecordEnvelope = z.object({
+  id: z.string(),
+  kind: z.string(),
+  config: z.unknown(),
+  state: z.unknown(),
   proxy_fallback_list: proxyFallbackListSchema.optional(),
+}).passthrough();
+
+// The bare envelope contract — every action endpoint that takes no extras
+// beyond `record` (refresh, probe, quota, list-models) shares this shape.
+const recordOnlyBody = z.object({ record: upstreamRecordEnvelope });
+
+export const copilotOauthDeviceLoginPollBody = z.object({
+  record: upstreamRecordEnvelope,
+  deviceCode: z.string().min(1),
 });
 
-// --- codex import / authorize-url / refresh ---
-//
-// The control plane refuses `kind: 'codex'` on the generic create / update
-// upstream endpoints; Codex credentials enter only through these dedicated
-// routes so the id_token parsing lives in one place.
+export const copilotQuotaBody = recordOnlyBody;
+
+// --- codex OAuth (record-body contract) ---
 //
 // PKCE state is fully SPA-held: the dashboard mints `{verifier, challenge,
 // state}` in the browser via Web Crypto, stores `{verifier, state}` in
 // sessionStorage, and posts `challenge + state` here so the server can stamp
 // them into the upstream's authorize URL. The server never sees the
-// verifier until the callback comes back as `{code, verifier}` on import.
+// verifier until the callback comes back as `{code, verifier}` on exchange.
 
-export const codexAuthorizeUrlBody = z.object({
+export const codexOauthAuthorizeUrlBody = z.object({
+  record: upstreamRecordEnvelope,
   challenge: z.string().min(1),
   state: z.string().min(1),
 });
 
-// Path A — operator pastes `~/.codex/auth.json` verbatim. Path B — operator
-// supplies the SPA-validated OAuth callback as `{code, verifier}`. The two
-// paths are mutually exclusive; the refine below catches the both-or-neither
-// case before the handler runs. State is not threaded through here:
-// auth.openai.com rejects state on the token-exchange endpoint with 400
-// unknown_parameter (live-probed); the SPA still validates state before
-// sending the callback so CSRF protection is intact, but the gateway has
-// no reason to receive it.
-// Shared by claude-code OAuth + Setup-Token callbacks; codex defines its own callback inline because it omits `state`.
+export const codexOauthExchangeBody = z.object({
+  record: upstreamRecordEnvelope,
+  auth_json: z.string().min(1).optional(),
+  callback: z.object({
+    code: z.string().min(1),
+    verifier: z.string().min(1),
+  }).optional(),
+}).refine(
+  b => (b.auth_json !== undefined) !== (b.callback !== undefined),
+  { message: 'Provide exactly one of auth_json or callback' },
+);
+
+export const codexOauthRefreshBody = recordOnlyBody;
+
+// --- claude-code OAuth + setup-token + probe (record-body contract) ---
+
+// Shared by claude-code OAuth + Setup-Token callbacks.
 const oauthCallbackSchema = z.object({
   code: z.string().min(1),
   verifier: z.string().min(1),
   state: z.string().min(1),
 });
 
-const codexCredentialFields = {
-  auth_json: z.string().min(1).optional(),
-  callback: z.object({
-    code: z.string().min(1),
-    verifier: z.string().min(1),
-  }).optional(),
-  // Edit-form override carried through the import dialog. The PKCE token
-  // exchange runs before the upstream record exists, so re-import uses the
-  // persisted row's list as a fallback; on first-time import only the
-  // override path is available.
-  proxy_fallback_list: proxyFallbackListSchema.optional(),
-};
-
-// Both `codexImportBody.name` and `codexReimportBody.name` are optional. On
-// import, the server synthesizes a default name from the id_token-derived
-// identity (matching how copilot's device flow auto-names rows from the
-// GitHub login); the operator can rename later from the edit page. On
-// re-import, the existing row already has a name, so omitting it is the
-// common case.
-export const codexImportBody = z.object({
-  name: z.string().min(1).optional(),
-  sort_order: z.number().int().optional(),
-  ...codexCredentialFields,
-  // Pre-save proxy override: a brand-new upstream has no persisted chain, so
-  // the OAuth bootstrap goes direct by default. When the operator has
-  // already picked a fallback list in the in-flight form, send it here so
-  // the bootstrap routes through that chain AND so the same chain is
-  // persisted on the new row for subsequent data-plane calls.
-  proxy_fallback_list: proxyFallbackListSchema.optional(),
-}).refine(
-  b => (b.auth_json !== undefined) !== (b.callback !== undefined),
-  { message: 'Provide exactly one of auth_json or callback' },
-);
-
-// `sort_order` is omitted because re-import must not re-rank the row.
-export const codexReimportBody = z.object({
-  name: z.string().min(1).optional(),
-  ...codexCredentialFields,
-  // Edit-time override: same rationale as codexImportBody — the operator may
-  // be changing the proxy chain in the same edit that re-imports the
-  // credential. When present, route the bootstrap through the override and
-  // overwrite the persisted list with it.
-  proxy_fallback_list: proxyFallbackListSchema.optional(),
-}).refine(
-  b => (b.auth_json !== undefined) !== (b.callback !== undefined),
-  { message: 'Provide exactly one of auth_json or callback' },
-);
-
-export const codexRefreshNowBody = z.object({
-  // Edit-form override; absent falls back to the persisted row's list. See
-  // proxy-resolution.ts.
-  proxy_fallback_list: proxyFallbackListSchema.optional(),
-});
-
-// --- claude-code import / authorize-url / refresh ---
-//
-// Same shape rationale as the codex routes above: the generic create / update
-// upstream endpoints reject `kind: 'claude-code'` and dedicated
-// authorize-url + import + re-import endpoints own the OAuth handoff so
-// credential parsing lives in one place. PKCE state is SPA-held (see codex
-// section above for the architecture). The single authorize-url endpoint
-// covers both the full-OAuth and Setup-Token scopes via the `kind`
-// discriminator; the matching import endpoint per kind consumes the SPA-
-// provided verifier. Every claude-code body below accepts the same in-flight
-// `proxy_fallback_list` edit-form override with semantics documented in
-// proxy-resolution.ts.
-
-export const claudeCodeAuthorizeUrlBody = z.object({
+export const claudeCodeOauthAuthorizeUrlBody = z.object({
+  record: upstreamRecordEnvelope,
   challenge: z.string().min(1),
   state: z.string().min(1),
-  kind: z.enum(['oauth', 'setup-token']),
 });
 
-// Path A — operator pastes `~/.claude/.credentials.json` verbatim. Path B —
-// operator supplies the SPA-validated OAuth callback as `{code, verifier,
-// state}`. The two paths are mutually exclusive; the refine below catches
-// the both-or-neither case before the handler runs.
-const claudeCodeCredentialFields = {
+export const claudeCodeOauthExchangeBody = z.object({
+  record: upstreamRecordEnvelope,
   credentials_json: z.string().min(1).optional(),
   callback: oauthCallbackSchema.optional(),
-};
-
-export const claudeCodeImportBody = z.object({
-  name: z.string().min(1).optional(),
-  sort_order: z.number().int().optional(),
-  ...claudeCodeCredentialFields,
-  proxy_fallback_list: proxyFallbackListSchema.optional(),
 }).refine(
   b => (b.credentials_json !== undefined) !== (b.callback !== undefined),
   { message: 'Provide exactly one of credentials_json or callback' },
 );
 
-export const claudeCodeReimportBody = z.object({
-  name: z.string().min(1).optional(),
-  ...claudeCodeCredentialFields,
-  proxy_fallback_list: proxyFallbackListSchema.optional(),
-}).refine(
-  b => (b.credentials_json !== undefined) !== (b.callback !== undefined),
-  { message: 'Provide exactly one of credentials_json or callback' },
-);
+export const claudeCodeOauthRefreshBody = recordOnlyBody;
 
-export const claudeCodeRefreshNowBody = z.object({
-  proxy_fallback_list: proxyFallbackListSchema.optional(),
+export const claudeCodeSetupTokenAuthorizeUrlBody = z.object({
+  record: upstreamRecordEnvelope,
+  challenge: z.string().min(1),
+  state: z.string().min(1),
 });
 
-// Same in-flight override slot as the refresh route: a probe fired from an
-// unsaved edit form should reach Anthropic through the proxy chain the
-// operator is currently editing, not the persisted one.
-export const claudeCodeProbeQuotaBody = z.object({
-  proxy_fallback_list: proxyFallbackListSchema.optional(),
-});
-
-// --- claude-code Setup-Token import / re-import ---
-//
-// The Setup-Token flow uses the same authorize host / client_id /
-// redirect_uri / token endpoint as the regular OAuth flow but narrows the
-// scope to `user:inference` (selected via the shared authorize-url
-// endpoint's `kind: 'setup-token'`). The resulting credential has no
-// refresh_token, so the import body has no credentials_json path
-// (Anthropic's CLI never persists a setup token).
-
-export const claudeCodeSetupTokenImportBody = z.object({
-  name: z.string().min(1).optional(),
-  sort_order: z.number().int().optional(),
+export const claudeCodeSetupTokenExchangeBody = z.object({
+  record: upstreamRecordEnvelope,
   callback: oauthCallbackSchema,
-  proxy_fallback_list: proxyFallbackListSchema.optional(),
 });
 
-export const claudeCodeSetupTokenReimportBody = z.object({
-  name: z.string().min(1).optional(),
-  callback: oauthCallbackSchema,
-  proxy_fallback_list: proxyFallbackListSchema.optional(),
-});
+export const claudeCodeProbeBody = recordOnlyBody;
+
+// Unified live-model listing for both create-time preview and edit-time
+// refresh. Custom returns the raw upstream row (dashboard translates
+// through the draft's endpoints); every other kind returns the fully
+// projected UpstreamModelConfig catalog.
+export const listModelsBody = recordOnlyBody;
 
 // --- proxies ---
 //
@@ -593,10 +491,129 @@ export const searchConfigSchema = z.object({
   jina: z.object({ apiKey: z.string() }),
 });
 
+// --- model aliases ---
+
+// Per-target chat rules. Field names mirror the IR slot each value overlays.
+// Values forward verbatim — no capability narrowing here, so an operator
+// can drive a feature the catalog hasn't advertised yet. All open-string
+// fields (`effort` + `summary` on the reasoning sub-block below,
+// `verbosity` + `serviceTier` on the outer rules schema) accept any
+// string for the same reason; the dashboard pins canonical presets as
+// combobox suggestions.
+const chatAliasReasoningSchema = z.object({
+  effort: z.string().min(1).optional(),
+  budget_tokens: z.number().int().nonnegative().optional(),
+  adaptive: z.boolean().optional(),
+  summary: z.string().min(1).optional(),
+}).strict().refine(
+  // `adaptive` and a pinned `budget_tokens` are mutually exclusive on the
+  // Messages wire — `thinking.type` is one of `adaptive` or `enabled`, and
+  // only the `enabled` branch carries a `budget_tokens`. Storing both on the
+  // same rule would silently discard the budget at overlay time.
+  r => !(r.adaptive === true && r.budget_tokens !== undefined),
+  {
+    message: 'reasoning.adaptive=true cannot be combined with reasoning.budget_tokens — adaptive mode auto-determines the budget',
+    path: ['budget_tokens'],
+  },
+);
+
+const chatAliasRulesSchema = z.object({
+  reasoning: chatAliasReasoningSchema.optional(),
+  verbosity: z.string().min(1).optional(),
+  serviceTier: z.string().min(1).optional(),
+}).strict();
+
+// Rules are validated against the alias-level kind in the superRefine pass
+// below — chat-kind aliases accept ChatAliasRules; other kinds require an
+// empty object. Each target_model_id is opaque (no `/` semantics in the
+// alias layer), so the only structural check is non-emptiness.
+const aliasTargetSchema = z.object({
+  target_model_id: z.string().min(1),
+  rules: z.record(z.string(), z.unknown()),
+});
+
+// Operator override for an alias's announced /v1/models payload. Both
+// sub-fields are independently optional, and the listing pipeline falls
+// back to the rule-aware automatic computation for any TOP-LEVEL
+// sub-block (`limits` / `chat`) the operator did not provide — a present
+// sub-block replaces the computed counterpart wholesale, not per-leaf.
+// `chatSchema` and `limitsSchema` are the same shapes the upstream-model
+// surface validates, so the override carries the catalog's full
+// vocabulary.
+const announcedMetadataSchema = z.object({
+  limits: limitsSchema.optional(),
+  chat: chatSchema.optional(),
+});
+
+const aliasBaseShape = {
+  name: z.string().min(1),
+  kind: z.enum(['chat', 'embedding', 'image']),
+  selection: z.enum(['random', 'first-available']),
+  display_name: z.string().min(1).nullable(),
+  visible_in_models_list: z.boolean(),
+  targets: z.array(aliasTargetSchema).min(1),
+  announced_metadata: announcedMetadataSchema.nullable(),
+  sort_order: z.number().int().optional(),
+};
+
+const aliasBodyCore = z.object(aliasBaseShape);
+
+// superRefine cross-validates each target's `rules` against the alias-level
+// kind. Chat: parse through `chatAliasRulesSchema` and surface the inner
+// issue verbatim. Embedding / image: the slot must be `{}` until a future
+// schema lands. `announced_metadata.chat` is bound to the same invariant:
+// a chat block on a non-chat alias would land on the InternalModel row and
+// leak an incoherent `chat: {...}` sidecar onto `/v1/models` for a row
+// whose `kind` says it does not carry one.
+const aliasBodyRulesRefinement = (
+  value: z.infer<typeof aliasBodyCore>,
+  ctx: z.core.$RefinementCtx,
+): void => {
+  value.targets.forEach((target, index) => {
+    if (value.kind === 'chat') {
+      const parsed = chatAliasRulesSchema.safeParse(target.rules);
+      if (!parsed.success) {
+        for (const issue of parsed.error.issues) {
+          ctx.issues.push({
+            code: 'custom',
+            message: issue.message,
+            path: ['targets', index, 'rules', ...issue.path],
+            input: target.rules,
+          });
+        }
+      }
+      return;
+    }
+    if (Object.keys(target.rules).length !== 0) {
+      ctx.issues.push({
+        code: 'custom',
+        message: `rules must be empty for kind=${value.kind}`,
+        path: ['targets', index, 'rules'],
+        input: target.rules,
+      });
+    }
+  });
+  if (value.kind !== 'chat' && value.announced_metadata?.chat !== undefined) {
+    ctx.issues.push({
+      code: 'custom',
+      message: `announced_metadata.chat is only allowed for kind='chat' aliases`,
+      path: ['announced_metadata', 'chat'],
+      input: value.announced_metadata.chat,
+    });
+  }
+};
+
+// Create and update share the same body shape — the difference is operational:
+// create rejects PK collisions, update reads the path `:name` as the old name
+// and treats a different `body.name` as a rename. Splitting them keeps the
+// type names self-documenting at the RPC-client surface.
+export const createAliasBody = aliasBodyCore.superRefine(aliasBodyRulesRefinement);
+export const updateAliasBody = aliasBodyCore.superRefine(aliasBodyRulesRefinement);
+
 // --- data transfer ---
 
 export const importBody = z.object({
-  version: z.literal(6, { error: 'version must be 6 — older export formats are not supported; re-export from the current deployment' }),
+  version: z.literal(7, { error: 'version must be 7 — older export formats are not supported; re-export from the current deployment' }),
   mode: z.enum(['merge', 'replace'], { error: "mode must be 'merge' or 'replace'" }),
   data: z.unknown().optional(),
 });
@@ -623,6 +640,18 @@ const usageBaseQuery = {
 };
 
 export const tokenUsageQuery = z.object(usageBaseQuery);
+
+// Dashboard `/api/models` accepts two query knobs. `aliases=false` skips the
+// alias-merge pass — the alias edit dialog and shadow detection need the
+// raw real-model set. `include_unlisted=true` extends the payload with the
+// addressable-but-not-listed surface (prefix-form alternates, Copilot
+// variant ids, provider-side redirects), so the alias dialog combobox sees
+// every id the data-plane resolver would accept.
+export const modelsQuery = z.object({
+  aliases: z.enum(['true', 'false']).optional(),
+  include_unlisted: z.enum(['true', 'false']).optional(),
+});
+
 export const searchUsageQuery = z.object({
   ...usageBaseQuery,
   provider: z.string().optional(),

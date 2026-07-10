@@ -10,7 +10,8 @@ import type { Context } from 'hono';
 
 import { tokenUsageFromCompletionsUsage } from './usage.ts';
 import type { TokenUsage } from '../../repo/types.ts';
-import { createGatewayCtxFromHono } from '../chat/shared/gateway-ctx.ts';
+import { backgroundSchedulerFromContext } from '../../runtime/background.ts';
+import { createGatewayCtxFromHono, finalizeGatewayResponse } from '../chat/shared/gateway-ctx.ts';
 import { readRequestBody } from '../chat/shared/request-body.ts';
 import { passthroughApiError, passthroughServe } from '../shared/passthrough-serve.ts';
 import { isOpenAIUsageOnlyEventShape, type ProtocolFrame } from '@floway-dev/protocols/common';
@@ -62,11 +63,11 @@ export const completions = async (c: Context): Promise<Response> => {
   const ctx = createGatewayCtxFromHono(c, {
     wantsStream: request.type === 'ok' ? request.wantsStream : false,
     requestBody,
+    backgroundScheduler: backgroundSchedulerFromContext(c),
   });
   if (request.type === 'invalid') {
     ctx.dump?.error('gateway');
-    const response = passthroughApiError(c, request.message, 400);
-    return (ctx.dump?.finalize(response) ?? response);
+    return finalizeGatewayResponse(ctx, passthroughApiError(c, request.message, 400));
   }
 
   ctx.dump?.requestedModel(request.model);
@@ -116,5 +117,5 @@ export const completions = async (c: Context): Promise<Response> => {
           },
         },
   });
-  return (ctx.dump?.finalize(response) ?? response);
+  return finalizeGatewayResponse(ctx, response);
 };

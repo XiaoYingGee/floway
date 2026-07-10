@@ -408,7 +408,7 @@ describe('codex 1p namespace', () => {
           return await response.json() as CodexModelsResponse;
         },
       );
-      // Bundled rust-v0.136.0 catalog has gpt-5.4 at context_window=272000
+      // Bundled rust-v0.144.1 catalog has gpt-5.4 at context_window=272000
       // and max_context_window=1000000. Registry says the gateway can only
       // serve 272000, so both fields collapse to that — codex must not
       // believe a 1M ceiling we cannot honour.
@@ -417,7 +417,7 @@ describe('codex 1p namespace', () => {
       expect(gpt54?.max_context_window).toBe(272000);
     });
 
-    it('drops slugs the registry does not advertise; only registry-known catalog entries reach the client', async () => {
+    it('registry-driven output: bundled entries surface only when a registry model resolves to them', async () => {
       const { apiKey } = await setupAppTest();
       const app = buildCodexApp();
       const body = await withMockedFetch(
@@ -430,41 +430,15 @@ describe('codex 1p namespace', () => {
           return await response.json() as CodexModelsResponse;
         },
       );
-      const slugs = body.models.map(m => m.slug);
-      // The bundled catalog ships with six slugs (gpt-5.5, gpt-5.4,
-      // gpt-5.4-mini, gpt-5.3-codex, gpt-5.2, codex-auto-review). Registry
-      // here advertises only gpt-5.5, and codex-auto-review's target
-      // (gpt-5.4) is missing — so the response is just gpt-5.5.
-      expect(slugs).toEqual(['gpt-5.5']);
+      // Pipeline iterates the addressable-listed chat models (gpt-5.5 is the
+      // only one the registry advertises here) and matches each against the
+      // bundled catalog. The other bundled slugs (gpt-5.4, gpt-5.4-mini,
+      // gpt-5.3-codex, gpt-5.2, codex-auto-review) have no registry counterpart
+      // and never appear in the output.
+      expect(body.models.map(m => m.slug)).toEqual(['gpt-5.5']);
     });
 
-    it('keeps codex-auto-review when its alias target is in the registry, drops it otherwise, and reports the target window', async () => {
-      const { apiKey } = await setupAppTest();
-      const app = buildCodexApp();
-      const body = await withMockedFetch(
-        copilotFetch([{ id: 'gpt-5.4', maxContextWindowTokens: 272000 }]),
-        async () => {
-          const response = await app.request('/azure-api.codex/models', {
-            headers: { authorization: `Bearer ${apiKey.key}` },
-          });
-          expect(response.status).toBe(200);
-          return await response.json() as CodexModelsResponse;
-        },
-      );
-      const slugs = new Set(body.models.map(m => m.slug));
-      expect(slugs.has('gpt-5.4')).toBe(true);
-      expect(slugs.has('codex-auto-review')).toBe(true);
-      expect(slugs.has('gpt-5.5')).toBe(false);
-      // codex-auto-review has no registry entry of its own, but it gets
-      // rewritten to gpt-5.4 at request time, so its catalog row reports
-      // gpt-5.4's window — not the bundled 1000000 max that would advertise
-      // a tier the gateway cannot serve.
-      const autoReview = body.models.find(m => m.slug === 'codex-auto-review');
-      expect(autoReview?.context_window).toBe(272000);
-      expect(autoReview?.max_context_window).toBe(272000);
-    });
-
-    it('returns an empty catalog when the registry has no overlapping slugs', async () => {
+    it('synthesizes a catalog entry for registry chat models with no bundled match', async () => {
       const { apiKey } = await setupAppTest();
       const app = buildCodexApp();
       const body = await withMockedFetch(
@@ -477,49 +451,10 @@ describe('codex 1p namespace', () => {
           return await response.json() as CodexModelsResponse;
         },
       );
-      expect(body.models).toEqual([]);
-    });
-
-    it('serves cached responses without re-running the registry on subsequent calls', async () => {
-      const { apiKey } = await setupAppTest();
-      const app = buildCodexApp();
-      const cacheStore = new Map<string, Response>();
-      const cacheStub: Cache = {
-        match: async (req: Request | string) => cacheStore.get(typeof req === 'string' ? req : req.url),
-        put: async (req: Request | string, response: Response) => {
-          cacheStore.set(typeof req === 'string' ? req : req.url, response);
-        },
-      } as unknown as Cache;
-      const globals = globalThis as unknown as { caches?: { default: Cache } };
-      const previous = globals.caches;
-      globals.caches = { default: cacheStub };
-      let registryCalls = 0;
-      try {
-        await withMockedFetch(
-          request => {
-            const url = new URL(request.url);
-            if (url.hostname === 'api.individual.githubcopilot.com' && url.pathname === '/models') registryCalls += 1;
-            return copilotFetch([{ id: 'gpt-5.5', maxContextWindowTokens: 1050000 }])(request);
-          },
-          async () => {
-            const first = await app.request('/azure-api.codex/models', {
-              headers: { authorization: `Bearer ${apiKey.key}` },
-            });
-            expect(first.status).toBe(200);
-            await first.json();
-            const second = await app.request('/azure-api.codex/models', {
-              headers: { authorization: `Bearer ${apiKey.key}` },
-            });
-            expect(second.status).toBe(200);
-            await second.json();
-          },
-        );
-      } finally {
-        if (previous === undefined) delete globals.caches;
-        else globals.caches = previous;
-      }
-      expect(registryCalls).toBe(1);
-      expect(cacheStore.size).toBe(1);
+      // claude-sonnet-4 is not in the bundled codex catalog, so it gets a
+      // synthesized entry using the codex-shaped baseline from synthesize.ts.
+      expect(body.models).toHaveLength(1);
+      expect(body.models[0].slug).toBe('claude-sonnet-4');
     });
   });
 });
