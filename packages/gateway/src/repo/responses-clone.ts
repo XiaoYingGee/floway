@@ -2,7 +2,7 @@ import type { StoredResponsesItem, StoredResponsesSnapshot } from './types.ts';
 
 export const cloneStoredResponsesItem = (item: StoredResponsesItem): StoredResponsesItem => ({
   ...item,
-  payload: item.payload === null ? null : structuredClone(item.payload),
+  payload: structuredClone(item.payload),
 });
 
 export const cloneStoredResponsesSnapshot = (snapshot: StoredResponsesSnapshot): StoredResponsesSnapshot => ({
@@ -10,8 +10,10 @@ export const cloneStoredResponsesSnapshot = (snapshot: StoredResponsesSnapshot):
   itemIds: [...snapshot.itemIds],
 });
 
-export const responsesItemStoreKey = (apiKeyId: string | null, id: string): string =>
-  `${apiKeyId ?? ''}\0${id}`;
+export const scopedResponsesKey = (apiKeyId: string, id: string): string => `${apiKeyId}\0${id}`;
 
-export const compareResponsesItemsByFreshness = (a: StoredResponsesItem, b: StoredResponsesItem): number =>
-  b.refreshedAt - a.refreshedAt || b.createdAt - a.createdAt || a.id.localeCompare(b.id);
+export const compareResponsesItemsByFreshness = (
+  a: Pick<StoredResponsesItem, 'id' | 'createdAt'>,
+  b: Pick<StoredResponsesItem, 'id' | 'createdAt'>,
+): number =>
+  b.createdAt - a.createdAt || a.id.localeCompare(b.id);

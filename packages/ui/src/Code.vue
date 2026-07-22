@@ -2,14 +2,15 @@
 import Prism from 'prismjs';
 import 'prismjs/components/prism-bash.js';
 import 'prismjs/components/prism-json.js';
+import 'prismjs/components/prism-powershell.js';
 import 'prismjs/components/prism-toml.js';
-import { computed, ref } from 'vue';
+import { computed, shallowRef } from 'vue';
 
 import OverlayScrollbars from './OverlayScrollbars.vue';
 
 const props = withDefaults(defineProps<{
   code: string;
-  language?: 'bash' | 'toml' | 'json' | 'text';
+  language?: 'bash' | 'powershell' | 'toml' | 'json' | 'text';
   copyable?: boolean;
   // Drop the card chrome (border, bg, rounded-xl, copy-button pad) so the code sits edge-to-edge inside an ancestor that already frames it.
   flush?: boolean;
@@ -19,7 +20,7 @@ const props = withDefaults(defineProps<{
   flush: false,
 });
 
-const copied = ref(false);
+const copied = shallowRef(false);
 
 const copy = async () => {
   await navigator.clipboard.writeText(props.code);
@@ -44,7 +45,7 @@ const highlighted = computed(() => {
 <template>
   <div class="code-block relative group">
     <OverlayScrollbars :class="flush ? '' : 'rounded-xl border border-white/[0.04] bg-surface-900'" no-tabindex>
-      <pre :class="flush ? 'min-w-max px-4 py-3 pr-11 text-[11px] font-mono leading-[1.6] text-gray-200' : 'min-w-max p-4 pr-11 text-[11px] font-mono leading-[1.6] text-gray-200'"><code :class="`language-${language}`" v-html="highlighted" /></pre>
+      <pre class="min-w-max pr-11 text-[11px] font-mono leading-[1.6] text-gray-200" :class="flush ? 'px-4 py-3' : 'p-4'"><code :class="`language-${language}`" v-html="highlighted" /></pre>
     </OverlayScrollbars>
     <button
       v-if="copyable"

@@ -1,13 +1,17 @@
-import type { HistogramBucket } from '../shared/performance-histogram.ts';
-import type { WebSearchProviderName } from '../shared/web-search-providers.ts';
-import type { AliasSelection, AliasTarget, AnnouncedMetadata, BillingDimension, ModelKind, ModelPricing } from '@floway-dev/protocols/common';
-import type { ProviderModel, UpstreamRecord } from '@floway-dev/provider';
+import type { SearchConfig, WebSearchProviderName } from '../shared/web-search-providers.ts';
+export type { SearchConfig } from '../shared/web-search-providers.ts';
+import type { AgentSetupRepository } from '@floway-dev/agent-setup';
+import type { AliasSelection, AliasTarget, AnnouncedMetadata, BillingMetric, DecimalString, ModelKind, PricingSelector } from '@floway-dev/protocols/common';
+import type { PerformanceTelemetryContext, ProviderModel, UpstreamRecord } from '@floway-dev/provider';
 
 export interface ApiKey {
   id: string;
   userId: number;
   name: string;
   key: string;
+  // Hidden server-private key material attached to this API key. Normal CRUD
+  // never exposes it; admin data transfer preserves it across deployments.
+  serverSecret: string;
   createdAt: string;
   lastUsedAt?: string;
   // null = inherit global upstream order; array = whitelist + priority order.
@@ -20,8 +24,9 @@ export interface ApiKey {
 export interface User {
   id: number;
   username: string;
-  // null = the row is not a credential — sign-in is only possible through
-  // the ADMIN_KEY backdoor.
+  // null = the row is not a credential — sign-in is only possible via
+  // the blank-username /auth/login path (ADMIN_KEY match, or the
+  // dev-only passwordless shortcut when ADMIN_KEY is unset).
   passwordHash: string | null;
   isAdmin: boolean;
   // null = unrestricted at the user level; an array intersects with the
@@ -45,32 +50,34 @@ export interface UsageRecord {
   upstream: string | null;
   modelKey: string;
   hour: string;
-  // Service tier the upstream stamped on this bucket (Anthropic `speed`,
-  // OpenAI `service_tier`). null = the base / default tier. Distinct tiers
-  // for the same (keyId, model, upstream, modelKey, hour) are stored as
-  // separate buckets so per-tier pricing overrides apply correctly.
-  tier: string | null;
+  // Canonical, self-describing selector coordinate for this bucket. The SQL
+  // identity stores its sorted-key JSON form; repository reads expose the typed
+  // object. `{}` is the base coordinate.
+  pricingSelector: PricingSelector;
   requests: number;
-  // Disjoint per-dimension token counts for this bucket. The tier the bucket
-  // was stamped under lives on the `tier` field above — do not encode it
-  // inside this map.
-  tokens: Partial<Record<BillingDimension, number>>;
-  // Pricing snapshot taken at write time. null means the provider did not
-  // resolve pricing for this model (Custom upstreams, unknown Copilot
-  // public id, etc.). The repo derives per-dimension unit prices from it via
-  // unitPriceForDimension after `resolveEffectivePricing(cost, tier)` folds
-  // in the bucket's tier override; aggregation treats a null snapshot as
-  // cost 0.
-  cost: ModelPricing | null;
+  metrics: UsageMetricRecord[];
 }
 
-// Disjoint per-dimension token counts. Absent keys mean zero for that
-// dimension. No key's count overlaps another's. `tier` is the upstream-
-// reported service-tier marker (Anthropic `usage.speed`, OpenAI
-// `usage.service_tier`) that selects an override against `cost.tiers`
-// before any per-dimension unit-price lookup; absent / null = the model's
-// base pricing applies.
-export interface TokenUsage extends Partial<Record<BillingDimension, number>> {
+export interface UsageMetricRecord {
+  metric: BillingMetric;
+  quantity: DecimalString;
+  unitPrice: DecimalString | null;
+}
+
+export type UsageQuantities = Partial<Record<BillingMetric, DecimalString>>;
+
+// Disjoint protocol-level token counts. Absent keys mean zero for that
+// token category. No key's count overlaps another's. `tier` is only the normalized
+// upstream observation used as a runtime pricing fact; it is projected into the
+// generic `pricingSelector` at recording time and is not persisted directly.
+export interface TokenUsage {
+  input?: number;
+  input_cache_read?: number;
+  input_cache_write?: number;
+  input_cache_write_1h?: number;
+  input_image?: number;
+  output?: number;
+  output_image?: number;
   tier?: string | null;
 }
 
@@ -84,30 +91,56 @@ export interface SearchUsageRecord {
   requests: number;
 }
 
-export type PerformanceMetricScope = 'request_total' | 'upstream_success';
+export type PerformanceMetric = 'ttft_ms' | 'tpot_us';
 
-export interface PerformanceDimensions {
-  hour: string;
-  metricScope: PerformanceMetricScope;
-  keyId: string;
-  model: string;
-  upstream: string | null;
-  modelKey: string;
-  stream: boolean;
-  runtimeLocation: string;
+// A performance-summary row is a `PerformanceTelemetryContext` (the provider-
+// facing telemetry identity the recorder threads through the request) plus
+// the aggregation bucket. Keeping the shape a strict extension guarantees a
+// context can be spread into a dimensions object without repeating field
+// names or drifting them out of sync.
+export interface PerformanceDimensions extends PerformanceTelemetryContext {
+  hour: string;              // 'YYYY-MM-DDTHH'
 }
 
-export interface PerformanceLatencySample extends PerformanceDimensions {
-  durationMs: number;
+// TPOT is measurable only when at least two output tokens are streamed; the
+// caller (recordPerformance) enforces that gate before setting `tpotUs`. A
+// TTFT-only sample omits it entirely.
+//
+// `success` discriminates a healthy TTFT sample from a partial-output failure
+// — the stream produced enough to yield a real TTFT (and possibly TPOT)
+// sample before failing. The repo routes the row to `ttft_samples_ok` when
+// success is true, or `errors_with_output` when false, so the counter
+// partition stays disjoint by construction.
+export interface PerformanceSample extends PerformanceDimensions {
+  ttftMs: number;
+  tpotUs?: number;
+  success: boolean;
 }
 
-export type PerformanceErrorSample = PerformanceDimensions;
+export interface PerformanceBucketRow {
+  metric: PerformanceMetric;
+  lower: number;
+  upper: number | null;
+  count: number;
+}
 
+// Partition-first counters — exactly one of the four counters bumps per
+// request, and their sum equals `requests`. `tpotSamples` is orthogonal (a
+// subset of `ttftSamplesOk + errorsWithOutput` where the stream produced
+// at least two output tokens). Display-friendly totals derive at
+// aggregation time:
+//   ttftSamples = ttftSamplesOk + errorsWithOutput
+//   errors      = errorsWithOutput + errorsNoOutput
 export interface PerformanceTelemetryRecord extends PerformanceDimensions {
   requests: number;
-  errors: number;
-  totalMsSum: number;
-  buckets: HistogramBucket[];
+  ttftSamplesOk: number;      // successful streams with a TTFT stamp
+  errorsWithOutput: number;   // failures that streamed at least one token (carry a TTFT sample)
+  errorsNoOutput: number;     // pre-stream / usage-never-arrived failures
+  neutral: number;            // successes with no TTFT (non-chat / no upstream call / no first-token frame)
+  tpotSamples: number;        // subset of TTFT-carrying rows with a measurable inter-token interval
+  ttftMsSum: number;
+  tpotUsSum: number;
+  buckets: readonly PerformanceBucketRow[];
 }
 
 export interface ApiKeyRepo {
@@ -121,7 +154,6 @@ export interface ApiKeyRepo {
   listByUserIdIncludingDeleted(userId: number): Promise<ApiKey[]>;
   findByRawKey(rawKey: string): Promise<ApiKey | null>;
   getById(id: string): Promise<ApiKey | null>;
-  idsByUserIdIncludingDeleted(userId: number): Promise<string[]>;
   save(key: ApiKey): Promise<void>;
   softDelete(id: string): Promise<boolean>;
   softDeleteByUserId(userId: number): Promise<number>;
@@ -154,14 +186,14 @@ export interface SessionsRepo {
 }
 
 export interface UsageRepo {
-  // Additive upsert: on (keyId, model, upstream, modelKey, hour, tier)
-  // conflict, token counts are summed. cost is COALESCED — the first write
-  // within a bucket establishes the pricing snapshot for that row, later
-  // writes that share the bucket keep the original snapshot.
+  // Additive upsert: on (keyId, model, upstream, modelKey, hour,
+  // pricingSelector, metric) conflict, quantities are summed exactly. The
+  // first write establishes the unit-price snapshot, including an unpriced
+  // snapshot; later writes that share the row keep it unchanged.
   record(record: UsageRecord): Promise<void>;
   query(opts: { keyId?: string; start: string; end: string }): Promise<UsageRecord[]>;
   listAll(): Promise<UsageRecord[]>;
-  // Replacement upsert: counts and cost are both overwritten from the record.
+  // Replacement upsert: quantities and unit prices are overwritten from the record.
   set(record: UsageRecord): Promise<void>;
   deleteAll(): Promise<void>;
 }
@@ -175,15 +207,31 @@ export interface SearchUsageRepo {
 }
 
 export interface PerformanceRepo {
-  recordLatency(sample: PerformanceLatencySample): Promise<void>;
-  recordError(sample: PerformanceErrorSample): Promise<void>;
-  query(opts: { keyId?: string; metricScope?: PerformanceMetricScope; start: string; end: string }): Promise<PerformanceTelemetryRecord[]>;
+  // Bumps `requests` + one of {ttftSamplesOk, errorsWithOutput} based on
+  // `sample.success`, and adds `sample.ttftMs` to `ttftMsSum` plus one TTFT
+  // bucket. When `sample.tpotUs` is set, also bumps `tpotSamples`, adds to
+  // `tpotUsSum`, and lands one TPOT bucket — a partial-output failure whose
+  // stream produced a real TTFT before dying still contributes latency data
+  // alongside its error accounting.
+  recordSample(sample: PerformanceSample): Promise<void>;
+  // Increments `requests` and `errorsNoOutput`; leaves the latency sums,
+  // sample counts, and buckets untouched. Used for failures that produced no
+  // output tokens (pre-stream / usage-never-arrived errors).
+  recordZeroOutputError(dims: PerformanceDimensions): Promise<void>;
+  // Increments `requests` and `neutral`; leaves the error counts, latency
+  // sums, sample counts, and buckets untouched. Used for successful non-chat
+  // calls and chat successes that never got a first output token or a real
+  // upstream call.
+  recordNeutral(dims: PerformanceDimensions): Promise<void>;
+  query(opts: { keyId?: string; start: string; end: string }): Promise<PerformanceTelemetryRecord[]>;
   listAll(): Promise<PerformanceTelemetryRecord[]>;
+  // Replacement upsert used by admin restore paths.
   set(record: PerformanceTelemetryRecord): Promise<void>;
   deleteAll(): Promise<void>;
 }
 
 export interface CachedModelsRow {
+  revision: number;
   fetchedAt: number;
   models: ProviderModel[];
   lastError: { message: string; at: number } | null;
@@ -191,14 +239,14 @@ export interface CachedModelsRow {
 
 export interface ModelsCacheRepo {
   get(upstreamId: string): Promise<CachedModelsRow | null>;
-  put(upstreamId: string, row: { fetchedAt: number; models: ProviderModel[] }): Promise<void>;
+  put(upstreamId: string, row: { revision: number; fetchedAt: number; models: ProviderModel[] }): Promise<void>;
   setLastError(upstreamId: string, error: { message: string; at: number } | null): Promise<void>;
   delete(upstreamId: string): Promise<void>;
 }
 
 export interface SearchConfigRepo {
   get(): Promise<unknown>;
-  save(config: unknown): Promise<void>;
+  save(config: SearchConfig): Promise<void>;
 }
 
 export interface UpstreamRepo {
@@ -312,19 +360,13 @@ export interface ModelAliasesRepo {
 
 export interface StoredResponsesItem {
   id: string;
-  apiKeyId: string | null;
+  apiKeyId: string;
   upstreamId: string | null;
   upstreamItemId: string | null;
   itemType: string;
-  origin: 'input' | 'upstream' | 'synthetic';
-  payload: StoredResponsesItemPayload | null;
+  payload: StoredResponsesItemPayload;
   contentHash: string | null;
-  // sha256 of the item's `encrypted_content`, when it carries one (reasoning /
-  // compaction). Lets a later turn that echoes the blob without a gateway id
-  // recover this row's owning upstream for affinity routing.
-  encryptedContentHash: string | null;
   createdAt: number;
-  refreshedAt: number;
 }
 
 export interface StoredResponsesItemPayload {
@@ -337,32 +379,32 @@ export interface StoredResponsesItemPayload {
 }
 
 export interface ResponsesItemsRepo {
-  lookupMany(apiKeyId: string | null, ids: readonly string[]): Promise<StoredResponsesItem[]>;
-  lookupManyByContentHash(apiKeyId: string | null, hashes: readonly string[]): Promise<StoredResponsesItem[]>;
-  lookupManyByEncryptedContentHash(apiKeyId: string | null, hashes: readonly string[]): Promise<StoredResponsesItem[]>;
+  lookupMany(apiKeyId: string, ids: readonly string[]): Promise<StoredResponsesItem[]>;
+  lookupManyByContentHash(apiKeyId: string, hashes: readonly string[]): Promise<StoredResponsesItem[]>;
   insertMany(items: readonly StoredResponsesItem[]): Promise<void>;
-  fillPayloads(items: readonly StoredResponsesItem[]): Promise<number>;
-  refreshMany(apiKeyId: string | null, ids: readonly string[], refreshedAt: number): Promise<number>;
-  clearPayloadOlderThan(createdBefore: number): Promise<number>;
-  deleteOlderThan(refreshedBefore: number): Promise<number>;
+  refreshMany(items: readonly StoredResponsesItem[], createdAt: number): Promise<void>;
+  deleteOlderThan(createdBefore: number): Promise<number>;
   deleteAll(): Promise<void>;
 }
 
 export interface StoredResponsesSnapshot {
   id: string;
-  apiKeyId: string | null;
+  apiKeyId: string;
   itemIds: string[];
   createdAt: number;
-  refreshedAt: number;
 }
 
 export interface ResponsesSnapshotsRepo {
-  lookup(apiKeyId: string | null, id: string): Promise<StoredResponsesSnapshot | null>;
+  lookup(apiKeyId: string, id: string): Promise<StoredResponsesSnapshot | null>;
   insert(snapshot: StoredResponsesSnapshot): Promise<void>;
-  refresh(apiKeyId: string | null, id: string, refreshedAt: number): Promise<boolean>;
-  deleteOlderThan(refreshedBefore: number): Promise<number>;
+  deleteOlderThan(createdBefore: number): Promise<number>;
   deleteAll(): Promise<void>;
 }
+
+// The Agent Setup lease store. Its shape, record, and mutation discriminants
+// are owned by @floway-dev/agent-setup; the SQL and in-memory implementations
+// here satisfy that contract. Re-exported so the repo layer imports one source.
+export type { AgentSetupMutation, AgentSetupRecord, AgentSetupRenewal, AgentSetupRepository } from '@floway-dev/agent-setup';
 
 export interface Repo {
   apiKeys: ApiKeyRepo;
@@ -379,4 +421,5 @@ export interface Repo {
   modelAliases: ModelAliasesRepo;
   responsesItems: ResponsesItemsRepo;
   responsesSnapshots: ResponsesSnapshotsRepo;
+  agentSetup: AgentSetupRepository;
 }

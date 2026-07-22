@@ -2,8 +2,7 @@ import { appendFailedUpstreams } from '../../shared/failed-upstreams.ts';
 import type { ChatServeFailure } from '../shared/errors.ts';
 import type { ProtocolFrame } from '@floway-dev/protocols/common';
 import type { ResponsesStreamEvent } from '@floway-dev/protocols/responses';
-import type { ExecuteResult } from '@floway-dev/provider';
-import type { TranslatorInputError } from '@floway-dev/translate';
+import type { ExecuteResult, PerformanceTelemetryContext } from '@floway-dev/provider';
 
 // OpenAI error envelope. `param` / `code` reproduce OpenAI's native fields; a
 // stored-item miss must byte-match OpenAI's own "not found" body — stateless
@@ -13,6 +12,7 @@ const openAiErrorResult = (
   status: number,
   message: string,
   extra?: { readonly param: string; readonly code: string | null },
+  performance?: PerformanceTelemetryContext,
 ): ExecuteResult<ProtocolFrame<ResponsesStreamEvent>> => ({
   type: 'api-error',
   source: 'gateway',
@@ -21,17 +21,17 @@ const openAiErrorResult = (
   body: new TextEncoder().encode(JSON.stringify({
     error: { message, type: 'invalid_request_error', ...extra },
   })),
+  ...(performance ? { performance } : {}),
 });
 
-// Translator surfaced a caller-input violation. Render as a 400
-// invalid_request_error so the caller sees a protocol-shaped failure
-// instead of the internal-error 502 envelope. `param` falls back to
-// `input` (the Responses canonical input field name) when the translator
-// did not carry a more specific path.
-export const translatorInputErrorResult = (
-  error: TranslatorInputError,
+// Caller-input violations discovered by translation or the source affinity
+// membrane share the Responses 400 envelope. `performance` retains candidate
+// attribution when validation fires after attempt dispatch.
+export const responsesInputErrorResult = (
+  error: { readonly message: string; readonly param?: string },
+  performance?: PerformanceTelemetryContext,
 ): ExecuteResult<ProtocolFrame<ResponsesStreamEvent>> =>
-  openAiErrorResult(400, error.message, { param: error.param ?? 'input', code: null });
+  openAiErrorResult(400, error.message, { param: error.param ?? 'input', code: null }, performance);
 
 export const renderResponsesFailure = (
   failure: ChatServeFailure,

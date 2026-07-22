@@ -1,34 +1,28 @@
 import { test, vi } from 'vitest';
 
+import { prepareResponsesAffinity } from './affinity/ingress.ts';
 import { responsesAttempt } from './attempt.ts';
-import { createStoredResponsesItemId, isStoredResponseId } from './items/format.ts';
+import { createResponsesItemId } from './items/format.ts';
 import * as outputModule from './items/output.ts';
-import { createResponsesHttpStore, createNonResponsesSourceStore } from './items/store.ts';
+import { hydrateResponsesPayload, rewriteResponsesItemsForCandidate } from './items/rewrite.ts';
+import { createResponsesHttpStore } from './items/store.ts';
 import { initRepo } from '../../../repo/index.ts';
 import { InMemoryRepo } from '../../../repo/memory.ts';
 import type { StoredResponsesItem } from '../../../repo/types.ts';
+import { mockChatGatewayCtx } from '../../../test-helpers/gateway-ctx.ts';
 import type { ChatGatewayCtx } from '../shared/gateway-ctx.ts';
+import { initExternalResourceFetcher } from '@floway-dev/platform';
+import type { ChatCompletionsPayload, ChatCompletionsStreamEvent } from '@floway-dev/protocols/chat-completions';
 import { doneFrame, eventFrame, type ProtocolFrame } from '@floway-dev/protocols/common';
-import type { MessagesStreamEvent } from '@floway-dev/protocols/messages';
-import type { ResponsesPayload, ResponsesResult, ResponsesStreamEvent } from '@floway-dev/protocols/responses';
+import type { MessagesPayload, MessagesStreamEvent } from '@floway-dev/protocols/messages';
+import type { CanonicalResponsesPayload, ResponsesPayload, ResponsesResult, ResponsesStreamEvent } from '@floway-dev/protocols/responses';
 import { type ModelCandidate, directFetcher, type ProviderModel, type ProviderResponsesResult, type ProviderStreamResult, type ResponsesAction, type UpstreamCallOptions, type FlagId } from '@floway-dev/provider';
 import { assert, assertEquals, stubProvider, stubInternalModel, stubProviderModel } from '@floway-dev/test-utils';
-import type { CanonicalResponsesPayload } from '@floway-dev/translate/via-responses/responses-items';
 
 const API_KEY_ID = 'key_attempt_test';
 
-const makeGatewayCtx = (store?: ChatGatewayCtx['store']): ChatGatewayCtx => ({
-  apiKeyId: API_KEY_ID,
-  upstreamIds: null,
-  wantsStream: true,
-  runtimeLocation: 'TEST',
-  currentColo: 'TEST',
-  dump: null,
-  responseHeaders: new Headers(),
-  backgroundScheduler: () => {},
-  requestStartedAt: 0,
-  store: store ?? createNonResponsesSourceStore(API_KEY_ID),
-});
+const makeGatewayCtx = (store?: ChatGatewayCtx['store']) =>
+  mockChatGatewayCtx({ apiKeyId: API_KEY_ID, wantsStream: true, ...(store ? { store } : {}) });
 
 const makePayload = (overrides: Partial<CanonicalResponsesPayload> = {}): CanonicalResponsesPayload => ({
   model: 'test-model',
@@ -59,7 +53,7 @@ const makeProviderEvents = async function* (events: readonly ResponsesStreamEven
 };
 
 const makeCandidate = (
-  callResponses: (model: ProviderModel, body: Omit<ResponsesPayload, 'model'>, action: ResponsesAction, signal: AbortSignal | undefined, opts: UpstreamCallOptions) => Promise<ProviderResponsesResult>,
+  callResponses: (model: ProviderModel, body: Omit<CanonicalResponsesPayload, 'model'>, action: ResponsesAction, signal: AbortSignal | undefined, opts: UpstreamCallOptions) => Promise<ProviderResponsesResult>,
   enabledFlags: ReadonlySet<FlagId> = new Set<FlagId>(),
 ): ModelCandidate => {
   const provider = stubProvider({ callResponses });
@@ -72,7 +66,6 @@ const makeCandidate = (
       disabledPublicModelIds: [],
       modelPrefix: null,
       instance: provider,
-      supportsResponsesItemReference: true,
     },
     model: stubInternalModel({
       providerModels: { [upstream]: stubProviderModel({ enabledFlags }) },
@@ -100,21 +93,17 @@ const insertStoredItem = async (repo: InMemoryRepo, overrides: Partial<StoredRes
     apiKeyId: API_KEY_ID,
     upstreamId: null,
     upstreamItemId: null,
-    origin: 'synthetic',
-    contentHash: null,
-    encryptedContentHash: null,
-    payload: null,
+    contentHash: `hash-${overrides.id}`,
+    payload: { item: { type: overrides.itemType, id: overrides.id } },
     createdAt: 1_000,
-    refreshedAt: 1_000,
     ...overrides,
   };
   await repo.responsesItems.insertMany([row]);
   return row;
 };
 
-test('generate native success wraps the upstream event stream once', async () => {
+test('generate native success leaves source-edge state ownership to the caller', async () => {
   installRepo();
-  const wrapSpy = vi.spyOn(outputModule, 'wrapResponsesOutputForStorage');
 
   const completedEvent: ResponsesStreamEvent = {
     type: 'response.completed',
@@ -131,7 +120,6 @@ test('generate native success wraps the upstream event stream once', async () =>
   const candidate = makeCandidate(callResponses);
   const store = createResponsesHttpStore(API_KEY_ID, true);
   const ctx = makeGatewayCtx(store);
-  const commitSpy = vi.spyOn(store, 'commitSnapshot').mockResolvedValue();
 
   const result = await responsesAttempt.generate({
     payload: makePayload(),
@@ -143,64 +131,52 @@ test('generate native success wraps the upstream event stream once', async () =>
   assertEquals(result.type, 'events');
   if (result.type !== 'events') throw new Error('unreachable');
 
-  // Drain so the wrapped pipeline runs and storage callbacks fire.
   const events = await collectEvents(result.events);
   assert(events.length >= 1, 'expected at least the response.completed event');
 
   assertEquals(callResponses.mock.calls.length, 1);
-  assertEquals(wrapSpy.mock.calls.length, 1);
-  const wrapArgs = wrapSpy.mock.calls[0][1];
-  assertEquals(wrapArgs.upstream, 'up_test');
-  assertEquals(wrapArgs.targetApi, 'responses');
-  // The upstream emitted no compaction-shape item, so wrap derived 'append'.
-  assertEquals(commitSpy.mock.calls.length, 1);
-  assertEquals(commitSpy.mock.calls[0][1], 'append');
-
-  wrapSpy.mockRestore();
 });
 
-test('generate derives snapshotMode=replace when the upstream emits a compaction output item', async () => {
-  // A direct `/v1/responses` generate carrying a `compaction_trigger` input
-  // (Codex's RemoteCompactionV2) — or a `context_management` `compact_threshold`
-  // turn that triggers server-side compaction — yields a compaction-shape
-  // output envelope on the wire. Wrap observes that output and derives a
-  // 'replace' snapshot regardless of how the request was framed.
+test('generate treats a translated Responses payload as opaque to native affinity and state', async () => {
   installRepo();
-  const wrapSpy = vi.spyOn(outputModule, 'wrapResponsesOutputForStorage');
-
-  const compactionItem = {
-    type: 'compaction',
-    id: 'cmp_trigger',
-    encrypted_content: 'ENC',
-  };
-  const compactionResponse: ResponsesResult = {
-    ...makeResponsesResult(),
-    object: 'response.compaction',
-    output: [compactionItem] as unknown as ResponsesResult['output'],
-  };
-  const completedEvent: ResponsesStreamEvent = {
-    type: 'response.completed',
-    sequence_number: 0,
-    response: compactionResponse,
-  };
-  const callResponses = vi.fn(async (): Promise<ProviderResponsesResult> => ({
-    action: 'generate', ok: true,
-    events: makeProviderEvents([completedEvent]),
-    modelKey: 'test-model-key',
-    headers: new Headers(),
-  }));
-
+  let observedBody: Omit<CanonicalResponsesPayload, 'model'> | undefined;
+  const callResponses = vi.fn(async (
+    _model: ProviderModel,
+    body: Omit<CanonicalResponsesPayload, 'model'>,
+  ): Promise<ProviderResponsesResult> => {
+    observedBody = body;
+    return {
+      action: 'generate',
+      ok: true,
+      events: makeProviderEvents([{
+        type: 'response.completed',
+        sequence_number: 0,
+        response: makeResponsesResult(),
+      }]),
+      modelKey: 'test-model-key',
+      headers: new Headers(),
+    };
+  });
   const candidate = makeCandidate(callResponses);
   const store = createResponsesHttpStore(API_KEY_ID, true);
-  const commitSpy = vi.spyOn(store, 'commitSnapshot').mockResolvedValue();
+  const ctx = makeGatewayCtx(store);
+  const carrier = await ctx.affinity.codec.wrap(
+    undefined,
+    {
+      upstreamId: candidate.provider.upstream,
+      modelId: candidate.model.id,
+    },
+    'responses.reasoning.encrypted_content',
+  );
+  const unwrap = vi.spyOn(ctx.affinity.codec, 'unwrap');
+  const getStoredItem = vi.spyOn(store, 'getItemById');
+  const itemId = createResponsesItemId('reasoning');
 
   const result = await responsesAttempt.generate({
     payload: makePayload({
-      input: [
-        { type: 'message', role: 'user', content: 'kept message' },
-      ],
+      input: [{ type: 'reasoning', id: itemId, summary: [], encrypted_content: carrier }],
     }),
-    ctx: makeGatewayCtx(store),
+    ctx,
     candidate,
     headers: new Headers(),
   });
@@ -208,62 +184,147 @@ test('generate derives snapshotMode=replace when the upstream emits a compaction
   assertEquals(result.type, 'events');
   if (result.type !== 'events') throw new Error('unreachable');
   await collectEvents(result.events);
-
-  assertEquals(wrapSpy.mock.calls.length, 1);
-  assertEquals(commitSpy.mock.calls.length, 1);
-  assertEquals(commitSpy.mock.calls[0][1], 'replace');
-
-  wrapSpy.mockRestore();
+  assertEquals(unwrap.mock.calls.length, 0);
+  assertEquals(getStoredItem.mock.calls.length, 0);
+  assertEquals(observedBody?.input, [{ type: 'reasoning', id: itemId, summary: [], encrypted_content: carrier }]);
 });
 
-test('generate returns failure when rewrite throws item-not-found', async () => {
+test('generate applies role compatibility flags in target-chain order', async () => {
   installRepo();
-  const callResponses = vi.fn(async (): Promise<ProviderResponsesResult> => {
-    throw new Error('callResponses should not be called when rewrite fails');
+  let observedBody: Omit<ResponsesPayload, 'model'> | undefined;
+  const callResponses = vi.fn(async (
+    _model: ProviderModel,
+    body: Omit<ResponsesPayload, 'model'>,
+  ): Promise<ProviderResponsesResult> => {
+    observedBody = body;
+    return {
+      action: 'generate',
+      ok: true,
+      events: makeProviderEvents([{
+        type: 'response.completed',
+        sequence_number: 0,
+        response: makeResponsesResult(),
+      }]),
+      modelKey: 'test-model-key',
+      headers: new Headers(),
+    };
   });
-  const candidate = makeCandidate(callResponses);
-  // Force `supportsResponsesItemReference: false` so a stored row with no
-  // inline payload triggers the rewrite-side throw.
-  candidate.provider.supportsResponsesItemReference = false;
-
-  const missingId = createStoredResponsesItemId('message');
-  // Pre-seed the store cache: a row with no inline payload, referenced as
-  // `item_reference`. The store will resolve the id, and rewrite will throw
-  // because the candidate cannot accept `item_reference`.
-  const store = createResponsesHttpStore(API_KEY_ID, true);
-  // Insert into the underlying repo so `loadInputItems` populates the cache.
-  // The store uses `getRepo()` lazily, so the repo installed via `installRepo`
-  // already feeds this lookup.
-  const repo = installRepo();
-  await insertStoredItem(repo, { id: missingId, itemType: 'message', payload: null });
-  await store.loadInputItems({
-    sourceItems: [{ type: 'item_reference' as const, id: missingId }],
-    view: {
-      visitAsResponsesItems: async (items, visit) => {
-        for (const item of items as readonly { id: string }[]) await visit({ type: 'item_reference', id: item.id });
-      },
-    },
-  });
+  const candidate = makeCandidate(callResponses, new Set([
+    'demote-developer-to-system',
+    'demote-interleaved-system-to-user',
+    'promote-system-to-developer',
+  ]));
 
   const result = await responsesAttempt.generate({
-    payload: makePayload({ input: [{ type: 'item_reference', id: missingId }] }),
-    ctx: makeGatewayCtx(store),
+    payload: makePayload({
+      input: [
+        { type: 'message', role: 'system', content: 'base instructions' },
+        { type: 'message', role: 'user', content: 'hello' },
+        { type: 'message', role: 'system', content: 'inline instructions' },
+      ],
+    }),
+    ctx: makeGatewayCtx(createResponsesHttpStore(API_KEY_ID, false)),
     candidate,
     headers: new Headers(),
   });
 
-  assertEquals(result.type, 'api-error');
-  if (result.type !== 'api-error') throw new Error('unreachable');
-  assertEquals(result.status, 404);
-  const body = JSON.parse(new TextDecoder().decode(result.body));
-  assertEquals(body.error.code, null);
-  assertEquals(body.error.message, `Item with id '${missingId}' not found.`);
-  assertEquals(callResponses.mock.calls.length, 0);
+  assertEquals(result.type, 'events');
+  if (result.type !== 'events') throw new Error('unreachable');
+  await collectEvents(result.events);
+  assertEquals(observedBody?.input, [
+    { type: 'message', role: 'system', content: 'base instructions' },
+    { type: 'message', role: 'user', content: 'hello' },
+    { type: 'message', role: 'user', content: 'inline instructions' },
+  ]);
+});
+
+test('generate defers role promotion until after translation to Chat Completions', async () => {
+  installRepo();
+  let observedBody: Omit<ChatCompletionsPayload, 'model'> | undefined;
+  const callChatCompletions = vi.fn(async (
+    _model: ProviderModel,
+    body: Omit<ChatCompletionsPayload, 'model'>,
+  ): Promise<ProviderStreamResult<ChatCompletionsStreamEvent>> => {
+    observedBody = body;
+    return {
+      ok: true,
+      events: (async function* () {
+        yield eventFrame<ChatCompletionsStreamEvent>({
+          id: 'chatcmpl_test',
+          object: 'chat.completion.chunk',
+          created: 0,
+          model: 'test-model',
+          choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+        });
+        yield eventFrame<ChatCompletionsStreamEvent>({
+          id: 'chatcmpl_test',
+          object: 'chat.completion.chunk',
+          created: 0,
+          model: 'test-model',
+          choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: null }],
+        });
+        yield eventFrame<ChatCompletionsStreamEvent>({
+          id: 'chatcmpl_test',
+          object: 'chat.completion.chunk',
+          created: 0,
+          model: 'test-model',
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+        });
+        yield doneFrame();
+      })(),
+      modelKey: 'test-model-key',
+      headers: new Headers(),
+    };
+  });
+  const upstream = 'up_chat';
+  const endpoints = { chatCompletions: {} };
+  const candidate: ModelCandidate = {
+    provider: {
+      upstream,
+      kind: 'custom',
+      name: upstream,
+      disabledPublicModelIds: [],
+      modelPrefix: null,
+      instance: stubProvider({ callChatCompletions }),
+    },
+    model: stubInternalModel({
+      endpoints,
+      providerModels: {
+        [upstream]: stubProviderModel({
+          endpoints,
+          enabledFlags: new Set(['promote-system-to-developer']),
+        }),
+      },
+    }, upstream),
+    fetcher: directFetcher,
+  };
+
+  const result = await responsesAttempt.generate({
+    payload: makePayload({
+      input: [
+        { type: 'message', role: 'system', content: 'base instructions' },
+        { type: 'message', role: 'user', content: 'hello' },
+        { type: 'message', role: 'system', content: 'inline instructions' },
+      ],
+    }),
+    ctx: makeGatewayCtx(createResponsesHttpStore(API_KEY_ID, false)),
+    candidate,
+    headers: new Headers(),
+  });
+
+  assertEquals(result.type, 'events');
+  if (result.type !== 'events') throw new Error('unreachable');
+  await collectEvents(result.events);
+  assertEquals(observedBody?.messages, [
+    { role: 'developer', content: 'base instructions' },
+    { role: 'user', content: 'hello' },
+    { role: 'developer', content: 'inline instructions' },
+  ]);
 });
 
 test('generate passes non-events provider result through unchanged', async () => {
   installRepo();
-  const wrapSpy = vi.spyOn(outputModule, 'wrapResponsesOutputForStorage');
+  const wrapSpy = vi.spyOn(outputModule, 'wrapResponsesClientOutput');
 
   const upstreamResponse = new Response(JSON.stringify({ error: { message: 'nope' } }), { status: 502, headers: new Headers({ 'content-type': 'application/json' }) });
   const callResponses = vi.fn(async (): Promise<ProviderResponsesResult> => ({
@@ -288,9 +349,8 @@ test('generate passes non-events provider result through unchanged', async () =>
   wrapSpy.mockRestore();
 });
 
-test('compact reshapes the trigger turn into a result and derives snapshotMode=replace from the synthesized envelope', async () => {
+test('compact returns the clean upstream result for source-edge affinity and storage', async () => {
   installRepo();
-  const wrapSpy = vi.spyOn(outputModule, 'wrapResponsesOutputForStorage');
 
   // Native /responses/compact returns a fully-shaped compaction envelope —
   // the `action: 'compact'` branch of `provider.callResponses` does the
@@ -311,14 +371,13 @@ test('compact reshapes the trigger turn into a result and derives snapshotMode=r
     output: [compactionItem] as unknown as ResponsesResult['output'],
   };
 
-  const callResponses = vi.fn(async (_model: ProviderModel, _body: Omit<ResponsesPayload, 'model'>, action: ResponsesAction): Promise<ProviderResponsesResult> => {
+  const callResponses = vi.fn(async (_model: ProviderModel, _body: Omit<CanonicalResponsesPayload, 'model'>, action: ResponsesAction): Promise<ProviderResponsesResult> => {
     if (action !== 'compact') throw new Error(`compact candidate received action='${action}'`);
     return { action: 'compact', ok: true, result: compactionResult, modelKey: 'test-model-key' };
   });
 
   const candidate = makeCandidate(callResponses);
   const store = createResponsesHttpStore(API_KEY_ID, true);
-  const commitSpy = vi.spyOn(store, 'commitSnapshot').mockResolvedValue();
   const result = await responsesAttempt.invoke({
     payload: makePayload({
       input: [
@@ -336,30 +395,25 @@ test('compact reshapes the trigger turn into a result and derives snapshotMode=r
   assertEquals(result.result.object, 'response.compaction');
   assertEquals(result.result.output.length, 1);
   assertEquals((result.result.output[0] as { id: string }).id, 'cmp_1');
-  // The compact result wears a Floway-minted response id, not the upstream's
-  // — same id wrap committed the snapshot under.
-  assert(isStoredResponseId(result.result.id));
-
-  // wrap-output-storage runs exactly once on the synthesized compaction
-  // events; the compaction item in the output drives commitSnapshot('replace').
-  assertEquals(wrapSpy.mock.calls.length, 1);
-  assertEquals(wrapSpy.mock.calls[0][1].targetApi, 'responses');
-  assertEquals(commitSpy.mock.calls.length, 1);
-  assertEquals(commitSpy.mock.calls[0][1], 'replace');
-
-  wrapSpy.mockRestore();
+  assertEquals(result.result.id, compactionResult.id);
 });
 
 // In-attempt test asserting the narrow header-inheritance contract: when an
 // outer protocol passes invocation headers, the translated Messages call sees
 // them on the wire.
-test('generate inherits invocation headers across translation to Messages', async () => {
+test('generate inherits headers and injects external image loading across translation to Messages', async () => {
   installRepo();
+  initExternalResourceFetcher(url => {
+    assertEquals(url.href, 'https://example.com/image.png');
+    return Promise.resolve(new Response(Uint8Array.of(1, 2, 3), { headers: { 'content-type': 'image/png' } }));
+  });
   let observedHeaders: Headers | undefined;
+  let observedBody: Omit<MessagesPayload, 'model'> | undefined;
   const upstreamModel = stubInternalModel({ endpoints: { messages: {} } }, 'up_test');
   const messagesProvider = stubProvider({
-    callMessages: async (_model, _body, _signal, opts): Promise<ProviderStreamResult<MessagesStreamEvent>> => {
+    callMessages: async (_model, body, _signal, opts): Promise<ProviderStreamResult<MessagesStreamEvent>> => {
       observedHeaders = opts.headers;
+      observedBody = body as Omit<MessagesPayload, 'model'>;
       return {
         ok: true,
         events: (async function* () {
@@ -382,14 +436,20 @@ test('generate inherits invocation headers across translation to Messages', asyn
   const candidate: ModelCandidate = {
     provider: {
       upstream: 'up_test', kind: 'custom', name: 'up_test',
-      disabledPublicModelIds: [], modelPrefix: null, instance: messagesProvider, supportsResponsesItemReference: true,
+      disabledPublicModelIds: [], modelPrefix: null, instance: messagesProvider,
     },
     model: upstreamModel,
     fetcher: directFetcher,
   };
 
   const result = await responsesAttempt.generate({
-    payload: makePayload(),
+    payload: makePayload({
+      input: [{
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_image', image_url: 'https://example.com/image.png', detail: 'auto' }],
+      }],
+    }),
     ctx: makeGatewayCtx(createResponsesHttpStore(API_KEY_ID, true)),
     candidate,
     headers: new Headers({ 'x-test': 'abc' }),
@@ -398,6 +458,11 @@ test('generate inherits invocation headers across translation to Messages', asyn
   if (result.type !== 'events') throw new Error('unreachable');
   await collectEvents(result.events);
   assertEquals(observedHeaders?.get('x-test'), 'abc');
+  const message = observedBody?.messages[0];
+  assert(message?.role === 'user' && Array.isArray(message.content));
+  const image = message.content.find(block => block.type === 'image');
+  assert(image?.type === 'image');
+  assertEquals(image.source, { type: 'base64', media_type: 'image/png', data: 'AQID' });
 });
 
 test('generate seeds privatePayload before interceptors so the web-search shim replays the prior wsc results on echo', async () => {
@@ -409,10 +474,10 @@ test('generate seeds privatePayload before interceptors so the web-search shim r
   // placeholder.
   //
   // The wire shape we model here:
-  //   - row.id = stored gateway id (`ws_<crc>_<body>`) — wrapResponsesOutputForStorage
+  //   - row.id = stored gateway id (`ws_<crc>_<body>`) — wrapResponsesClientOutput
   //     emits this on the wire and clients echo it back as `wsc.id`.
-  //   - payload.item.id = the original `ws_gw_` wire id the shim synthesized
-  //     on turn 1; beginAttempt keys privatePayload by it after inline expansion.
+  //   - payload.item.id = the stored client-visible id; this gateway-generated
+  //     item has no native upstream id to restore.
   //   - payload.private = WebSearchCallPrivatePayload (v:1, functionCallItem, ir).
   //
   // This regression caught a prior ordering bug where rewrite + beginAttempt
@@ -420,19 +485,18 @@ test('generate seeds privatePayload before interceptors so the web-search shim r
   // so privatePayload was always empty when the shim looked it up, and
   // every echoed wsc collapsed to the placeholder.
   const repo = installRepo();
-  const storedId = createStoredResponsesItemId('web_search_call');
-  const wireId = 'ws_gw_72927da0b19d48aa874e9937';
+  const storedId = createResponsesItemId('web_search_call');
+  const storedItem = {
+    type: 'web_search_call' as const,
+    id: storedId,
+    status: 'completed' as const,
+    action: { type: 'search' as const, query: 'deepseek v4', queries: ['deepseek v4'] },
+  };
   await insertStoredItem(repo, {
     id: storedId,
     itemType: 'web_search_call',
-    origin: 'synthetic',
     payload: {
-      item: {
-        type: 'web_search_call',
-        id: wireId,
-        status: 'completed',
-        action: { type: 'search', query: 'deepseek v4', queries: ['deepseek v4'] },
-      },
+      item: storedItem,
       private: {
         v: 1,
         functionCallItem: {
@@ -469,31 +533,45 @@ test('generate seeds privatePayload before interceptors so the web-search shim r
   const candidate = makeCandidate(callResponses, new Set(['responses-web-search-shim']));
 
   const store = createResponsesHttpStore(API_KEY_ID, true);
-  await store.loadInputItems({
-    sourceItems: [{ id: storedId } as unknown as { id: string }],
-    view: {
-      visitAsResponsesItems: async (items, visit) => {
-        for (const item of items as readonly { id: string }[]) {
-          await visit({ type: 'web_search_call', id: item.id } as unknown as never);
-        }
-      },
+  await store.loadInputItems([{ type: 'web_search_call', id: storedId }], []);
+  const ctx = makeGatewayCtx(store);
+  const carrier = await ctx.affinity.codec.wrap(
+    undefined,
+    {
+      upstreamId: candidate.provider.upstream,
+      modelId: candidate.model.id,
     },
-  });
+    'responses.reasoning.encrypted_content',
+  );
 
+  const sourcePayload = makePayload({
+    input: [
+      { type: 'message', role: 'user', content: 'follow-up' },
+      { type: 'reasoning', id: 'rs_affinity', summary: [], encrypted_content: carrier },
+      {
+        type: 'web_search_call',
+        id: storedId,
+        status: 'completed',
+        action: { type: 'search', queries: ['deepseek v4'] },
+      } as unknown as never,
+    ],
+    tools: [{ type: 'web_search' }],
+  });
+  await store.loadInputItems(sourcePayload.input, sourcePayload.input);
+  const hydrated = hydrateResponsesPayload(sourcePayload, store);
+  const affinity = await prepareResponsesAffinity(hydrated.payload, ctx.affinity.codec);
+  const rewritten = rewriteResponsesItemsForCandidate(
+    affinity.payloadForCandidate(candidate),
+    hydrated.privatePayloads,
+    store,
+    candidate,
+  );
   const result = await responsesAttempt.generate({
-    payload: makePayload({
-      input: [
-        { type: 'message', role: 'user', content: 'follow-up' },
-        {
-          type: 'web_search_call',
-          id: storedId,
-          status: 'completed',
-          action: { type: 'search', queries: ['deepseek v4'] },
-        } as unknown as never,
-      ],
-      tools: [{ type: 'web_search' }],
-    }),
-    ctx: makeGatewayCtx(store),
+    payload: rewritten.payload,
+    sourceState: {
+      privatePayloads: rewritten.privatePayloads,
+    },
+    ctx,
     candidate,
     headers: new Headers(),
   });

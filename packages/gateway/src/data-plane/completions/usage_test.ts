@@ -1,4 +1,4 @@
-import { test } from 'vitest';
+import { expect, test } from 'vitest';
 
 import { tokenUsageFromCompletionsUsage } from './usage.ts';
 import { assertEquals } from '@floway-dev/test-utils';
@@ -13,7 +13,7 @@ test('tokenUsageFromCompletionsUsage maps the OpenAI bare shape to bare input + 
 test('tokenUsageFromCompletionsUsage splits prompt_tokens into cache_read + bare input when prompt_tokens_details.cached_tokens is populated', () => {
   // vLLM, llama.cpp, Fireworks, OpenRouter, xAI Grok all populate this on
   // /v1/completions; the cache_read tokens come out of the bare input bucket
-  // so the two input dimensions stay disjoint.
+  // so the two input metrics stay disjoint.
   assertEquals(
     tokenUsageFromCompletionsUsage(
       { prompt_tokens: 100, completion_tokens: 7, total_tokens: 107, prompt_tokens_details: { cached_tokens: 80 } },
@@ -44,6 +44,14 @@ test('tokenUsageFromCompletionsUsage reads the flat top-level cached_tokens (Moo
     ),
     { input: 18, input_cache_read: 32, output: 3 },
   );
+});
+
+test.each([
+  { prompt_tokens: 40, completion_tokens: 1, total_tokens: 41, prompt_tokens_details: { cached_tokens: 50 } },
+  { prompt_tokens: 40, completion_tokens: 1, total_tokens: 41, cached_tokens: -1 },
+  { prompt_tokens: 40, completion_tokens: 1, total_tokens: 41, prompt_cache_hit_tokens: 1.5 },
+])('tokenUsageFromCompletionsUsage rejects malformed inclusive cache counts', usage => {
+  expect(() => tokenUsageFromCompletionsUsage(usage, null)).toThrowError(RangeError);
 });
 
 test('tokenUsageFromCompletionsUsage runs serviceTier through billableServiceTier', () => {

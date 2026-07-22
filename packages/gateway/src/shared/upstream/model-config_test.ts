@@ -12,7 +12,7 @@ test('modelsField parses a full model entry', () => {
         endpoints: { chatCompletions: {}, responses: {} },
         display_name: 'GPT Prod',
         limits: { max_context_window_tokens: 128000, max_output_tokens: 4096 },
-        cost: { input: 2.5, output: 15, input_cache_read: 0.25, input_cache_write: 3.75 },
+        pricing: { entries: [{ rates: { input_tokens: '2.5', output_tokens: '15', input_cache_read_tokens: '0.25', input_cache_write_tokens: '3.75' } }] },
         flagOverrides: { 'vendor-deepseek': false },
       },
     ],
@@ -27,7 +27,7 @@ test('modelsField parses a full model entry', () => {
       endpoints: { chatCompletions: {}, responses: {} },
       display_name: 'GPT Prod',
       limits: { max_context_window_tokens: 128000, max_output_tokens: 4096 },
-      cost: { input: 2.5, output: 15, input_cache_read: 0.25, input_cache_write: 3.75 },
+      pricing: { entries: [{ rates: { input_tokens: '2.5', output_tokens: '15', input_cache_read_tokens: '0.25', input_cache_write_tokens: '3.75' } }] },
       flagOverrides: { 'vendor-deepseek': false },
     },
   ]);
@@ -104,27 +104,27 @@ test('modelsField accepts a valid kind and rejects an unknown one', () => {
   assertThrows(
     () => modelsField([{ upstreamModelId: 'm', kind: 'bogus', endpoints: { chatCompletions: {} } }], 'custom'),
     Error,
-    'Malformed custom models[0].kind: must be one of chat, embedding, image',
+    'Malformed custom models[0].kind: must be one of chat, embedding, image, rerank',
   );
 });
 
-test('modelsField accepts cost with only a subset of dimensions set', () => {
+test('modelsField accepts pricing with only a subset of metrics set', () => {
   const models = modelsField(
-    [{ upstreamModelId: 'gpt-prod', endpoints: { chatCompletions: {} }, cost: { input: 2.5 } }],
+    [{ upstreamModelId: 'gpt-prod', endpoints: { chatCompletions: {} }, pricing: { entries: [{ rates: { input_tokens: '2.5' } }] } }],
     'azure',
   );
-  assertEquals(models[0].cost, { input: 2.5 });
+  assertEquals(models[0].pricing, { entries: [{ rates: { input_tokens: '2.5' } }] });
 });
 
-test('modelsField rejects cost with a negative input', () => {
+test('modelsField rejects pricing with a negative input', () => {
   assertThrows(
     () =>
       modelsField(
-        [{ upstreamModelId: 'gpt-prod', endpoints: { chatCompletions: {} }, cost: { input: -1, output: 1 } }],
+        [{ upstreamModelId: 'gpt-prod', endpoints: { chatCompletions: {} }, pricing: { entries: [{ rates: { input_tokens: '-1', output_tokens: '1' } }] } }],
         'azure',
       ),
     Error,
-    'Malformed azure models[0].cost.input: must be a finite non-negative number',
+    'pricing.entries[0].rates.input_tokens must be non-negative',
   );
 });
 

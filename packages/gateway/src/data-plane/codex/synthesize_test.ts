@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
 
-import type { CatalogModel } from './catalog.ts';
+import type { CatalogModel, CodexCatalogCapabilities } from './catalog.ts';
 import { synthesizeCatalogEntry } from './synthesize.ts';
 import type { InternalModel } from '@floway-dev/provider';
 
@@ -11,6 +11,10 @@ const base: InternalModel = {
   limits: { max_context_window_tokens: 128000 },
   endpoints: { chatCompletions: {} },
   providerModels: {},
+};
+
+const ultraCapabilities: CodexCatalogCapabilities = {
+  ultraReasoningLevel: { effort: 'ultra', description: 'Maximum reasoning with automatic task delegation' },
 };
 
 describe('synthesizeCatalogEntry', () => {
@@ -93,6 +97,31 @@ describe('synthesizeCatalogEntry', () => {
     expect(entry.default_reasoning_level).toBe('low');
   });
 
+  test('does not infer Ultra support from Max alone', () => {
+    const entry = synthesizeCatalogEntry({
+      ...base,
+      chat: { reasoning: { effort: { supported: ['low', 'max'], default: 'low' } } },
+    });
+    expect(entry.supported_reasoning_levels).toEqual([
+      { effort: 'low', description: '' },
+      { effort: 'max', description: '' },
+    ]);
+    expect(entry.multi_agent_version).toBeUndefined();
+  });
+
+  test('adds Ultra and multi-agent v2 when the client supports Ultra and the model supports Max', () => {
+    const entry = synthesizeCatalogEntry({
+      ...base,
+      chat: { reasoning: { effort: { supported: ['low', 'max'], default: 'low' } } },
+    }, undefined, ultraCapabilities);
+    expect(entry.supported_reasoning_levels).toEqual([
+      { effort: 'low', description: '' },
+      { effort: 'max', description: '' },
+      { effort: 'ultra', description: 'Maximum reasoning with automatic task delegation' },
+    ]);
+    expect(entry.multi_agent_version).toBe('v2');
+  });
+
   test('drops budget_tokens silently — no effort fields on output', () => {
     const entry = synthesizeCatalogEntry({
       ...base,
@@ -129,15 +158,15 @@ describe('synthesizeCatalogEntry', () => {
     expect(entry.default_reasoning_level).toBe('medium');
   });
 
-  test('service_tiers derived from cost.tiers keys', () => {
+  test('service_tiers derived from pricing.entries keys', () => {
     const entry = synthesizeCatalogEntry({
       ...base,
-      cost: { tiers: { fast: { input: 1 } } },
+      pricing: { entries: [{ rates: { input_tokens: '1' } }, { selector: { serviceTier: 'fast' }, rates: { input_tokens: '1' } }] },
     });
     expect(entry.service_tiers).toEqual([{ id: 'fast', name: 'fast', description: '' }]);
   });
 
-  test('service_tiers empty when no cost.tiers', () => {
+  test('service_tiers empty when no pricing.entries', () => {
     const entry = synthesizeCatalogEntry(base);
     expect(entry.service_tiers).toEqual([]);
   });
@@ -145,7 +174,7 @@ describe('synthesizeCatalogEntry', () => {
   test('service_tiers preserves key order for multiple tiers', () => {
     const entry = synthesizeCatalogEntry({
       ...base,
-      cost: { tiers: { flex: { input: 1 }, priority: { input: 2 } } },
+      pricing: { entries: [{ rates: { input_tokens: '1' } }, { selector: { serviceTier: 'flex' }, rates: { input_tokens: '1' } }, { selector: { serviceTier: 'priority' }, rates: { input_tokens: '2' } }] },
     });
     expect(entry.service_tiers).toEqual([
       { id: 'flex', name: 'flex', description: '' },
@@ -223,6 +252,22 @@ describe('synthesizeCatalogEntry', () => {
       expect(entry.default_reasoning_level).toBe('high');
     });
 
+    test('preserves an existing Ultra preset without duplication', () => {
+      const entry = synthesizeCatalogEntry(base, {
+        ...bundledBase,
+        supported_reasoning_levels: [
+          { effort: 'max', description: 'Maximum' },
+          { effort: 'ultra', description: 'Existing Ultra' },
+        ],
+        multi_agent_version: 'v1',
+      });
+      expect(entry.supported_reasoning_levels).toEqual([
+        { effort: 'max', description: 'Maximum' },
+        { effort: 'ultra', description: 'Existing Ultra' },
+      ]);
+      expect(entry.multi_agent_version).toBe('v1');
+    });
+
     test('bundled context_window preserved when registry omits max_context_window_tokens', () => {
       const entry = synthesizeCatalogEntry({ ...base, limits: {} }, bundledBase);
       expect(entry.context_window).toBe(272_000);
@@ -240,9 +285,9 @@ describe('synthesizeCatalogEntry', () => {
 
     test('service_tiers is a hard override — bundled tiers do not survive when registry has none', () => {
       // Bundled entries may advertise OpenAI 1p tiers Floway cannot bill;
-      // publishing them without registry-side unit prices would surface a
+      // publishing them without registry-side prices would surface a
       // toggle we could not honor. Registry-derived tiers (from
-      // model.cost.tiers) always win, even when the registry list is empty.
+      // model.pricing.entries) always win, even when the registry list is empty.
       const entry = synthesizeCatalogEntry(base, bundledBase);
       expect(entry.service_tiers).toEqual([]);
     });
@@ -250,7 +295,7 @@ describe('synthesizeCatalogEntry', () => {
     test('service_tiers picks up the registry-configured tiers', () => {
       const entry = synthesizeCatalogEntry({
         ...base,
-        cost: { tiers: { fast: { input: 1 } } },
+        pricing: { entries: [{ rates: { input_tokens: '1' } }, { selector: { serviceTier: 'fast' }, rates: { input_tokens: '1' } }] },
       }, bundledBase);
       expect(entry.service_tiers).toEqual([{ id: 'fast', name: 'fast', description: '' }]);
     });

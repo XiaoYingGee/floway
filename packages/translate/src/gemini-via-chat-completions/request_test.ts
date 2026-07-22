@@ -4,6 +4,22 @@ import { buildTargetRequest } from './request.ts';
 import { assertEquals, assertThrows } from '../test-assert.ts';
 import type { GeminiContent, GeminiPayload } from '@floway-dev/protocols/gemini';
 
+test('buildTargetRequest forwards an empty thinkingLevel verbatim', () => {
+  const request = buildTargetRequest({
+    generationConfig: { thinkingConfig: { thinkingLevel: '' } },
+  }, 'gpt-test');
+
+  assertEquals(request.reasoning_effort, '');
+});
+
+test('buildTargetRequest gives thinkingBudget precedence over an empty thinkingLevel', () => {
+  const request = buildTargetRequest({
+    generationConfig: { thinkingConfig: { thinkingBudget: 2048, thinkingLevel: '' } },
+  }, 'gpt-test');
+
+  assertEquals(request.reasoning_effort, 'low');
+});
+
 test('buildTargetRequest maps system instruction and multimodal user content', () => {
   const payload: GeminiPayload = {
     systemInstruction: {
@@ -41,7 +57,7 @@ test('buildTargetRequest maps function calls, tool responses, and reasoning hist
     contents: [
       {
         role: 'model',
-        parts: [{ text: 'private trace', thought: true, thoughtSignature: 'sig_1' }, { text: 'I will call a tool.' }, { functionCall: { name: 'lookup', args: { query: 'docs' } } }],
+        parts: [{ text: 'private trace', thought: true, thoughtSignature: 'sig_old' }, { text: 'I will call a tool.', thoughtSignature: 'sig_1' }, { functionCall: { name: 'lookup', args: { query: 'docs' } } }],
       },
       {
         role: 'user',

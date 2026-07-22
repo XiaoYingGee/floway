@@ -4,15 +4,15 @@
 //   2. Anthropic:    { data: [{ type: 'model', id, display_name?, created_at? }],
 //                      has_more, first_id, last_id }     (no top-level `object`)
 //   3. OpenAI/Anthropic superset with optional display_name, created_at,
-//      limits, cost, kind on the model and a `data` array on the container.
+//      limits, pricing, kind on the model and a `data` array on the container.
 //
 // A model is admitted if it has a string `id`; everything else is best-
 // effort metadata. The container is admitted if `data` is an array.
 
 import type { CustomUpstreamConfig } from './config.ts';
 import { customFetchModels } from './fetch.ts';
-import { BILLING_DIMENSIONS, type ModelKind, type ModelPricing } from '@floway-dev/protocols/common';
-import { chatField, fetchUpstreamModels, type Fetcher, type UpstreamChatModelConfig } from '@floway-dev/provider';
+import { BILLING_METRICS, canonicalizePricingSelector, type BillingMetric, type ModelKind, type ModelPricing, parseNonNegativeDecimalString, type PriceVector, type PricingSelector, validateModelPricing } from '@floway-dev/protocols/common';
+import { chatField, fetchUpstreamModels, type Fetcher, type UpstreamChatModelConfig, identityWrapUpstreamCall } from '@floway-dev/provider';
 
 export interface CustomRawModel {
   id: string;
@@ -30,7 +30,7 @@ export interface CustomRawModel {
     max_context_window_tokens?: number;
     max_prompt_tokens?: number;
   };
-  cost?: ModelPricing;
+  pricing?: ModelPricing;
   // Optional ModelKind published by Floway upstreams; absent on plain
   // OpenAI-compat upstreams.
   kind?: ModelKind;
@@ -61,20 +61,39 @@ const parseLimits = (value: unknown): CustomRawModel['limits'] => {
   return Object.keys(limits).length > 0 ? limits : undefined;
 };
 
-const parseCost = (value: unknown): ModelPricing | undefined => {
-  // Admit any subset of billing dimensions advertised on the upstream's
-  // /v1/models cost block; drop the whole block when none are present.
-  if (!isRecord(value)) return undefined;
-  const cost: ModelPricing = {};
-  for (const dimension of BILLING_DIMENSIONS) {
-    const rate = optionalNumberField(value[dimension]);
-    if (rate !== undefined) cost[dimension] = rate;
+const parsePricing = (value: unknown): ModelPricing | undefined => {
+  // Pricing is best-effort catalog metadata: malformed pricing omits only the pricing
+  // block, never the enclosing model or the rest of the catalog.
+  if (!isRecord(value) || !Array.isArray(value.entries)) return undefined;
+  try {
+    if (Object.keys(value).some(key => key !== 'entries')) throw new TypeError('Malformed pricing block');
+    const entries: ModelPricing['entries'][number][] = [];
+    for (const rawEntry of value.entries) {
+      if (!isRecord(rawEntry) || !isRecord(rawEntry.rates)) throw new TypeError('Malformed pricing entry');
+      if (Object.keys(rawEntry).some(key => key !== 'selector' && key !== 'rates')) throw new TypeError('Malformed pricing entry');
+      if (Object.keys(rawEntry.rates).some(key => !BILLING_METRICS.includes(key as BillingMetric))) throw new TypeError('Malformed pricing rates');
+      const rates: PriceVector = {};
+      for (const metric of BILLING_METRICS) {
+        const rawRate = rawEntry.rates[metric];
+        if (rawRate === undefined) continue;
+        rates[metric] = parseNonNegativeDecimalString(rawRate, `pricing rate ${metric}`);
+      }
+      if (Object.keys(rates).length === 0) throw new TypeError('Pricing entry has no recognized rates');
+      if (rawEntry.selector !== undefined && !isRecord(rawEntry.selector)) throw new TypeError('Malformed pricing selector');
+      const selector = canonicalizePricingSelector(rawEntry.selector as PricingSelector | undefined);
+      entries.push({ ...(Object.keys(selector).length > 0 ? { selector } : {}), rates });
+    }
+    if (entries.length === 0) return undefined;
+    const pricing = { entries };
+    validateModelPricing(pricing);
+    return pricing;
+  } catch {
+    return undefined;
   }
-  return Object.keys(cost).length > 0 ? cost : undefined;
 };
 
 const parseKind = (value: unknown): ModelKind | undefined => {
-  if (value === 'chat' || value === 'embedding' || value === 'image') return value;
+  if (value === 'chat' || value === 'embedding' || value === 'image' || value === 'rerank') return value;
   return undefined;
 };
 
@@ -94,8 +113,8 @@ const parseRawModel = (value: unknown): CustomRawModel | null => {
   if (owned_by !== undefined) model.owned_by = owned_by;
   const limits = parseLimits(value.limits);
   if (limits !== undefined) model.limits = limits;
-  const cost = parseCost(value.cost);
-  if (cost !== undefined) model.cost = cost;
+  const pricing = parsePricing(value.pricing);
+  if (pricing !== undefined) model.pricing = pricing;
   const kind = parseKind(value.kind);
   if (kind !== undefined) model.kind = kind;
   // Attempt to parse chat metadata; silently skip on malformed data.
@@ -118,6 +137,6 @@ const parseCustomModelsResponse = (value: unknown): CustomModelsResponse | null 
 
 export const fetchCustomModels = (config: CustomUpstreamConfig, fetcher: Fetcher): Promise<CustomModelsResponse> =>
   fetchUpstreamModels(
-    () => customFetchModels(config, { method: 'GET' }, { fetcher }),
+    () => customFetchModels(config, { method: 'GET' }, { fetcher, wrapUpstreamCall: identityWrapUpstreamCall }),
     parseCustomModelsResponse,
   );

@@ -18,7 +18,9 @@
 import { z } from 'zod';
 
 import { normalizeDisabledPublicModelIds } from '../repo/disabled-public-models.ts';
-import { type FlagOverrides, MODEL_PREFIX_MAX_LENGTH, MODEL_PREFIX_REGEX, parseFlagOverridesWire } from '@floway-dev/provider';
+import { CUSTOM_API_KEY_MAX_LENGTH, KEY_SOURCES } from '../shared/api-key-tokens.ts';
+import { kindForEndpoints, MODEL_KINDS, parseNonNegativeDecimalString, RERANK_PROTOCOLS } from '@floway-dev/protocols/common';
+import { type FlagOverrides, MODEL_PREFIX_MAX_LENGTH, MODEL_PREFIX_REGEX, normalizeUpstreamColor, parseFlagOverridesWire } from '@floway-dev/provider';
 
 // --- shared atoms ---
 
@@ -52,18 +54,26 @@ const modelEndpointsSchema = z.object({
   embeddings: z.object({}).optional(),
   imagesGenerations: z.object({}).optional(),
   imagesEdits: z.object({}).optional(),
+  rerank: z.object({}).optional(),
 });
 
-// Shared between base pricing and per-tier overlays so the two always carry
-// the same dimension set.
-const pricingDimensionShape = {
-  input: z.number().nonnegative().optional(),
-  output: z.number().nonnegative().optional(),
-  input_cache_read: z.number().nonnegative().optional(),
-  input_cache_write: z.number().nonnegative().optional(),
-  input_cache_write_1h: z.number().nonnegative().optional(),
-  input_image: z.number().nonnegative().optional(),
-  output_image: z.number().nonnegative().optional(),
+const priceSchema = z.string().transform((value, ctx) => {
+  try {
+    return parseNonNegativeDecimalString(value, 'price');
+  } catch (cause) {
+    ctx.issues.push({ code: 'custom', message: cause instanceof Error ? cause.message : String(cause), input: value });
+    return z.NEVER;
+  }
+});
+const pricingMetricShape = {
+  input_tokens: priceSchema.optional(),
+  output_tokens: priceSchema.optional(),
+  input_cache_read_tokens: priceSchema.optional(),
+  input_cache_write_tokens: priceSchema.optional(),
+  input_cache_write_1h_tokens: priceSchema.optional(),
+  input_image_tokens: priceSchema.optional(),
+  output_image_tokens: priceSchema.optional(),
+  rerank_searches: priceSchema.optional(),
 };
 
 // Modality arrays: both input and output require at least one entry and
@@ -129,22 +139,31 @@ const limitsSchema = z.object({
 const upstreamModelSchema = z.object({
   upstreamModelId: z.string().min(1),
   publicModelId: z.string().optional(),
-  kind: z.enum(['chat', 'embedding', 'image']).optional(),
+  kind: z.enum(MODEL_KINDS).optional(),
   endpoints: modelEndpointsSchema,
+  rerankTarget: z.object({
+    protocol: z.enum(RERANK_PROTOCOLS),
+    path: z.string().optional(),
+  }).strict().optional(),
   display_name: z.string().optional(),
-  cost: z.object({
-    ...pricingDimensionShape,
-    // See ModelPricing.tiers in @floway-dev/protocols/common for semantics.
-    // An empty overlay is legal — it declares the tier without changing any
-    // rate, so every dimension inherits base pricing.
-    tiers: z.record(z.string().min(1), z.object(pricingDimensionShape)).optional(),
-  }).optional(),
+  pricing: z.object({
+    entries: z.array(z.object({
+      selector: z.record(z.string(), z.unknown()).optional(),
+      rates: z.object(pricingMetricShape).strict(),
+    }).strict()).min(1),
+  }).strict().optional(),
   flagOverrides: flagOverridesSchema.optional(),
   limits: limitsSchema.optional(),
   chat: chatSchema.optional(),
 }).refine(
   m => m.chat === undefined || m.kind === undefined || m.kind === 'chat',
   { message: "chat metadata only allowed when kind === 'chat'", path: ['chat'] },
+).refine(
+  m => kindForEndpoints(m.endpoints) !== 'rerank' || m.rerankTarget !== undefined,
+  { message: 'rerankTarget is required when endpoints select rerank', path: ['rerankTarget'] },
+).refine(
+  m => m.rerankTarget === undefined || kindForEndpoints(m.endpoints) === 'rerank',
+  { message: 'rerankTarget is only allowed when endpoints select rerank', path: ['rerankTarget'] },
 );
 
 const customConfigSchema = z.object({
@@ -169,6 +188,9 @@ const azureConfigSchema = z.object({
   endpoint: z.string().min(1),
   apiKey: z.string().optional(),
   models: z.array(upstreamModelSchema).min(1, 'models must be a non-empty array'),
+}).refine(config => config.models.every(model => model.kind !== 'rerank'), {
+  message: 'rerank models require a custom upstream',
+  path: ['models'],
 });
 
 const ollamaConfigSchema = z.object({
@@ -177,6 +199,9 @@ const ollamaConfigSchema = z.object({
   // daemon. PATCH passes `null` to explicitly clear it.
   apiKey: z.string().nullable().optional(),
   models: z.array(upstreamModelSchema).optional(),
+}).refine(config => config.models?.every(model => model.kind !== 'rerank') !== false, {
+  message: 'rerank models require a custom upstream',
+  path: ['models'],
 });
 
 // --- auth ---
@@ -187,11 +212,12 @@ const ollamaConfigSchema = z.object({
 // JSON-parse + zod + pre-hash work is still worth bounding.
 const passwordSchema = z.string().min(1).max(1024);
 
-// Username is allowed empty so the ADMIN_KEY-only login path passes
-// validation; the login handler dispatches on the empty value.
+// Both fields are allowed empty so the blank-username login path (ADMIN_KEY
+// match, or the dev-only passwordless shortcut when ADMIN_KEY is unset)
+// passes validation; the login handler dispatches on the empty values.
 export const authLoginBody = z.object({
   username: z.string().regex(/^[a-zA-Z0-9_.\-]{0,64}$/, 'username must be 0-64 chars of [A-Za-z0-9_.-] (empty for ADMIN_KEY login)'),
-  password: passwordSchema,
+  password: z.string().max(1024),
 });
 
 // --- users ---
@@ -238,10 +264,24 @@ export const changeOwnPasswordBody = z.object({
 export const DUMP_RETENTION_MAX_SECONDS = 10 * 365 * 24 * 60 * 60;
 const dumpRetentionSecondsSchema = z.number().int().positive().max(DUMP_RETENTION_MAX_SECONDS).nullable();
 
+// `key_source` picks how the raw key on this create/rotate request is
+// produced: 'generate' means the gateway mints an sk-...T3BlbkFJ... token
+// for this write; 'custom' means the request carries the token verbatim in
+// `custom_key`. The choice is per-call — the shape is not persisted, and a
+// later rotate is free to switch styles without any state on the row.
+const keySourceShape = {
+  key_source: z.enum(KEY_SOURCES).optional(),
+  custom_key: z.string().max(CUSTOM_API_KEY_MAX_LENGTH).optional(),
+};
+
 export const createKeyBody = z.object({
   name: z.string().min(1),
   upstream_ids: upstreamIdsValueSchema.optional(),
+  dump_retention_seconds: dumpRetentionSecondsSchema.optional(),
+  ...keySourceShape,
 });
+
+export const rotateKeyBody = z.object(keySourceShape);
 
 export const updateKeyBody = z.object({
   name: z.string().min(1).optional(),
@@ -252,8 +292,8 @@ export const updateKeyBody = z.object({
 // --- upstreams ---
 
 // Per-upstream proxy fallback list. Each entry is an object with a required
-// `id` (a proxy id known to the proxies repo, or the literal `'direct'`
-// sentinel meaning "dial without a proxy") and an optional `colos` whitelist
+// `id` (a proxy id known to the proxies repo, or a built-in direct transport)
+// and an optional `colos` whitelist
 // of location tags (Cloudflare colos / the Node `RUNTIME_LOCATION` env
 // var). `colos` is intentionally not cross-checked against a known-colo list
 // — Node `RUNTIME_LOCATION` is free-form and CF adds new colos we haven't
@@ -277,6 +317,22 @@ const modelPrefixSchema = z.object({
   listed: z.array(addressableFormSchema),
 }).nullable();
 
+// Per-upstream badge color override. `null` inherits the frontend's kind
+// default. Delegates parsing entirely to `normalizeUpstreamColor` so the
+// wire accept-rules stay in one place (`@floway-dev/provider/model`);
+// widening / narrowing the accepted forms — new preset, alpha hex, etc.
+// — is a one-file change. The transform surfaces the normalizer's throw
+// as a Zod issue so the client-side error shape stays consistent with
+// the sibling flagOverridesSchema.
+const upstreamColorSchema = z.unknown().transform((value, ctx) => {
+  try {
+    return normalizeUpstreamColor(value);
+  } catch (e) {
+    ctx.issues.push({ code: 'custom', message: e instanceof Error ? e.message : String(e), input: value });
+    return z.NEVER;
+  }
+});
+
 const upstreamBaseFields = {
   name: z.string().min(1),
   enabled: z.boolean().optional(),
@@ -285,6 +341,7 @@ const upstreamBaseFields = {
   disabled_public_model_ids: disabledPublicModelIdsSchema.optional(),
   proxy_fallback_list: proxyFallbackListSchema.optional(),
   model_prefix: modelPrefixSchema.optional(),
+  color: upstreamColorSchema.optional(),
 };
 
 // Create accepts a discriminated union on `kind` for per-provider config
@@ -323,6 +380,7 @@ export const updateUpstreamBody = z.object({
   disabled_public_model_ids: disabledPublicModelIdsSchema.optional(),
   proxy_fallback_list: proxyFallbackListSchema.optional(),
   model_prefix: modelPrefixSchema.optional(),
+  color: upstreamColorSchema.optional(),
   // Patches only carry field diffs, not per-kind shape validation — the
   // handler dispatches on the existing row's kind and enforces the shape
   // there (Copilot/Codex/Claude Code reject a config patch outright, since
@@ -431,6 +489,12 @@ export const claudeCodeProbeBody = recordOnlyBody;
 // projected UpstreamModelConfig catalog.
 export const listModelsBody = recordOnlyBody;
 
+// --- agent setup ---
+//
+// The lease update/heartbeat wire schemas live in @floway-dev/agent-setup
+// alongside the route factory that consumes them; the gateway mounts those
+// routes rather than re-declaring their bodies here.
+
 // --- proxies ---
 //
 // Proxy URLs accept the URI schemes parsed by `parseProxyUri` in
@@ -489,6 +553,19 @@ export const searchConfigSchema = z.object({
   tavily: z.object({ apiKey: z.string() }),
   microsoftGrounding: z.object({ apiKey: z.string() }),
   jina: z.object({ apiKey: z.string() }),
+  passthroughOpenAiSearch: z.object({
+    enabled: z.boolean(),
+    upstreamId: z.string(),
+    model: z.string(),
+  }),
+}).superRefine((config, ctx) => {
+  if (!config.passthroughOpenAiSearch.enabled) return;
+  if (config.passthroughOpenAiSearch.upstreamId.trim() === '') {
+    ctx.addIssue({ code: 'custom', path: ['passthroughOpenAiSearch', 'upstreamId'], message: 'Select an upstream' });
+  }
+  if (config.passthroughOpenAiSearch.model.trim() === '') {
+    ctx.addIssue({ code: 'custom', path: ['passthroughOpenAiSearch', 'model'], message: 'Select a model' });
+  }
 });
 
 // --- model aliases ---
@@ -547,7 +624,7 @@ const announcedMetadataSchema = z.object({
 
 const aliasBaseShape = {
   name: z.string().min(1),
-  kind: z.enum(['chat', 'embedding', 'image']),
+  kind: z.enum(MODEL_KINDS),
   selection: z.enum(['random', 'first-available']),
   display_name: z.string().min(1).nullable(),
   visible_in_models_list: z.boolean(),
@@ -560,7 +637,7 @@ const aliasBodyCore = z.object(aliasBaseShape);
 
 // superRefine cross-validates each target's `rules` against the alias-level
 // kind. Chat: parse through `chatAliasRulesSchema` and surface the inner
-// issue verbatim. Embedding / image: the slot must be `{}` until a future
+// issue verbatim. Embedding / image / rerank: the slot must be `{}` until a future
 // schema lands. `announced_metadata.chat` is bound to the same invariant:
 // a chat block on a non-chat alias would land on the InternalModel row and
 // leak an incoherent `chat: {...}` sidecar onto `/v1/models` for a row
@@ -613,7 +690,7 @@ export const updateAliasBody = aliasBodyCore.superRefine(aliasBodyRulesRefinemen
 // --- data transfer ---
 
 export const importBody = z.object({
-  version: z.literal(7, { error: 'version must be 7 — older export formats are not supported; re-export from the current deployment' }),
+  version: z.literal(14, { error: 'version must be 14 — older export formats are not supported; re-export from the current deployment' }),
   mode: z.enum(['merge', 'replace'], { error: "mode must be 'merge' or 'replace'" }),
   data: z.unknown().optional(),
 });
@@ -657,10 +734,20 @@ export const searchUsageQuery = z.object({
   provider: z.string().optional(),
 });
 
-export const performanceQuery = z.object({
-  ...usageBaseQuery,
-  metric_scope: z.enum(['request_total', 'upstream_success']).optional(),
-  group_by: z.enum(['none', 'keyId', 'userId', 'model', 'runtimeLocation']).optional(),
+export const performanceQuery = z.object(usageBaseQuery).omit({ include_key_metadata: true, include_user_metadata: true }).extend({
+  group_by: z.enum(['keyId', 'userId', 'model', 'upstream', 'operation', 'runtimeLocation']).optional(),
   bucket: z.enum(['hour', '4h', '8h', 'day', 'all']).optional(),
   timezone_offset_minutes: z.string().optional(),
+  // Cross-cutting filters applied to raw records before aggregation. Each is
+  // a single value (dashboard dropdown is single-select); combining filters
+  // is AND.
+  filter_model: z.string().optional(),
+  filter_upstream: z.string().optional(),
+  filter_operation: z.string().optional(),
+  filter_runtime_location: z.string().optional(),
+  // User ids are auto-increment starting at 1, so zero and leading-zero forms
+  // can never resolve and are rejected up front rather than silently returning
+  // an empty result.
+  filter_user_id: z.union([z.literal(''), z.string().regex(/^[1-9]\d*$/, 'filter_user_id must be a positive integer')]).optional(),
+  filter_key_id: z.string().optional(),
 });

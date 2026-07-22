@@ -77,13 +77,6 @@ export const seq = (state: ResponsesSequenceState, events: ResponsesStreamEvent[
     sequence_number: state.sequenceNumber++,
   }));
 
-export const usage = (inputTokens: number, outputTokens: number, cacheReadInputTokens?: number): ResponsesUsage => ({
-  input_tokens: inputTokens,
-  output_tokens: outputTokens,
-  total_tokens: inputTokens + outputTokens,
-  ...(cacheReadInputTokens !== undefined ? { input_tokens_details: { cached_tokens: cacheReadInputTokens } } : {}),
-});
-
 // `incompleteDetails` is an explicit caller-supplied input. Inferring
 // it from `status === 'incomplete'` alone would have to hard-code a
 // reason — current callers all map to `'max_output_tokens'`, but a
@@ -163,12 +156,19 @@ export const started = (state: ResponsesSequenceState, response: ResponsesResult
   ]);
 
 export const terminal = (state: ResponsesSequenceState, response: ResponsesResult) => {
-  if (response.status === 'in_progress') {
-    throw new Error('Cannot emit a terminal Responses event for in_progress');
+  let type: 'response.completed' | 'response.incomplete' | 'response.failed';
+  switch (response.status) {
+  case 'completed': type = 'response.completed'; break;
+  case 'incomplete': type = 'response.incomplete'; break;
+  case 'failed': type = 'response.failed'; break;
+  case 'queued':
+  case 'in_progress':
+  case 'cancelled':
+    throw new TypeError(`Cannot emit a terminal Responses event for status '${response.status}'`);
   }
   return seq(state, [
     {
-      type: response.status === 'incomplete' ? 'response.incomplete' : response.status === 'failed' ? 'response.failed' : 'response.completed',
+      type,
       response,
     },
   ]);

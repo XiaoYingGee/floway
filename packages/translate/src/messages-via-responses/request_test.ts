@@ -1,4 +1,4 @@
-import { test } from 'vitest';
+import { expect, test } from 'vitest';
 
 import { translateMessagesToResponses } from './request.ts';
 import { packReasoningSignature } from '../shared/messages-and-responses/reasoning.ts';
@@ -22,7 +22,7 @@ test('translateMessagesToResponses preserves a native thinking signature as encr
   const reasoning = result.input[0] as ResponsesInputReasoning;
   assertEquals(reasoning, {
     type: 'reasoning',
-    id: 'rs_0',
+    id: expect.stringMatching(/^rs_[0-9a-f]{32}$/),
     summary: [{ type: 'summary_text', text: 'trace' }],
     encrypted_content: 'sig',
   });
@@ -189,6 +189,22 @@ test('translateMessagesToResponses maps thinking.adaptive to reasoning.effort me
   assertEquals(result.reasoning, { effort: 'medium' });
 });
 
+test('translateMessagesToResponses never invents reasoning.context from a source thinking block', () => {
+  // The Messages thinking shape carries no reasoning-context mode, so the
+  // target reasoning object must expose effort only — never a synthesized
+  // `all_turns` (or any other) context value.
+  const result = translateMessagesToResponses({
+    model: 'gpt-test',
+    max_tokens: 4096,
+    thinking: { type: 'enabled', budget_tokens: 8192 },
+    messages: [{ role: 'user', content: 'hi' }],
+  });
+
+  assertEquals(result.reasoning, { effort: 'medium' });
+  assertEquals(result.reasoning?.context, undefined);
+  assertFalse('context' in (result.reasoning ?? {}));
+});
+
 test('translateMessagesToResponses preserves max_tokens at the translation boundary', () => {
   const result = translateMessagesToResponses({
     model: 'gpt-test',
@@ -286,7 +302,7 @@ test('translateMessagesToResponses preserves redacted_thinking as a native-signa
   assertEquals(result.input, [
     {
       type: 'reasoning',
-      id: 'rs_0',
+      id: expect.stringMatching(/^rs_[0-9a-f]{32}$/),
       summary: [],
       encrypted_content: 'opaque_sig',
     },
@@ -332,7 +348,7 @@ test('translateMessagesToResponses preserves text-only thinking input', () => {
   const reasoning = result.input[0] as ResponsesInputReasoning;
   assertEquals(reasoning, {
     type: 'reasoning',
-    id: 'rs_0',
+    id: expect.stringMatching(/^rs_[0-9a-f]{32}$/),
     summary: [{ type: 'summary_text', text: 'trace' }],
   });
 });

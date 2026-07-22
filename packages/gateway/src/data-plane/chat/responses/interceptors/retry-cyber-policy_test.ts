@@ -2,13 +2,12 @@ import { test } from 'vitest';
 
 import { withCyberPolicyRetried } from './retry-cyber-policy.ts';
 import type { ResponsesInvocation } from './types.ts';
+import { mockChatGatewayCtx } from '../../../../test-helpers/gateway-ctx.ts';
 import type { ChatGatewayCtx } from '../../shared/gateway-ctx.ts';
-import { createNonResponsesSourceStore } from '../items/store.ts';
 import { eventFrame, type ProtocolFrame } from '@floway-dev/protocols/common';
-import type { ResponsesResult, ResponsesStreamEvent } from '@floway-dev/protocols/responses';
+import type { CanonicalResponsesPayload, ResponsesResult, ResponsesStreamEvent } from '@floway-dev/protocols/responses';
 import { eventResult, type ExecuteResult } from '@floway-dev/provider';
 import { assertEquals, stubModelCandidate, testTelemetryModelIdentity } from '@floway-dev/test-utils';
-import type { CanonicalResponsesPayload } from '@floway-dev/translate/via-responses/responses-items';
 
 const makePayload = (): CanonicalResponsesPayload => ({
   model: 'gpt-test',
@@ -33,19 +32,8 @@ const makeInvocation = (payload: CanonicalResponsesPayload): ResponsesInvocation
   action: 'generate',
 });
 
-const stubCtx = (overrides: { abortSignal?: AbortSignal } = {}): ChatGatewayCtx => ({
-  apiKeyId: 'test-key',
-  upstreamIds: null,
-  wantsStream: true,
-  runtimeLocation: 'TEST',
-  currentColo: 'TEST',
-  dump: null,
-  responseHeaders: new Headers(),
-  backgroundScheduler: () => {},
-  requestStartedAt: 0,
-  store: createNonResponsesSourceStore('test-key'),
-  ...overrides,
-});
+const stubCtx = (overrides: Partial<ChatGatewayCtx> = {}): ChatGatewayCtx =>
+  mockChatGatewayCtx({ wantsStream: true, ...overrides });
 
 type PromiseState<T> = { type: 'pending' } | { type: 'fulfilled'; value: T } | { type: 'rejected'; error: unknown };
 
@@ -147,14 +135,13 @@ const modelIdentityFor = (modelKey: string) => ({
   modelKey,
 });
 
-const performanceFor = (modelKey: string) => ({
+const performanceFor = (model: string) => ({
   keyId: 'key_test',
-  model: 'gpt-test',
+  model,
   upstream: 'test-upstream',
-  modelKey,
+  operation: 'chat' as const,
   stream: true,
   runtimeLocation: 'TEST',
-  currentColo: 'TEST',
   dump: null,
   responseHeaders: new Headers(),
 });
@@ -243,16 +230,21 @@ test('withCyberPolicyRetried buffers converted fallback prologue frames before r
       return Promise.resolve(
         protocolResult([
           {
-            type: 'response.created',
+            type: 'response.queued',
             sequence_number: 0,
+            response: { ...inProgressResponse('resp_blocked'), status: 'queued' },
+          },
+          {
+            type: 'response.created',
+            sequence_number: 1,
             response: inProgressResponse('resp_blocked'),
           },
           {
             type: 'response.in_progress',
-            sequence_number: 1,
+            sequence_number: 2,
             response: inProgressResponse('resp_blocked'),
           },
-          cyberPolicyEvent('resp_blocked', 2),
+          cyberPolicyEvent('resp_blocked', 3),
         ]),
       );
     }
@@ -290,7 +282,7 @@ test('withCyberPolicyRetried attributes streaming retries to the final provider 
 
   assertEquals(frames.length, 1);
   assertEquals(result.modelIdentity.modelKey, 'final-model-key');
-  assertEquals(result.performance?.modelKey, 'final-model-key');
+  assertEquals(result.performance?.model, 'final-model-key');
 });
 
 test('withCyberPolicyRetried returns successful streams without draining them', async () => {

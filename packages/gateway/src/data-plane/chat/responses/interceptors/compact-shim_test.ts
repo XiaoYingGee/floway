@@ -3,26 +3,13 @@ import { test } from 'vitest';
 import { SUMMARY_PREFIX, expandShimCompactionItems, withResponsesCompactShim } from './compact-shim.ts';
 import type { ResponsesInvocation } from './types.ts';
 import { encodeBase64UrlJson } from '../../../../shared/base64url-json.ts';
-import type { ChatGatewayCtx } from '../../shared/gateway-ctx.ts';
-import { createNonResponsesSourceStore } from '../items/store.ts';
+import { mockChatGatewayCtx } from '../../../../test-helpers/gateway-ctx.ts';
 import { doneFrame, eventFrame, type ProtocolFrame } from '@floway-dev/protocols/common';
-import { collectResponsesProtocolEventsToResult, type ResponsesInputItem, type ResponsesPayload, type ResponsesResult, type ResponsesStreamEvent } from '@floway-dev/protocols/responses';
+import { collectResponsesProtocolEventsToResult, type CanonicalResponsesPayload, type ResponsesInputItem, type ResponsesPayload, type ResponsesResult, type ResponsesStreamEvent } from '@floway-dev/protocols/responses';
 import { eventResult, type ExecuteResult } from '@floway-dev/provider';
 import { assertEquals, stubModelCandidate, testTelemetryModelIdentity } from '@floway-dev/test-utils';
-import type { CanonicalResponsesPayload } from '@floway-dev/translate/via-responses/responses-items';
 
-const stubCtx: ChatGatewayCtx = {
-  apiKeyId: 'test-key',
-  upstreamIds: null,
-  wantsStream: false,
-  runtimeLocation: 'TEST',
-  currentColo: 'TEST',
-  dump: null,
-  backgroundScheduler: () => {},
-  requestStartedAt: 0,
-  responseHeaders: new Headers(),
-  store: createNonResponsesSourceStore('test-key'),
-};
+const stubCtx = mockChatGatewayCtx();
 
 const makeInvocation = (
   payload: Partial<ResponsesPayload> = {},
@@ -241,25 +228,6 @@ test('compact + flag on: synthesized encrypted_content decodes to a user message
   assertEquals(decoded[0].role, 'user');
   assertEquals(decoded[0].content[0].type, 'input_text');
   assertEquals(decoded[0].content[0].text, `${SUMMARY_PREFIX}\nTHE SUMMARY`);
-});
-
-test('compact + flag on: synthesized compaction id is registered as synthetic so storage drops upstream affinity', async () => {
-  // The minted `cmp_<uuid>` is gateway-internal — no upstream issued it.
-  // wrapResponsesOutputForStorage keys upstreamOwned on
-  // `targetApi === 'responses' && !store.isSyntheticItem(upstreamId)`; without
-  // the synthetic registration, a flag-on engagement against a responses
-  // target would store the row with the originating upstreamId set, and
-  // classifyStoredResponsesAffinity would lock routing to that upstream
-  // on any later turn that echoes the compaction.
-  const inv = makeInvocation(
-    { input: [{ type: 'message', role: 'user', content: 'history' }] },
-    { action: 'compact' },
-  );
-  const result = await withResponsesCompactShim(inv, stubCtx, fakeUpstreamRun('summary'));
-  if (result.type !== 'events') throw new Error('expected events branch');
-  const collected = await collectResponsesProtocolEventsToResult(result.events);
-  const compactionItem = collected.output[0] as { type: string; id: string };
-  assertEquals(stubCtx.store.isSyntheticItem(compactionItem.id), true);
 });
 
 test('compact + flag on: upstream `output_text` SDK alias is dropped from the synthesized envelope', async () => {

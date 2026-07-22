@@ -1,9 +1,30 @@
+import { AffinityRequestContext } from './affinity/index.ts';
 import type { RequestBody } from './request-body.ts';
 import { type DumpAccumulator, openDumpAccumulator } from '../../../dump/accumulator.ts';
 import { apiKeyFromContext, type AuthedContext, effectiveUpstreamIdsFromContext } from '../../../middleware/auth.ts';
-import { getCurrentColo } from '../../../runtime/runtime-info.ts';
+import { getRuntimeLocation } from '../../../runtime/runtime-info.ts';
 import type { StatefulResponsesStore } from '../responses/items/store.ts';
 import type { BackgroundScheduler } from '@floway-dev/platform';
+import type { PerformanceTelemetryContext } from '@floway-dev/provider';
+
+// Per-attempt performance state. Reset at the start of every
+// iterateCandidates attempt so a candidate that short-circuits cannot inherit
+// the prior attempt's slots. The numeric slots use `null` because a real
+// timestamp of `0` would be ambiguous.
+export interface AttemptState {
+  upstreamCallStartedAt: number | null;
+  firstOutputTokenAt: number | null;
+  telemetry: PerformanceTelemetryContext | undefined;
+}
+
+// Stamps at dispatch entry — pre-dial by design. See
+// UpstreamCallOptions.wrapUpstreamCall for why the interval includes proxy
+// handshake time (the user waits for it too).
+export const stampUpstreamCallStart = (attempt: AttemptState) =>
+  <T>(dispatch: () => Promise<T>): Promise<T> => {
+    attempt.upstreamCallStartedAt = performance.now();
+    return dispatch();
+  };
 
 export interface GatewayCtx {
   readonly apiKeyId: string;
@@ -12,15 +33,12 @@ export interface GatewayCtx {
   readonly wantsStream: boolean;
   readonly downstreamAbortController?: AbortController;
   readonly backgroundScheduler: BackgroundScheduler;
-  // Stamped at ctx construction so request-total latency telemetry can subtract
-  // from `performance.now()` at response completion.
-  readonly requestStartedAt: number;
+  readonly attempt: AttemptState;
   // The deployment colo / region, used both as the `runtimeLocation`
   // performance-telemetry dimension and as the dial-time colo whitelist key.
   // Request-scoped, so it is resolved once here rather than at the
   // provider-call boundary.
   readonly runtimeLocation: string;
-  readonly currentColo: string;
   // Null when the api key has no retention configured, in which case
   // `finalizeGatewayResponse` short-circuits the dump tee and returns the
   // response untouched.
@@ -31,12 +49,16 @@ export interface GatewayCtx {
   readonly responseHeaders: Headers;
 }
 
-// Chat-protocol ctx — `GatewayCtx` plus the request-scoped stored-items
-// store. Every chat HTTP/WS entry constructs this via
-// `createChatGatewayCtxFromHono` and threads it through serve → narrow →
-// attempt. Passthrough endpoints (embeddings / images / completions) have
-// no stored-items concept and stay on plain `GatewayCtx`.
+// Chat-protocol ctx adds the affinity membrane and the Responses item store.
+// The store is present on every chat ctx: native Responses entries supply a
+// persisting factory, non-Responses sources a no-backing scratchpad store, so
+// the server-tool shim's request-private state always has a home. Every chat
+// HTTP/WS entry constructs this via `createChatGatewayCtxFromHono` and threads
+// it through serve → narrow → attempt. Passthrough endpoints (embeddings /
+// images / completions) have no stored-items concept and stay on plain
+// `GatewayCtx`.
 export interface ChatGatewayCtx extends GatewayCtx {
+  readonly affinity: AffinityRequestContext;
   readonly store: StatefulResponsesStore;
 }
 
@@ -79,7 +101,6 @@ export const createGatewayCtxFromHono = (c: AuthedContext, opts: CreateGatewayCt
   const upstreamIds = effectiveUpstreamIdsFromContext(c);
   const dump = openDumpAccumulator(c, opts.method ?? c.req.method, apiKey, opts.requestBody, opts.backgroundScheduler);
   if (opts.model !== undefined) dump?.requestedModel(opts.model);
-  const colo = getCurrentColo(c.req.raw);
   return {
     apiKeyId: apiKey.id,
     upstreamIds,
@@ -87,9 +108,8 @@ export const createGatewayCtxFromHono = (c: AuthedContext, opts: CreateGatewayCt
     wantsStream: opts.wantsStream,
     downstreamAbortController: controller,
     backgroundScheduler: opts.backgroundScheduler,
-    requestStartedAt: performance.now(),
-    runtimeLocation: colo,
-    currentColo: colo,
+    attempt: { firstOutputTokenAt: null, upstreamCallStartedAt: null, telemetry: undefined },
+    runtimeLocation: getRuntimeLocation(c.req.raw),
     dump,
     responseHeaders: new Headers(),
   };
@@ -103,18 +123,19 @@ export const finalizeGatewayResponse = (ctx: GatewayCtx, response: Response): Re
   return ctx.dump?.finalize(response) ?? response;
 };
 
-// Chat-protocol counterpart of `createGatewayCtxFromHono`. Calls the base
-// factory, then attaches the stored-items store the caller chose for this
-// protocol. The factory receives `ctx.apiKeyId` so every entry threads the
-// same authoritative id into its store — messages / gemini / chat-completions
-// pass `createNonResponsesSourceStore`; responses HTTP passes
-// `apiKeyId => createResponsesHttpStore(apiKeyId, payload.store)`; responses
-// WS passes `apiKeyId => session.createStore(apiKeyId, payload.store)`.
+// Chat-protocol counterpart of `createGatewayCtxFromHono`. The factory receives
+// the authoritative API-key id. Native Responses HTTP and WebSocket entries
+// supply a persisting store factory; non-Responses sources supply
+// `createNonResponsesSourceStore`, so every chat ctx carries a store.
 export const createChatGatewayCtxFromHono = (
   c: AuthedContext,
   opts: CreateGatewayCtxOptions,
   storeFactory: (apiKeyId: string) => StatefulResponsesStore,
 ): ChatGatewayCtx => {
   const base = createGatewayCtxFromHono(c, opts);
-  return { ...base, store: storeFactory(base.apiKeyId) };
+  return {
+    ...base,
+    affinity: new AffinityRequestContext(apiKeyFromContext(c).serverSecret),
+    store: storeFactory(base.apiKeyId),
+  };
 };
