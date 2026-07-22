@@ -5,28 +5,33 @@ import {
   cloneStoredResponsesItem,
   cloneStoredResponsesSnapshot,
   compareResponsesItemsByFreshness,
-  responsesItemStoreKey,
+  scopedResponsesKey,
 } from './responses-clone.ts';
-import { RESPONSES_REFRESH_DEBOUNCE_MS } from './responses-payload.ts';
 import type {
   ApiKey,
   ApiKeyRepo,
+  AgentSetupMutation,
+  AgentSetupRecord,
+  AgentSetupRenewal,
+  AgentSetupRepository,
   BackoffRow,
   CachedModelsRow,
   ModelAliasesRepo,
   ModelAliasRecord,
   ModelsCacheRepo,
   PerformanceDimensions,
-  PerformanceErrorSample,
-  PerformanceLatencySample,
   PerformanceRepo,
   PerformanceTelemetryRecord,
+  PerformanceSample,
+  PerformanceBucketRow,
+  PerformanceMetric,
   ProxyBackoffRepo,
   ProxyRecord,
   ProxyRepo,
   Repo,
   ResponsesItemsRepo,
   ResponsesSnapshotsRepo,
+  SearchConfig,
   SearchConfigRepo,
   SearchUsageRecord,
   SearchUsageRepo,
@@ -41,10 +46,12 @@ import type {
   UsersRepo,
 } from './types.ts';
 import { serializeStoredState } from './upstream-json.ts';
-import { latencyBucketForMs } from '../shared/performance-histogram.ts';
+import { usageMetricRows } from './usage-metrics.ts';
+import { bucketForTtftMs, bucketForTpotUs } from '../shared/performance-histogram.ts';
 import { generateSessionToken } from '../shared/session-tokens.ts';
 import { assertWebSearchProviderName } from '../shared/web-search-providers.ts';
-import { BILLING_DIMENSIONS, type BillingDimension, type ModelPricing, resolveEffectivePricing, unitPriceForDimension } from '@floway-dev/protocols/common';
+import { AgentSetupTokenCollisionError } from '@floway-dev/agent-setup';
+import { addDecimalStrings, canonicalPricingSelectorKey, canonicalizePricingSelector, type BillingMetric, type DecimalString, type PricingSelector } from '@floway-dev/protocols/common';
 import type { ProviderModel, UpstreamRecord } from '@floway-dev/provider';
 
 const SEED_ADMIN_USER: User = {
@@ -189,10 +196,6 @@ class MemoryApiKeyRepo implements ApiKeyRepo {
     return Promise.resolve(k ? { ...k } : null);
   }
 
-  idsByUserIdIncludingDeleted(userId: number): Promise<string[]> {
-    return Promise.resolve(this.keys.filter(k => k.userId === userId).map(k => k.id));
-  }
-
   async save(key: ApiKey): Promise<void> {
     const i = this.keys.findIndex(k => k.id === key.id);
     if (i >= 0) this.keys[i] = { ...key };
@@ -231,12 +234,11 @@ interface UsageBucketIdentity {
   upstream: string | null;
   modelKey: string;
   hour: string;
-  tier: string | null;
+  pricingSelector: PricingSelector;
 }
 
 interface UsageBucketState extends UsageBucketIdentity {
-  tokens: Partial<Record<BillingDimension, number>>;
-  unitPrices: Partial<Record<BillingDimension, number>>;
+  metrics: Map<BillingMetric, { metric: BillingMetric; quantity: DecimalString; unitPrice: DecimalString | null }>;
   requests: number;
 }
 
@@ -244,34 +246,19 @@ class MemoryUsageRepo implements UsageRepo {
   private store = new Map<string, UsageBucketState>();
 
   private key(r: UsageBucketIdentity): string {
-    return [r.keyId, r.model, r.upstream ?? '', r.modelKey, r.hour, r.tier ?? ''].join('\0');
-  }
-
-  private dimensionEntries(record: UsageRecord): { dimension: BillingDimension; tokens: number; unitPrice: number | null }[] {
-    const effective = resolveEffectivePricing(record.cost, record.tier);
-    return BILLING_DIMENSIONS.flatMap(dimension => {
-      const tokens = record.tokens[dimension] ?? 0;
-      return tokens > 0 ? [{ dimension, tokens, unitPrice: unitPriceForDimension(effective, dimension) }] : [];
-    });
+    return [r.keyId, r.model, r.upstream ?? '', r.modelKey, r.hour, canonicalPricingSelectorKey(r.pricingSelector)].join('\0');
   }
 
   private toRecord(state: UsageBucketState): UsageRecord {
-    const tokens: Partial<Record<BillingDimension, number>> = {};
-    let cost: ModelPricing | null = null;
-    for (const dimension of BILLING_DIMENSIONS) {
-      const count = state.tokens[dimension];
-      if (count !== undefined) tokens[dimension] = count;
-      const unitPrice = state.unitPrices[dimension];
-      if (unitPrice !== undefined) (cost ??= {})[dimension] = unitPrice;
-    }
-    return { keyId: state.keyId, model: state.model, upstream: state.upstream ?? null, modelKey: state.modelKey, hour: state.hour, tier: state.tier, requests: state.requests, tokens, cost };
+    return { keyId: state.keyId, model: state.model, upstream: state.upstream ?? null, modelKey: state.modelKey, hour: state.hour, pricingSelector: state.pricingSelector, requests: state.requests, metrics: [...state.metrics.values()].map(row => ({ ...row })) };
   }
 
   private bucket(record: UsageRecord): UsageBucketState {
-    const k = this.key(record);
+    const pricingSelector = canonicalizePricingSelector(record.pricingSelector);
+    const k = this.key({ ...record, pricingSelector });
     let state = this.store.get(k);
     if (!state) {
-      state = { keyId: record.keyId, model: record.model, upstream: record.upstream ?? null, modelKey: record.modelKey, hour: record.hour, tier: record.tier, tokens: {}, unitPrices: {}, requests: 0 };
+      state = { keyId: record.keyId, model: record.model, upstream: record.upstream ?? null, modelKey: record.modelKey, hour: record.hour, pricingSelector, metrics: new Map(), requests: 0 };
       this.store.set(k, state);
     }
     return state;
@@ -280,9 +267,11 @@ class MemoryUsageRepo implements UsageRepo {
   record(record: UsageRecord): Promise<void> {
     const state = this.bucket(record);
     state.requests += record.requests;
-    for (const { dimension, tokens, unitPrice } of this.dimensionEntries(record)) {
-      state.tokens[dimension] = (state.tokens[dimension] ?? 0) + tokens;
-      if (state.unitPrices[dimension] === undefined && unitPrice !== null) state.unitPrices[dimension] = unitPrice;
+    for (const row of usageMetricRows(record)) {
+      const current = state.metrics.get(row.metric);
+      state.metrics.set(row.metric, current
+        ? { ...current, quantity: addDecimalStrings(current.quantity, row.quantity) }
+        : { ...row });
     }
     return Promise.resolve();
   }
@@ -304,21 +293,20 @@ class MemoryUsageRepo implements UsageRepo {
   }
 
   set(record: UsageRecord): Promise<void> {
-    const k = this.key(record);
+    const pricingSelector = canonicalizePricingSelector(record.pricingSelector);
+    const k = this.key({ ...record, pricingSelector });
     const state: UsageBucketState = {
       keyId: record.keyId,
       model: record.model,
       upstream: record.upstream ?? null,
       modelKey: record.modelKey,
       hour: record.hour,
-      tier: record.tier,
-      tokens: {},
-      unitPrices: {},
+      pricingSelector,
+      metrics: new Map(),
       requests: record.requests,
     };
-    for (const { dimension, tokens, unitPrice } of this.dimensionEntries(record)) {
-      state.tokens[dimension] = tokens;
-      if (unitPrice !== null) state.unitPrices[dimension] = unitPrice;
+    for (const row of usageMetricRows(record)) {
+      state.metrics.set(row.metric, { ...row });
     }
     this.store.set(k, state);
     return Promise.resolve();
@@ -381,94 +369,110 @@ class MemorySearchUsageRepo implements SearchUsageRepo {
   }
 }
 
-const comparePerformanceTelemetryRecords = (a: PerformanceTelemetryRecord, b: PerformanceTelemetryRecord): number =>
-  a.hour.localeCompare(b.hour) ||
-  a.metricScope.localeCompare(b.metricScope) ||
-  a.keyId.localeCompare(b.keyId) ||
-  a.model.localeCompare(b.model) ||
-  (a.upstream ?? '').localeCompare(b.upstream ?? '') ||
-  a.modelKey.localeCompare(b.modelKey) ||
-  Number(a.stream) - Number(b.stream) ||
-  a.runtimeLocation.localeCompare(b.runtimeLocation);
+type StoredPerformanceRow = Omit<PerformanceTelemetryRecord, 'buckets'> & { bucketMap: Map<string, PerformanceBucketRow> };
+
+const comparePerformanceRow = (a: StoredPerformanceRow, b: StoredPerformanceRow): number =>
+  a.hour.localeCompare(b.hour)
+  || a.keyId.localeCompare(b.keyId)
+  || a.model.localeCompare(b.model)
+  || a.upstream.localeCompare(b.upstream)
+  || a.operation.localeCompare(b.operation)
+  || a.runtimeLocation.localeCompare(b.runtimeLocation);
+
+const compareBucketRow = (a: PerformanceBucketRow, b: PerformanceBucketRow): number =>
+  a.metric.localeCompare(b.metric) || a.lower - b.lower;
+
+const freezePerformanceRow = ({ bucketMap, ...rest }: StoredPerformanceRow): PerformanceTelemetryRecord => ({
+  ...rest,
+  buckets: [...bucketMap.values()].map(b => ({ ...b })).sort(compareBucketRow),
+});
 
 class MemoryPerformanceRepo implements PerformanceRepo {
-  private summaries = new Map<string, PerformanceTelemetryRecord>();
+  private readonly summaries = new Map<string, StoredPerformanceRow>();
 
-  private key(r: PerformanceDimensions): string {
-    return [r.hour, r.metricScope, r.keyId, r.model, r.upstream ?? '', r.modelKey, r.stream ? '1' : '0', r.runtimeLocation].join('\0');
-  }
-
-  private summary(sample: PerformanceDimensions): PerformanceTelemetryRecord {
-    const key = this.key(sample);
-    let record = this.summaries.get(key);
-    if (!record) {
-      record = {
-        hour: sample.hour,
-        metricScope: sample.metricScope,
-        keyId: sample.keyId,
-        model: sample.model,
-        upstream: sample.upstream ?? null,
-        modelKey: sample.modelKey,
-        stream: sample.stream,
-        runtimeLocation: sample.runtimeLocation,
-        requests: 0,
-        errors: 0,
-        totalMsSum: 0,
-        buckets: [],
-      };
-      this.summaries.set(key, record);
+  async recordSample(sample: PerformanceSample): Promise<void> {
+    const row = this.upsertRow(sample);
+    row.requests += 1;
+    if (sample.success) row.ttftSamplesOk += 1;
+    else row.errorsWithOutput += 1;
+    row.ttftMsSum += sample.ttftMs;
+    this.incrementBucket(row, 'ttft_ms', bucketForTtftMs(sample.ttftMs));
+    if (sample.tpotUs !== undefined) {
+      row.tpotSamples += 1;
+      row.tpotUsSum += sample.tpotUs;
+      this.incrementBucket(row, 'tpot_us', bucketForTpotUs(sample.tpotUs));
     }
-    return record;
   }
 
-  recordLatency(sample: PerformanceLatencySample): Promise<void> {
-    const record = this.summary(sample);
-    const durationMs = Math.max(0, Math.round(sample.durationMs));
-    record.requests += 1;
-    record.totalMsSum += durationMs;
-
-    const bucket = latencyBucketForMs(durationMs);
-    const existing = record.buckets.find(b => b.lowerMs === bucket.lowerMs && b.upperMs === bucket.upperMs);
-    if (existing) {
-      existing.count += 1;
-    } else {
-      record.buckets.push({ ...bucket, count: 1 });
-      record.buckets.sort((a, b) => a.upperMs - b.upperMs || a.lowerMs - b.lowerMs);
-    }
-    return Promise.resolve();
+  async recordZeroOutputError(dims: PerformanceDimensions): Promise<void> {
+    const row = this.upsertRow(dims);
+    row.requests += 1;
+    row.errorsNoOutput += 1;
   }
 
-  recordError(sample: PerformanceErrorSample): Promise<void> {
-    this.summary(sample).errors += 1;
-    return Promise.resolve();
+  async recordNeutral(dims: PerformanceDimensions): Promise<void> {
+    const row = this.upsertRow(dims);
+    row.requests += 1;
+    row.neutral += 1;
   }
 
-  query(opts: { keyId?: string; metricScope?: PerformanceTelemetryRecord['metricScope']; start: string; end: string }): Promise<PerformanceTelemetryRecord[]> {
-    return Promise.resolve(
-      [...this.summaries.values()]
-        .filter(r => r.hour >= opts.start && r.hour < opts.end)
-        .filter(r => !opts.keyId || r.keyId === opts.keyId)
-        .filter(r => !opts.metricScope || r.metricScope === opts.metricScope)
-        .map(r => ({ ...r, buckets: r.buckets.map(b => ({ ...b })) }))
-        .sort(comparePerformanceTelemetryRecords),
-    );
+  async query(opts: { keyId?: string; start: string; end: string }): Promise<PerformanceTelemetryRecord[]> {
+    return [...this.summaries.values()]
+      .filter(r => (opts.keyId ? r.keyId === opts.keyId : true) && r.hour >= opts.start && r.hour < opts.end)
+      .sort(comparePerformanceRow)
+      .map(freezePerformanceRow);
   }
 
-  listAll(): Promise<PerformanceTelemetryRecord[]> {
-    return Promise.resolve([...this.summaries.values()].map(r => ({ ...r, buckets: r.buckets.map(b => ({ ...b })) })).sort(comparePerformanceTelemetryRecords));
+  async listAll(): Promise<PerformanceTelemetryRecord[]> {
+    return [...this.summaries.values()].sort(comparePerformanceRow).map(freezePerformanceRow);
   }
 
-  set(record: PerformanceTelemetryRecord): Promise<void> {
-    this.summaries.set(this.key(record), {
-      ...record,
-      buckets: record.buckets.map(bucket => ({ ...bucket })).sort((a, b) => a.upperMs - b.upperMs || a.lowerMs - b.lowerMs),
-    });
-    return Promise.resolve();
+  async set(record: PerformanceTelemetryRecord): Promise<void> {
+    const key = this.rowKey(record);
+    const { buckets, ...dims } = record;
+    const bucketMap = new Map(buckets.map(b => [`${b.metric}\0${b.lower}`, { ...b }] as const));
+    this.summaries.set(key, { ...dims, bucketMap });
   }
 
-  deleteAll(): Promise<void> {
+  async deleteAll(): Promise<void> {
     this.summaries.clear();
-    return Promise.resolve();
+  }
+
+  private rowKey(dims: PerformanceDimensions): string {
+    return `${dims.hour}\0${dims.keyId}\0${dims.model}\0${dims.upstream}\0${dims.operation}\0${dims.runtimeLocation}`;
+  }
+
+  private upsertRow(dims: PerformanceDimensions): StoredPerformanceRow {
+    const key = this.rowKey(dims);
+    let row = this.summaries.get(key);
+    if (!row) {
+      row = {
+        hour: dims.hour,
+        keyId: dims.keyId,
+        model: dims.model,
+        upstream: dims.upstream,
+        operation: dims.operation,
+        runtimeLocation: dims.runtimeLocation,
+        requests: 0,
+        ttftSamplesOk: 0,
+        errorsWithOutput: 0,
+        errorsNoOutput: 0,
+        neutral: 0,
+        tpotSamples: 0,
+        ttftMsSum: 0,
+        tpotUsSum: 0,
+        bucketMap: new Map(),
+      };
+      this.summaries.set(key, row);
+    }
+    return row;
+  }
+
+  private incrementBucket(row: StoredPerformanceRow, metric: PerformanceMetric, edges: { lower: number; upper: number | null }) {
+    const key = `${metric}\0${edges.lower}`;
+    const existing = row.bucketMap.get(key);
+    if (existing) { existing.count += 1; return; }
+    row.bucketMap.set(key, { metric, lower: edges.lower, upper: edges.upper, count: 1 });
   }
 }
 
@@ -480,8 +484,8 @@ class MemoryModelsCacheRepo implements ModelsCacheRepo {
     return Promise.resolve(row ? { ...row, models: [...row.models] } : null);
   }
 
-  put(upstreamId: string, row: { fetchedAt: number; models: ProviderModel[] }): Promise<void> {
-    this.rows.set(upstreamId, { fetchedAt: row.fetchedAt, models: [...row.models], lastError: null });
+  put(upstreamId: string, row: { revision: number; fetchedAt: number; models: ProviderModel[] }): Promise<void> {
+    this.rows.set(upstreamId, { revision: row.revision, fetchedAt: row.fetchedAt, models: [...row.models], lastError: null });
     return Promise.resolve();
   }
 
@@ -506,8 +510,8 @@ class MemorySearchConfigRepo implements SearchConfigRepo {
     return Promise.resolve(this.config === null ? null : structuredClone(this.config));
   }
 
-  save(config: unknown): Promise<void> {
-    this.config = config === undefined ? null : structuredClone(config);
+  save(config: SearchConfig): Promise<void> {
+    this.config = structuredClone(config);
     return Promise.resolve();
   }
 }
@@ -559,36 +563,25 @@ const cloneUpstreamRecord = (upstream: UpstreamRecord): UpstreamRecord => ({
   disabledPublicModelIds: normalizeDisabledPublicModelIds(upstream.disabledPublicModelIds),
   proxyFallbackList: normalizeProxyFallbackList(upstream.proxyFallbackList),
   modelPrefix: structuredClone(upstream.modelPrefix),
+  color: upstream.color ?? null,
 });
 
 class MemoryResponsesItemsRepo implements ResponsesItemsRepo {
   private store = new Map<string, StoredResponsesItem>();
 
-  lookupMany(apiKeyId: string | null, ids: readonly string[]): Promise<StoredResponsesItem[]> {
+  lookupMany(apiKeyId: string, ids: readonly string[]): Promise<StoredResponsesItem[]> {
     const rows: StoredResponsesItem[] = [];
     const seen = new Set<string>();
     for (const id of ids) {
       if (seen.has(id)) continue;
       seen.add(id);
-      const row = this.store.get(responsesItemStoreKey(apiKeyId, id));
-      if (row?.apiKeyId === apiKeyId) rows.push(cloneStoredResponsesItem(row));
+      const row = this.store.get(scopedResponsesKey(apiKeyId, id));
+      if (row !== undefined) rows.push(cloneStoredResponsesItem(row));
     }
     return Promise.resolve(rows);
   }
 
-  lookupManyByEncryptedContentHash(apiKeyId: string | null, hashes: readonly string[]): Promise<StoredResponsesItem[]> {
-    const wanted = new Set(hashes);
-    if (wanted.size === 0) return Promise.resolve([]);
-    const rows: StoredResponsesItem[] = [];
-    for (const row of this.store.values()) {
-      if (row.apiKeyId === apiKeyId && row.encryptedContentHash !== null && wanted.has(row.encryptedContentHash)) {
-        rows.push(cloneStoredResponsesItem(row));
-      }
-    }
-    return Promise.resolve(rows.toSorted(compareResponsesItemsByFreshness));
-  }
-
-  lookupManyByContentHash(apiKeyId: string | null, hashes: readonly string[]): Promise<StoredResponsesItem[]> {
+  lookupManyByContentHash(apiKeyId: string, hashes: readonly string[]): Promise<StoredResponsesItem[]> {
     const wanted = new Set(hashes);
     if (wanted.size === 0) return Promise.resolve([]);
     const rows: StoredResponsesItem[] = [];
@@ -602,60 +595,27 @@ class MemoryResponsesItemsRepo implements ResponsesItemsRepo {
 
   insertMany(items: readonly StoredResponsesItem[]): Promise<void> {
     for (const item of items) {
-      const key = responsesItemStoreKey(item.apiKeyId, item.id);
+      const key = scopedResponsesKey(item.apiKeyId, item.id);
       if (this.store.has(key)) continue;
       this.store.set(key, cloneStoredResponsesItem(item));
     }
     return Promise.resolve();
   }
 
-  fillPayloads(items: readonly StoredResponsesItem[]): Promise<number> {
-    let changes = 0;
-    for (const item of items) {
-      if (item.payload === null) continue;
-      const existing = this.store.get(responsesItemStoreKey(item.apiKeyId, item.id));
-      // Row may be absent if a concurrent TTL prune removed it between load and persist;
-      // SQL's `UPDATE ... WHERE id = ?` is a no-op in the same case, so we mirror that.
-      if (existing === undefined) continue;
-      if (existing.payload !== null) continue;
-      existing.payload = structuredClone(item.payload);
-      existing.contentHash = item.contentHash;
-      existing.encryptedContentHash = item.encryptedContentHash;
-      existing.createdAt = item.createdAt;
-      existing.refreshedAt = Math.max(existing.refreshedAt, item.refreshedAt);
-      changes += 1;
+  refreshMany(items: readonly StoredResponsesItem[], createdAt: number): Promise<void> {
+    const existing = items.map(item => this.store.get(scopedResponsesKey(item.apiKeyId, item.id)));
+    const missingIndex = existing.findIndex(item => item === undefined);
+    if (missingIndex !== -1) {
+      return Promise.reject(new Error(`Responses item disappeared before lifetime refresh: ${items[missingIndex].id}`));
     }
-    return Promise.resolve(changes);
+    for (const item of existing) item!.createdAt = Math.max(item!.createdAt, createdAt);
+    return Promise.resolve();
   }
 
-  refreshMany(apiKeyId: string | null, ids: readonly string[], refreshedAt: number): Promise<number> {
-    let changes = 0;
-    const cutoff = refreshedAt - RESPONSES_REFRESH_DEBOUNCE_MS;
-    for (const id of new Set(ids)) {
-      const row = this.store.get(responsesItemStoreKey(apiKeyId, id));
-      if (row && row.refreshedAt < cutoff) {
-        row.refreshedAt = refreshedAt;
-        changes += 1;
-      }
-    }
-    return Promise.resolve(changes);
-  }
-
-  clearPayloadOlderThan(createdBefore: number): Promise<number> {
-    let changes = 0;
-    for (const row of this.store.values()) {
-      if (row.createdAt < createdBefore && row.payload !== null) {
-        row.payload = null;
-        changes += 1;
-      }
-    }
-    return Promise.resolve(changes);
-  }
-
-  deleteOlderThan(refreshedBefore: number): Promise<number> {
+  deleteOlderThan(createdBefore: number): Promise<number> {
     let changes = 0;
     for (const [key, row] of this.store) {
-      if (row.refreshedAt < refreshedBefore) {
+      if (row.createdAt < createdBefore) {
         this.store.delete(key);
         changes += 1;
       }
@@ -672,27 +632,24 @@ class MemoryResponsesItemsRepo implements ResponsesItemsRepo {
 class MemoryResponsesSnapshotsRepo implements ResponsesSnapshotsRepo {
   private store = new Map<string, StoredResponsesSnapshot>();
 
-  lookup(apiKeyId: string | null, id: string): Promise<StoredResponsesSnapshot | null> {
-    const snapshot = this.store.get(responsesItemStoreKey(apiKeyId, id));
+  lookup(apiKeyId: string, id: string): Promise<StoredResponsesSnapshot | null> {
+    const snapshot = this.store.get(scopedResponsesKey(apiKeyId, id));
     return Promise.resolve(snapshot ? cloneStoredResponsesSnapshot(snapshot) : null);
   }
 
   insert(snapshot: StoredResponsesSnapshot): Promise<void> {
-    this.store.set(responsesItemStoreKey(snapshot.apiKeyId, snapshot.id), cloneStoredResponsesSnapshot(snapshot));
+    const key = scopedResponsesKey(snapshot.apiKeyId, snapshot.id);
+    const existing = this.store.get(key);
+    if (existing === undefined || snapshot.createdAt >= existing.createdAt) {
+      this.store.set(key, cloneStoredResponsesSnapshot(snapshot));
+    }
     return Promise.resolve();
   }
 
-  refresh(apiKeyId: string | null, id: string, refreshedAt: number): Promise<boolean> {
-    const snapshot = this.store.get(responsesItemStoreKey(apiKeyId, id));
-    if (!snapshot || snapshot.refreshedAt >= refreshedAt - RESPONSES_REFRESH_DEBOUNCE_MS) return Promise.resolve(false);
-    snapshot.refreshedAt = refreshedAt;
-    return Promise.resolve(true);
-  }
-
-  deleteOlderThan(refreshedBefore: number): Promise<number> {
+  deleteOlderThan(createdBefore: number): Promise<number> {
     let changes = 0;
     for (const [key, snapshot] of this.store) {
-      if (snapshot.refreshedAt < refreshedBefore) {
+      if (snapshot.createdAt < createdBefore) {
         this.store.delete(key);
         changes += 1;
       }
@@ -932,6 +889,91 @@ class MemoryModelAliasesRepo implements ModelAliasesRepo {
   }
 }
 
+const compareLatestAgentSetupRecord = (a: AgentSetupRecord, b: AgentSetupRecord): number =>
+  b.updatedAt - a.updatedAt || b.createdAt - a.createdAt || (a.token < b.token ? 1 : -1);
+
+class MemoryAgentSetupRepo implements AgentSetupRepository {
+  // Keyed by token: a user may own many concurrent leases at once.
+  private byToken = new Map<string, AgentSetupRecord>();
+
+  findByToken(token: string): Promise<AgentSetupRecord | null> {
+    const found = this.byToken.get(token);
+    return Promise.resolve(found ? { ...found } : null);
+  }
+
+  latestByUserId(userId: number): Promise<AgentSetupRecord | null> {
+    let latest: AgentSetupRecord | undefined;
+    for (const record of this.byToken.values()) {
+      if (record.userId !== userId) continue;
+      if (latest === undefined || compareLatestAgentSetupRecord(record, latest) < 0) latest = record;
+    }
+    return Promise.resolve(latest ? { ...latest } : null);
+  }
+
+  insertForUser(input: {
+    userId: number;
+    token: string;
+    configurationJson: string;
+    now: number;
+    expiresAt: number;
+  }): Promise<AgentSetupRecord> {
+    if (this.byToken.has(input.token)) throw new AgentSetupTokenCollisionError();
+    const record: AgentSetupRecord = {
+      userId: input.userId,
+      token: input.token,
+      configurationJson: input.configurationJson,
+      configurationRevision: 1,
+      expiresAt: input.expiresAt,
+      createdAt: input.now,
+      updatedAt: input.now,
+    };
+    this.byToken.set(record.token, record);
+    // Mirror the AFTER INSERT trigger: sweep only this user's already-expired
+    // rows, measured against the new row's created_at, never the new row.
+    for (const [token, existing] of this.byToken) {
+      if (existing.userId === input.userId && token !== record.token && existing.expiresAt <= input.now) this.byToken.delete(token);
+    }
+    return Promise.resolve({ ...record });
+  }
+
+  updateConfiguration(input: {
+    userId: number;
+    token: string;
+    expectedRevision: number;
+    configurationJson: string;
+    now: number;
+    expiresAt: number;
+  }): Promise<AgentSetupMutation> {
+    const existing = this.byToken.get(input.token);
+    if (!existing || existing.userId !== input.userId) return Promise.resolve({ status: 'missing' });
+    if (existing.configurationRevision !== input.expectedRevision) {
+      return Promise.resolve({ status: 'revision-conflict', record: { ...existing } });
+    }
+    const record: AgentSetupRecord = {
+      ...existing,
+      configurationJson: input.configurationJson,
+      configurationRevision: existing.configurationRevision + 1,
+      expiresAt: input.expiresAt,
+      updatedAt: input.now,
+    };
+    this.byToken.set(record.token, record);
+    return Promise.resolve({ status: 'ok', record: { ...record } });
+  }
+
+  renewLease(input: {
+    userId: number;
+    token: string;
+    expiresAt: number;
+  }): Promise<AgentSetupRenewal> {
+    const existing = this.byToken.get(input.token);
+    if (!existing || existing.userId !== input.userId) return Promise.resolve({ status: 'missing' });
+    // Expiry-only: updated_at and the revision stay put.
+    const record: AgentSetupRecord = { ...existing, expiresAt: input.expiresAt };
+    this.byToken.set(record.token, record);
+    return Promise.resolve({ status: 'ok', record: { ...record } });
+  }
+}
+
 export class InMemoryRepo implements Repo {
   apiKeys: ApiKeyRepo;
   users: UsersRepo;
@@ -947,6 +989,7 @@ export class InMemoryRepo implements Repo {
   modelAliases: ModelAliasesRepo;
   responsesItems: ResponsesItemsRepo;
   responsesSnapshots: ResponsesSnapshotsRepo;
+  agentSetup: AgentSetupRepository;
 
   constructor() {
     this.users = new MemoryUsersRepo();
@@ -963,5 +1006,6 @@ export class InMemoryRepo implements Repo {
     this.modelAliases = new MemoryModelAliasesRepo();
     this.responsesItems = new MemoryResponsesItemsRepo();
     this.responsesSnapshots = new MemoryResponsesSnapshotsRepo();
+    this.agentSetup = new MemoryAgentSetupRepo();
   }
 }

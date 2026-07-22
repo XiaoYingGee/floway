@@ -1,9 +1,13 @@
 import type { Context } from 'hono';
 import { streamSSE } from 'hono/streaming';
 
+import { wrapNativeResponsesClientOutput } from './client-output.ts';
 import { tokenUsageFromResponsesResult } from './usage.ts';
+import { recordFailedRequest } from '../../shared/telemetry/performance.ts';
+import { settle } from '../../shared/telemetry/settle.ts';
+import { forwardUpstreamHeaders, mergeForwardedUpstreamHeaders } from '../../shared/upstream-response.ts';
 import type { GatewayCtx } from '../shared/gateway-ctx.ts';
-import { SourceStreamState, eventResultMetadata, forwardUpstreamHeaders, mergeForwardedUpstreamHeaders, plainResultToResponse, recordPerformance, recordUsage } from '../shared/respond.ts';
+import { SourceStreamState, eventResultMetadata, plainResultToResponse } from '../shared/respond.ts';
 import { type StreamCompletion, writeSSEFrames } from '../shared/stream/sse.ts';
 import { type ProtocolFrame, sseCommentFrame, sseFrame } from '@floway-dev/protocols/common';
 import { responsesProtocolFrameToSSEFrame, RESPONSES_MISSING_TERMINAL_MESSAGE, collectResponsesProtocolEventsToResult } from '@floway-dev/protocols/responses';
@@ -14,35 +18,35 @@ import { apiErrorToResponse } from '@floway-dev/provider';
 // Renders an upstream Responses result into the client HTTP/SSE response. An
 // error-typed result is a pre-stream failure and always answers as HTTP; an
 // events result drains to one JSON body (non-streaming) or is proxied frame by
-// frame (streaming). `success` reports whether a non-streaming body was
-// produced, so the orchestrator knows whether to flush stored items.
+// frame (streaming).
 export const respondResponses = async (
   c: Context,
   result: ExecuteResult<ProtocolFrame<ResponsesStreamEvent>> | PlainResult,
   wantsStream: boolean,
   ctx: GatewayCtx,
-): Promise<{ success: boolean; response: Response }> => {
+): Promise<Response> => {
   if (result.type === 'api-error') {
-    recordPerformance(ctx, result.performance, true);
+    recordFailedRequest(ctx, result.performance);
     ctx.dump?.error(result.source, result.upstream);
-    return { success: false, response: apiErrorToResponse(result) };
+    return apiErrorToResponse(result);
   }
 
   if (result.type === 'internal-error') {
-    recordPerformance(ctx, result.performance, true);
+    recordFailedRequest(ctx, result.performance);
     ctx.dump?.failed(result.error.message);
-    return { success: false, response: internalResponsesErrorResponse(result.status, result.error) };
+    return internalResponsesErrorResponse(result.status, result.error);
   }
 
   if (result.type === 'plain') {
     if (result.status >= 400) {
       ctx.dump?.error(result.upstream !== undefined ? 'upstream' : 'gateway', result.upstream);
     }
-    return { success: true, response: plainResultToResponse(result) };
+    return plainResultToResponse(result);
   }
 
   const state = new SourceStreamState();
-  const frames = observeResponsesFrames(result.events, state, wantsStream, ctx);
+  const observed = observeResponsesFrames(result.events, state, wantsStream, ctx);
+  const frames = wrapNativeResponsesClientOutput(observed, ctx);
 
   if (!wantsStream) {
     try {
@@ -50,13 +54,12 @@ export const respondResponses = async (
       const metadata = await eventResultMetadata(result);
       const usage = tokenUsageFromResponsesResult(response);
       ctx.dump?.success(metadata.modelIdentity, usage);
-      await recordUsage(ctx, metadata.modelIdentity, usage);
-      recordPerformance(ctx, metadata.performance, state.failed || response.status === 'failed');
-      return { success: true, response: Response.json(response, { headers: mergeForwardedUpstreamHeaders(undefined, result.headers) }) };
+      settle(ctx, metadata.performance, metadata.modelIdentity, usage, state.failed || response.status === 'failed');
+      return Response.json(response, { headers: mergeForwardedUpstreamHeaders(undefined, result.headers) });
     } catch (error) {
-      recordPerformance(ctx, result.performance, true);
+      recordFailedRequest(ctx, result.performance);
       ctx.dump?.failed(error);
-      return { success: false, response: internalResponsesErrorResponse(502, toInternalDebugError(error)) };
+      return internalResponsesErrorResponse(502, toInternalDebugError(error));
     }
   }
 
@@ -76,17 +79,11 @@ export const respondResponses = async (
       } else {
         ctx.dump?.success(metadata.modelIdentity, state.usage);
       }
-      try {
-        await recordUsage(ctx, metadata.modelIdentity, state.usage);
-      } catch (error) {
-        console.error('Failed to record Responses HTTP usage:', error);
-      } finally {
-        recordPerformance(ctx, metadata.performance, failed);
-      }
+      settle(ctx, metadata.performance, metadata.modelIdentity, state.usage, failed);
     }
   });
 
-  return { success: true, response };
+  return response;
 };
 
 // --- error rendering ---

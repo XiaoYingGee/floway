@@ -14,8 +14,11 @@ import {
 } from './server-tool-shim.ts';
 import { SHIM_TOOL_NAME, webSearchServerTool } from './server-tools/web-search.ts';
 import type { ResponsesInterceptor, ResponsesInvocation } from './types.ts';
-import { initRepo } from '../../../../repo/index.ts';
+import { getRepo, initRepo } from '../../../../repo/index.ts';
 import { InMemoryRepo } from '../../../../repo/memory.ts';
+import { mockChatGatewayCtx } from '../../../../test-helpers/gateway-ctx.ts';
+import { resolveAlphaSearchDispatcher } from '../../../tools/web-search/alpha-search/upstream.ts';
+import type { AlphaSearchDispatcher } from '../../../tools/web-search/alpha-search/upstream.ts';
 import { resolveConfiguredWebSearchProvider } from '../../../tools/web-search/provider.ts';
 import type {
   ConfiguredWebSearchProvider,
@@ -31,6 +34,7 @@ import { createNonResponsesSourceStore } from '../items/store.ts';
 import { eventFrame } from '@floway-dev/protocols/common';
 import type { ProtocolFrame } from '@floway-dev/protocols/common';
 import type {
+  CanonicalResponsesPayload,
   ResponsesOutputItem,
   ResponsesInputItem,
   ResponsesInputWebSearchCall,
@@ -44,7 +48,6 @@ import type {
 } from '@floway-dev/protocols/responses';
 import { type EventResult, type ExecuteResult, type FlagId } from '@floway-dev/provider';
 import { assert, assertEquals, assertFalse, stubModelCandidate } from '@floway-dev/test-utils';
-import type { CanonicalResponsesPayload } from '@floway-dev/translate/via-responses/responses-items';
 
 const withResponsesWebSearchShim = withResponsesServerToolShim([webSearchServerTool]);
 
@@ -63,6 +66,12 @@ const mkResponseCreated = (responseId = 'upstream_test'): ProtocolFrame<Response
   eventFrame({
     type: 'response.created',
     response: emptyResult(responseId, 'in_progress'),
+  });
+
+const mkResponseQueued = (responseId = 'upstream_test'): ProtocolFrame<ResponsesStreamEvent> =>
+  eventFrame({
+    type: 'response.queued',
+    response: emptyResult(responseId, 'queued'),
   });
 
 const mkResponseInProgress = (responseId = 'upstream_test'): ProtocolFrame<ResponsesStreamEvent> =>
@@ -181,6 +190,7 @@ const mkReasoningDone = (outputIndex: number, reasoningId: string): ProtocolFram
 // test stub. Tests that need a specific configured state set
 // `mockResolveConfigured.mockReturnValue(...)` per call.
 vi.mock('../../../tools/web-search/provider.ts');
+vi.mock('../../../tools/web-search/alpha-search/upstream.ts');
 
 const mkResponseCompleted = (
   usage?: ResponsesResult['usage'],
@@ -217,7 +227,7 @@ const testTelemetryModelIdentity = {
   model: 'test-model',
   upstream: 'test-upstream',
   modelKey: 'test-model-key',
-  cost: null,
+  pricing: null,
 };
 
 interface ProviderOverrides {
@@ -272,12 +282,14 @@ interface DepsOverrides {
 }
 
 const mockResolveConfigured = vi.mocked(resolveConfiguredWebSearchProvider);
+const mockResolveAlpha = vi.mocked(resolveAlphaSearchDispatcher);
 
 // Seed a per-test InMemoryRepo and a default tavily search config so
 // `loadSearchConfig()` returns a non-default value. The actual provider
 // construction is short-circuited by the module mock above; tests
 // override `mockResolveConfigured` to point at a stub backend.
 beforeEach(() => {
+  mockResolveAlpha.mockReset();
   const repo = new InMemoryRepo();
   initRepo(repo);
   void repo.searchConfig.save({
@@ -285,6 +297,7 @@ beforeEach(() => {
     tavily: { apiKey: 'test-key' },
     microsoftGrounding: { apiKey: '' },
     jina: { apiKey: '' },
+    passthroughOpenAiSearch: { enabled: false, upstreamId: '', model: '' },
   } satisfies SearchConfig);
 });
 
@@ -330,18 +343,8 @@ const makeInvocation = (overrides: InvocationOverrides = {}): ResponsesInvocatio
   action: 'generate',
 });
 
-const makeGatewayCtx = (apiKeyId: string = 'k1'): ChatGatewayCtx => ({
-  apiKeyId,
-  upstreamIds: null,
-  wantsStream: true,
-  runtimeLocation: 'TEST',
-  currentColo: 'TEST',
-  dump: null,
-  responseHeaders: new Headers(),
-  backgroundScheduler: () => {},
-  requestStartedAt: 0,
-  store: createNonResponsesSourceStore(apiKeyId),
-});
+const makeGatewayCtx = (apiKeyId: string = 'k1') =>
+  mockChatGatewayCtx({ apiKeyId, wantsStream: true });
 
 const collectFrames = async <T>(iter: AsyncIterable<T>): Promise<T[]> => {
   const out: T[] = [];
@@ -640,7 +643,34 @@ test('shim drives one search then a final message in two upstream turns', async 
   assertEquals(events[events.length - 1].type, 'response.completed');
 });
 
-test('synthesized web_search_call ids are registered as gateway-synthetic on the request', async () => {
+test('translated source with a no-backing store still replays private search state across turns', async () => {
+  makeStubDeps();
+  const shim = withResponsesWebSearchShim;
+  const inv = makeInvocation();
+  // A non-Responses source (Messages/Gemini/Chat) translated into a Responses
+  // upstream carries a no-backing store, not a persisting one; the shim's
+  // request-private replay must still round-trip within the single request.
+  const ctx = mockChatGatewayCtx({ apiKeyId: 'k1', wantsStream: true, store: createNonResponsesSourceStore('k1') });
+  const script = scriptedRun([
+    searchCallTurn(0, 'call_1', 'q1'),
+    messageTurn('summary', 0),
+  ]);
+
+  const result = await shim(inv, ctx, script.run);
+  assert(result.type === 'events');
+  await collectFrames(result.events);
+
+  const input = inv.payload.input as ResponsesInputItem[];
+  const tail = input.slice(-2);
+  assert(tail[0].type === 'function_call');
+  // The preserved `call_id` proves the private payload was found (replay
+  // path 1); a lost payload would synthesize a fresh id and emit the
+  // "results were not preserved" placeholder instead.
+  assertEquals(tail[0].call_id, 'call_1');
+  assertEquals(tail[1].type, 'function_call_output');
+});
+
+test('synthesized web_search_call ids retain request-private replay state', async () => {
   makeStubDeps();
   const shim = withResponsesWebSearchShim;
   const inv = makeInvocation();
@@ -652,20 +682,16 @@ test('synthesized web_search_call ids are registered as gateway-synthetic on the
 
   const { frames } = await runShimAndDrain(shim, inv, ctx, script.run);
 
-  // Every web_search_call the shim synthesizes carries a gateway-minted id no
-  // upstream issued; persistence relies on these being registered so it stores
-  // them with no upstream identity (non_affinity).
   const doneEvents = outputItemDoneEvents(frames);
   const wsCallDoneIds = doneEvents.filter(e => e.item.type === 'web_search_call').map(e => e.item.id!);
   const store = ctx.store;
   assert(wsCallDoneIds.length > 0, 'expected a synthesized web_search_call');
   for (const id of wsCallDoneIds) {
-    assert(id.startsWith('ws_gw_'));
-    assert(store.isSyntheticItem(id), `expected ${id} registered as synthetic`);
+    assert(/^ws_[0-9a-f]{32}$/.test(id));
+    assert(store.getPrivatePayload(id) !== undefined, `expected ${id} to retain private replay state`);
   }
-  // A genuine upstream item (the final message) is not registered.
   for (const e of doneEvents.filter(e => e.item.type === 'message')) {
-    assertFalse(store.isSyntheticItem(e.item.id!));
+    assertFalse(store.getPrivatePayload(e.item.id!) !== undefined);
   }
 });
 
@@ -962,6 +988,31 @@ test('fetchPage whole-batch failure surfaces the open-page error text', async ()
 });
 
 // ── Domain filter input validation ────────────────────────────────────
+
+test('invalid request registration preserves an upstream error type and null code', async () => {
+  const shim = withResponsesServerToolShim([() => ({
+    type: 'invalid-request',
+    message: 'native image error',
+    param: 'input',
+    errorType: 'image_generation_user_error',
+    code: null,
+  })]);
+  const result = await shim(
+    makeInvocation(),
+    makeGatewayCtx(),
+    () => Promise.reject(new Error('run should not be called')),
+  );
+  assert(result.type === 'api-error');
+  const body = JSON.parse(new TextDecoder().decode(result.body)) as {
+    error: { message: string; type: string; param: string | null; code: string | null };
+  };
+  assertEquals(body.error, {
+    message: 'native image error',
+    type: 'image_generation_user_error',
+    param: 'input',
+    code: null,
+  });
+});
 
 test('non-empty allowed_domains with every entry malformed is rejected as 400 invalid_request_error (no silent expansion to allow-all)', async () => {
   // Silently dropping every malformed entry would turn "only allow
@@ -1623,6 +1674,8 @@ test('truncated page contents append the truncation sentinel', async () => {
   assert(lastOutput.type === 'function_call_output');
   const text = (lastOutput as { output: string }).output;
   assert(text.includes('[Content truncated; full page is 99999 bytes.'));
+  assert(text.includes('Use the `find` sub-property with a pattern'));
+  assertFalse(text.includes("web_search's"));
 });
 
 // ── Multi-turn SSE merge invariants ──────────────────────────────────
@@ -2810,7 +2863,7 @@ test('finalMetadata resolves with the LATEST turn modelIdentity, not turn 1', as
         model: 'gpt-5',
         upstream: 'test-upstream',
         modelKey: `turn-${runCalls}-key`,
-        cost: null,
+        pricing: null,
       },
     };
   };
@@ -3302,7 +3355,7 @@ test('input preprocessor: web_search_call without an action is replaced by a pla
   assert(fco.output.includes('"id":"ws_no_action"'));
 });
 
-test('input preprocessor: web_search_call with empty id has its id synthesized and produces an upstream pair (codex CLI strips ws_gw_ ids on session persist)', async () => {
+test('input preprocessor: web_search_call with empty id has its id synthesized and produces an upstream pair', async () => {
   makeStubDeps();
   const shim = withResponsesWebSearchShim;
   const inv = makeInvocation({
@@ -3885,6 +3938,36 @@ test('responses target with flag on: function_call_output is plain-text formatte
 
   const text = lastFunctionCallOutput(inv.payload.input as ResponsesInputItem[]);
   assert(text.startsWith('Search results for "q1":'));
+});
+
+test('responses target with OpenAI passthrough uses the selected alpha search dispatcher', async () => {
+  makeStubDeps();
+  await getRepo().searchConfig.save({
+    provider: 'tavily',
+    tavily: { apiKey: 'test-key' },
+    microsoftGrounding: { apiKey: '' },
+    jina: { apiKey: '' },
+    passthroughOpenAiSearch: { enabled: true, upstreamId: 'up_codex', model: 'gpt-search' },
+  } satisfies SearchConfig);
+  const call = vi.fn<AlphaSearchDispatcher>(async () => new Response(JSON.stringify({
+    encrypted_output: null,
+    output: 'alpha output',
+    results: [{ type: 'text_result', url: 'https://example.com', title: 'Example', snippet: 'alpha snippet' }],
+  }), { status: 200, headers: { 'content-type': 'application/json' } }));
+  mockResolveAlpha.mockResolvedValue(call);
+  const inv = makeInvocation({
+    targetApi: 'responses',
+    enabledFlags: new Set<FlagId>(['responses-web-search-shim']),
+  });
+  const script = scriptedRun([
+    searchCallTurn(0, 'call_1', 'alpha query'),
+    messageTurn('done', 0),
+  ]);
+
+  await runShimAndDrain(withResponsesWebSearchShim, inv, makeGatewayCtx(), script.run);
+
+  assertEquals(lastFunctionCallOutput(inv.payload.input as ResponsesInputItem[]), 'alpha output');
+  assertEquals(call.mock.calls[0]?.[0].commands, { search_query: [{ q: 'alpha query' }] });
 });
 
 test('chat-completions target: function_call_output is plain-text formatted search results', async () => {
@@ -4481,19 +4564,11 @@ test('downstream AbortSignal threads through to provider search / fetchPage and 
   });
   const shim = withResponsesWebSearchShim;
   const inv = makeInvocation();
-  const gatewayCtx: ChatGatewayCtx = {
+  const gatewayCtx = mockChatGatewayCtx({
     apiKeyId: 'k1',
-    upstreamIds: null,
     wantsStream: true,
-    runtimeLocation: 'TEST',
-    currentColo: 'TEST',
-    dump: null,
-    responseHeaders: new Headers(),
-    backgroundScheduler: () => {},
-    requestStartedAt: 0,
-    store: createNonResponsesSourceStore('k1'),
     abortSignal: controller.signal,
-  };
+  });
   const script = scriptedRun([
     searchCallTurn(0, 'call_1', 'will-be-aborted'),
   ]);
@@ -4608,6 +4683,27 @@ const consumeTurn = async (
     records,
   );
 };
+
+test('consumeTurn forwards queued only from the first upstream turn', async () => {
+  const firstState = createMergeState();
+  const first = await consumeTurn(
+    framesOf(mkResponseQueued('queued_first'), mkResponseCreated('created_first'), mkResponseCompleted()),
+    firstState,
+    true,
+  );
+  assertEquals(eventTypesOf(first.downstreamFrames), ['response.queued', 'response.created']);
+  const queued = first.downstreamFrames[0];
+  assert(queued.type === 'event' && queued.event.type === 'response.queued');
+  assertEquals(queued.event.response.id, firstState.synthesizedResponseId);
+  assertEquals(queued.event.response.status, 'queued');
+
+  const later = await consumeTurn(
+    framesOf(mkResponseQueued('queued_later'), mkResponseCreated('created_later'), mkResponseCompleted()),
+    createMergeState(),
+    false,
+  );
+  assertEquals(later.downstreamFrames, []);
+});
 
 test('consumeTurn first turn synthesizes response.created with the once-per-request synthesized id (not the upstream id)', async () => {
   const state = createMergeState();
@@ -5111,13 +5207,17 @@ test('consumeTurn forwards content_part / output_text / annotation events live w
     'response.output_item.done',
   ]);
 
-  // Message-child events get item_id rewritten onto the
-  // downstream-minted `msg_<downstreamIndex>` (0 here).
+  const addedFrame = result.downstreamFrames.find(frame =>
+    frame.type === 'event' && frame.event.type === 'response.output_item.added');
+  assert(addedFrame?.type === 'event');
+  const messageId = (addedFrame.event as { item: { id?: string } }).item.id;
+  assert(messageId !== undefined && /^msg_[0-9a-f]{32}$/.test(messageId));
+
   for (const f of result.downstreamFrames) {
     if (f.type !== 'event') continue;
     const ev = f.event as { item_id?: string };
     if (ev.item_id !== undefined) {
-      assertEquals(ev.item_id, 'msg_0');
+      assertEquals(ev.item_id, messageId);
     }
   }
 });
@@ -5145,7 +5245,12 @@ test('consumeTurn rewrites any structurally indexed child event without an event
     f.type === 'event' && (f.event as { type: string }).type === 'response.future_child.delta');
   assert(futureFrame?.type === 'event');
   assertEquals((futureFrame.event as { output_index: number }).output_index, 0);
-  assertEquals((futureFrame.event as { item_id: string }).item_id, 'msg_0');
+  const addedFrame = result.downstreamFrames.find(f =>
+    f.type === 'event' && f.event.type === 'response.output_item.added');
+  assert(addedFrame?.type === 'event');
+  const messageId = (addedFrame.event as { item: { id?: string } }).item.id;
+  assert(messageId !== undefined && /^msg_[0-9a-f]{32}$/.test(messageId));
+  assertEquals((futureFrame.event as { item_id: string }).item_id, messageId);
 });
 
 test('consumeTurn swallows future indexed events attached to an intercepted server tool call', async () => {
@@ -5207,7 +5312,6 @@ test('consumeTurn preserves upstream message item.id (no fabrication) when upstr
     true,
   );
 
-  // Child events keep upstream's id verbatim, not rewritten to msg_0.
   const deltaFrame = result.downstreamFrames.find(f =>
     f.type === 'event' && f.event.type === 'response.output_text.delta');
   assert(deltaFrame?.type === 'event');
@@ -5960,13 +6064,15 @@ test('echo restore preserves client-supplied filters / user_location on the cano
   assertEquals((completed.response.tools![0] as { user_location: typeof userLoc }).user_location, userLoc);
 });
 
-test('duplicate hosted web_search entries silently collapse into one echoed canonical', async () => {
+test('duplicate hosted web_search declarations collapse to the last complete declaration', async () => {
   makeStubDeps();
+  const firstFilters = { allowed_domains: ['first.example'] };
+  const lastFilters = { allowed_domains: ['last.example'] };
   const inv = makeInvocation({
     payload: {
       tools: [
-        { type: 'web_search', search_context_size: 'high' },
-        { type: 'web_search' },
+        { type: 'web_search', search_context_size: 'high', filters: firstFilters },
+        { type: 'web_search_preview', search_context_size: 'low', filters: lastFilters },
       ],
     },
   });
@@ -5988,12 +6094,13 @@ test('duplicate hosted web_search entries silently collapse into one echoed cano
   // Request side: only one function tool was sent upstream.
   assertEquals(inv.payload.tools?.length, 1);
   assertEquals(inv.payload.tools?.[0].type, 'function');
-  // Response side: one restored canonical entry, preserving the FIRST
-  // hosted block's `search_context_size`.
+  // Response side: one restored declaration with the last alias and all of
+  // its configuration.
   const completed = findResponseCompleted(frames);
   assertEquals(completed.response.tools!.length, 1);
-  assertEquals(completed.response.tools![0].type, 'web_search');
-  assertEquals((completed.response.tools![0] as { search_context_size: string }).search_context_size, 'high');
+  assertEquals(completed.response.tools![0].type, 'web_search_preview');
+  assertEquals((completed.response.tools![0] as { search_context_size: string }).search_context_size, 'low');
+  assertEquals((completed.response.tools![0] as { filters: typeof lastFilters }).filters, lastFilters);
 });
 
 test('echo restore swaps the function-typed tool_choice back to a hosted tool_choice', async () => {

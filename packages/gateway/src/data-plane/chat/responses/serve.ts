@@ -1,27 +1,24 @@
 import { responsesAttempt } from './attempt.ts';
+import { wrapNativeResponsesClientOutput } from './client-output.ts';
 import type { ResponsesAttemptResult } from './interceptors/types.ts';
+import { syntheticEventsFromResult } from './items/output.ts';
+import { rewriteResponsesItemsForCandidate } from './items/rewrite.ts';
 import { prepareResponsesServePlan } from './serve-prep.ts';
+import { tokenUsageFromResponsesResult } from './usage.ts';
 import { iterateCandidates } from '../../shared/iterate-candidates.ts';
 import type { ChatGatewayCtx } from '../shared/gateway-ctx.ts';
 import type { ProtocolFrame } from '@floway-dev/protocols/common';
-import type { ResponsesStreamEvent } from '@floway-dev/protocols/responses';
+import { collectResponsesProtocolEventsToResult, type CanonicalResponsesPayload, type ResponsesStreamEvent } from '@floway-dev/protocols/responses';
 import type { ExecuteResult } from '@floway-dev/provider';
-import type { CanonicalResponsesPayload } from '@floway-dev/translate/via-responses/responses-items';
 
-export interface ResponsesServeGenerateArgs {
-  readonly payload: CanonicalResponsesPayload;
-  readonly ctx: ChatGatewayCtx;
-  readonly headers: Headers;
-}
-
-export interface ResponsesServeCompactArgs {
+interface ResponsesServeArgs {
   readonly payload: CanonicalResponsesPayload;
   readonly ctx: ChatGatewayCtx;
   readonly headers: Headers;
 }
 
 export const responsesServe = {
-  generate: async (args: ResponsesServeGenerateArgs): Promise<ExecuteResult<ProtocolFrame<ResponsesStreamEvent>>> => {
+  generate: async (args: ResponsesServeArgs): Promise<ExecuteResult<ProtocolFrame<ResponsesStreamEvent>>> => {
     const { payload, ctx, headers } = args;
     const plan = await prepareResponsesServePlan({ payload, ctx });
     if (plan.kind === 'failure') return plan.result;
@@ -29,23 +26,41 @@ export const responsesServe = {
     // final answer; per-candidate failures fall through so a transient
     // 5xx/429/network does not become the request's verdict when another
     // candidate can serve. The last failure surfaces verbatim on exhaustion.
-    // Normalize `prepared.model` to the candidate's real id so every
-    // attempt sees the canonical resolved public id.
-    return await iterateCandidates(
+    // Each attempt stamps its private prepared-payload clone with the
+    // candidate's canonical model id.
+    const result = await iterateCandidates(
       plan.candidates,
       'responsesServe.generate',
-      candidate => {
-        plan.prepared.model = candidate.model.id;
-        return responsesAttempt.generate({ payload: plan.prepared, ctx, candidate, headers });
+      ctx,
+      'chat',
+      async candidate => {
+        const rewritten = rewriteResponsesItemsForCandidate(
+          plan.affinity.payloadForCandidate(candidate),
+          plan.privatePayloads,
+          ctx.store,
+          candidate,
+        );
+        const result = await responsesAttempt.generate({
+          payload: rewritten.payload,
+          sourceState: {
+            privatePayloads: rewritten.privatePayloads,
+          },
+          ctx,
+          candidate,
+          headers,
+        });
+        if (result.type === 'events') ctx.affinity.select(candidate);
+        return result;
       },
     );
+    return result;
   },
 
-  compact: async (args: ResponsesServeCompactArgs): Promise<ResponsesAttemptResult> => {
+  compact: async (args: ResponsesServeArgs): Promise<ResponsesAttemptResult> => {
     const { payload, ctx, headers } = args;
     // Compact accepts `previous_response_id` (the official endpoint documents
     // it). When present serve-prep expands it the same way generate does so
-    // the upstream sees the same item_reference + current input shape.
+    // the candidate rewrite can restore the stored history before dispatch.
     //
     // For non-responses targets the responses-compact-shim picks up the
     // request inside the interceptor chain, flips action='compact' to
@@ -53,13 +68,40 @@ export const responsesServe = {
     // re-tags the result as compact on the way out.
     const plan = await prepareResponsesServePlan({ payload, ctx });
     if (plan.kind === 'failure') return plan.result;
-    return await iterateCandidates(
+    const result = await iterateCandidates(
       plan.candidates,
       'responsesServe.compact',
-      candidate => {
-        plan.prepared.model = candidate.model.id;
-        return responsesAttempt.invoke({ payload: plan.prepared, action: 'compact', ctx, candidate, headers });
+      ctx,
+      'chat',
+      async candidate => {
+        const rewritten = rewriteResponsesItemsForCandidate(
+          plan.affinity.payloadForCandidate(candidate),
+          plan.privatePayloads,
+          ctx.store,
+          candidate,
+        );
+        const result = await responsesAttempt.invoke({
+          payload: rewritten.payload,
+          sourceState: {
+            privatePayloads: rewritten.privatePayloads,
+          },
+          action: 'compact',
+          ctx,
+          candidate,
+          headers,
+        });
+        if (result.type === 'result') ctx.affinity.select(candidate);
+        return result;
       },
     );
+    if (result.type !== 'result') return result;
+
+    const stored = wrapNativeResponsesClientOutput(syntheticEventsFromResult(result.result), ctx);
+    const clientResult = await collectResponsesProtocolEventsToResult(stored);
+    return {
+      ...result,
+      result: clientResult,
+      usage: tokenUsageFromResponsesResult(clientResult),
+    };
   },
 };

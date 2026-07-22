@@ -1,18 +1,18 @@
 import { afterEach, test, vi } from 'vitest';
 
-import { createStoredResponsesItemId } from './items/format.ts';
+import { createResponsesItemId } from './items/format.ts';
 import { createResponsesHttpStore, MemoryStatefulResponsesBacking, LayeredStatefulResponsesStore } from './items/store.ts';
 import { initRepo } from '../../../repo/index.ts';
 import { InMemoryRepo } from '../../../repo/memory.ts';
 import type { StoredResponsesItem, StoredResponsesSnapshot } from '../../../repo/types.ts';
+import { mockChatGatewayCtx } from '../../../test-helpers/gateway-ctx.ts';
 import type { ChatGatewayCtx } from '../shared/gateway-ctx.ts';
 import type { ChatCompletionsStreamEvent } from '@floway-dev/protocols/chat-completions';
 import { type AliasRules, doneFrame, eventFrame, type ModelEndpoints, type ProtocolFrame } from '@floway-dev/protocols/common';
 import type { MessagesStreamEvent } from '@floway-dev/protocols/messages';
-import type { ResponsesPayload, ResponsesResult, ResponsesStreamEvent } from '@floway-dev/protocols/responses';
+import type { CanonicalResponsesPayload, ResponsesPayload, ResponsesResult, ResponsesStreamEvent } from '@floway-dev/protocols/responses';
 import { type ModelCandidate, directFetcher, type ProviderResponsesResult, type ProviderStreamResult, type ResponsesAction, type UpstreamCallOptions } from '@floway-dev/provider';
 import { assert, assertEquals, stubProvider, stubInternalModel } from '@floway-dev/test-utils';
-import type { CanonicalResponsesPayload } from '@floway-dev/translate/via-responses/responses-items';
 
 // Mock the resolver seam so each test hands the serve exactly the provider
 // candidates it wants, optionally with an alias-rules overlay attached.
@@ -64,18 +64,12 @@ const installRepo = (): InMemoryRepo => {
   return repo;
 };
 
-const makeGatewayCtx = (store?: ChatGatewayCtx['store']): ChatGatewayCtx => ({
-  apiKeyId: API_KEY_ID,
-  upstreamIds: null,
-  wantsStream: true,
-  runtimeLocation: 'TEST',
-  currentColo: 'TEST',
-  dump: null,
-  responseHeaders: new Headers(),
-  backgroundScheduler: () => {},
-  requestStartedAt: 0,
-  store: store ?? createResponsesHttpStore(API_KEY_ID, true),
-});
+const makeGatewayCtx = (store?: ChatGatewayCtx['store']) =>
+  mockChatGatewayCtx({
+    apiKeyId: API_KEY_ID,
+    wantsStream: true,
+    store: store ?? createResponsesHttpStore(API_KEY_ID, true),
+  });
 
 const makePayload = (overrides: Partial<CanonicalResponsesPayload> = {}): CanonicalResponsesPayload => ({
   model: 'test-model',
@@ -114,6 +108,7 @@ const makeProtocolFrames = async function* <E>(events: readonly E[]): AsyncGener
 
 const makeCandidate = (overrides: {
   upstream?: string;
+  modelId?: string;
   endpoints?: ModelEndpoints;
   callResponses?: (model: unknown, body: unknown, action: ResponsesAction, signal?: AbortSignal, opts?: UpstreamCallOptions) => Promise<ProviderResponsesResult>;
   callMessages?: (model: unknown, body: unknown, signal?: AbortSignal, opts?: UpstreamCallOptions) => Promise<ProviderStreamResult<MessagesStreamEvent>>;
@@ -133,11 +128,13 @@ const makeCandidate = (overrides: {
       disabledPublicModelIds: [],
       modelPrefix: null,
       instance: provider,
-      supportsResponsesItemReference: true,
     },
     // Default keeps stubInternalModel's three-endpoint map intact; tests that
     // need a rejected candidate pass an explicit `endpoints` override.
-    model: stubInternalModel(overrides.endpoints ? { endpoints: overrides.endpoints } : {}, upstream),
+    model: stubInternalModel({
+      id: overrides.modelId ?? 'test-model',
+      ...(overrides.endpoints ? { endpoints: overrides.endpoints } : {}),
+    }, upstream),
     fetcher: directFetcher,
   };
 };
@@ -187,15 +184,18 @@ test('compact returns a result envelope from the wrapped attempt', async () => {
     object: 'response.compaction',
     output: [compactionItem] as unknown as ResponsesResult['output'],
   };
-  const callResponses = vi.fn(async (_model: unknown, _body: unknown, action: ResponsesAction): Promise<ProviderResponsesResult> => {
+  const observedModelIds: string[] = [];
+  const callResponses = vi.fn(async (model: unknown, _body: unknown, action: ResponsesAction): Promise<ProviderResponsesResult> => {
     if (action !== 'compact') throw new Error(`expected compact, got ${action}`);
+    observedModelIds.push((model as { id: string }).id);
     return { action: 'compact', ok: true, result: compactionResult, modelKey: 'test-model-key' };
   });
-  const candidate = makeCandidate({ upstream: 'up_a', callResponses });
+  const candidate = makeCandidate({ upstream: 'up_a', modelId: 'gpt-target', callResponses });
   queueResolution([candidate]);
+  const payload = compactPayload({ model: 'gpt-alias' });
 
   const result = await responsesServe.compact({
-    payload: compactPayload(),
+    payload,
     ctx: makeGatewayCtx(),
     headers: new Headers(),
   });
@@ -205,30 +205,47 @@ test('compact returns a result envelope from the wrapped attempt', async () => {
   assertEquals(result.result.object, 'response.compaction');
   assertEquals(callResponses.mock.calls.length, 1);
   assertEquals(callResponses.mock.calls[0][2], 'compact');
+  assertEquals(observedModelIds, ['gpt-target']);
+  assertEquals(payload.model, 'gpt-alias');
 });
 
 test('generate falls through to the next candidate when the first yields an upstream error', async () => {
   installRepo();
+  const originalImageUrl = 'data:image/png;base64,AQID';
+  const payload = makePayload({
+    input: [{
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_image', image_url: originalImageUrl, detail: 'auto' }],
+    }],
+  });
   const firstError = new Response(JSON.stringify({ error: { message: 'nope' } }), {
     status: 502, headers: new Headers({ 'content-type': 'application/json' }),
   });
-  const firstCall = vi.fn(async (): Promise<ProviderResponsesResult> => ({
-    action: 'generate', ok: false, response: firstError, modelKey: 'first-key',
-  }));
+  const firstCall = vi.fn(async (_model: unknown, body: unknown): Promise<ProviderResponsesResult> => {
+    const item = (body as Omit<CanonicalResponsesPayload, 'model'>).input[0];
+    if (item.type !== 'message' || !Array.isArray(item.content) || item.content[0]?.type !== 'input_image') throw new Error('expected image content');
+    item.content[0].image_url = 'data:image/webp;base64,COMPRESSED';
+    return { action: 'generate', ok: false, response: firstError, modelKey: 'first-key' };
+  });
   const completed: ResponsesStreamEvent = {
     type: 'response.completed',
     sequence_number: 0,
     response: makeResponsesResult('resp_second'),
   };
-  const secondCall = vi.fn(async (): Promise<ProviderResponsesResult> => ({
-    action: 'generate', ok: true, events: makeProtocolFrames([completed]), modelKey: 'second-key', headers: new Headers(),
-  }));
+  let fallbackImageUrl: string | null | undefined;
+  const secondCall = vi.fn(async (_model: unknown, body: unknown): Promise<ProviderResponsesResult> => {
+    const item = (body as Omit<CanonicalResponsesPayload, 'model'>).input[0];
+    if (item.type !== 'message' || !Array.isArray(item.content) || item.content[0]?.type !== 'input_image') throw new Error('expected image content');
+    fallbackImageUrl = item.content[0].image_url;
+    return { action: 'generate', ok: true, events: makeProtocolFrames([completed]), modelKey: 'second-key', headers: new Headers() };
+  });
   const first = makeCandidate({ upstream: 'up_a', callResponses: firstCall });
   const second = makeCandidate({ upstream: 'up_b', callResponses: secondCall });
   queueResolution([first, second]);
 
   const result = await responsesServe.generate({
-    payload: makePayload(),
+    payload,
     ctx: makeGatewayCtx(),
     headers: new Headers(),
   });
@@ -239,6 +256,47 @@ test('generate falls through to the next candidate when the first yields an upst
   assertEquals(result.type, 'events');
   assertEquals(firstCall.mock.calls.length, 1);
   assertEquals(secondCall.mock.calls.length, 1);
+  assertEquals(fallbackImageUrl, originalImageUrl);
+  const sourceItem = payload.input[0];
+  if (sourceItem.type !== 'message' || !Array.isArray(sourceItem.content) || sourceItem.content[0]?.type !== 'input_image') throw new Error('expected source image content');
+  assertEquals(sourceItem.content[0].image_url, originalImageUrl);
+});
+
+// A mid-attempt throw (interceptor bug / translation error / provider-layer
+// JS exception bypassing tryCatchChatServeFailure) must attribute the perf
+// error row to the throwing candidate, not the previous one that already
+// failed cleanly with a 5xx.
+test('mid-attempt throw stamps telemetry with the throwing candidate, not the previous one', async () => {
+  installRepo();
+  const firstError = new Response(JSON.stringify({ error: { message: 'nope' } }), {
+    status: 502, headers: new Headers({ 'content-type': 'application/json' }),
+  });
+  const firstCall = vi.fn(async (): Promise<ProviderResponsesResult> => ({
+    action: 'generate', ok: false, response: firstError, modelKey: 'first-key',
+  }));
+  const secondCall = vi.fn(async (): Promise<ProviderResponsesResult> => {
+    throw new Error('simulated provider-layer JS exception');
+  });
+  queueResolution([
+    makeCandidate({ upstream: 'up_a', callResponses: firstCall }),
+    makeCandidate({ upstream: 'up_b', callResponses: secondCall }),
+  ]);
+
+  const ctx = makeGatewayCtx();
+  await responsesServe.generate({
+    payload: makePayload(),
+    ctx,
+    headers: new Headers(),
+  }).then(
+    () => { throw new Error('expected responsesServe.generate to throw'); },
+    (error: unknown) => {
+      assertEquals((error as Error).message, 'simulated provider-layer JS exception');
+    },
+  );
+
+  assertEquals(firstCall.mock.calls.length, 1);
+  assertEquals(secondCall.mock.calls.length, 1);
+  assertEquals(ctx.attempt.telemetry?.upstream, 'up_b');
 });
 
 test('generate renders model-missing when no candidates are available', async () => {
@@ -279,71 +337,6 @@ test('generate filters out candidates whose endpoints do not satisfy the respons
   assertEquals(body.error.type, 'invalid_request_error');
   assert(typeof body.error.message === 'string' && body.error.message.includes('does not support'));
   assertEquals(callResponses.mock.calls.length, 0);
-});
-
-test('generate renders routing-unavailable as a 400 when a forcing item names an absent upstream', async () => {
-  const repo = installRepo();
-  const id = createStoredResponsesItemId('compaction');
-  const row: StoredResponsesItem = {
-    id,
-    apiKeyId: API_KEY_ID,
-    upstreamId: 'up_forcing',
-    upstreamItemId: 'raw_cmp',
-    itemType: 'compaction',
-    origin: 'upstream',
-    contentHash: null,
-    encryptedContentHash: null,
-    payload: null,
-    createdAt: 1_000,
-    refreshedAt: 1_000,
-  };
-  await repo.responsesItems.insertMany([row]);
-
-  queueResolution([makeCandidate({ upstream: 'up_b' })]);
-
-  const result = await responsesServe.generate({
-    payload: makePayload({ input: [{ type: 'item_reference', id }] }),
-    ctx: makeGatewayCtx(),
-    headers: new Headers(),
-  });
-
-  assertEquals(result.type, 'api-error');
-  if (result.type !== 'api-error') throw new Error('unreachable');
-  assertEquals(result.status, 400);
-  const body = JSON.parse(new TextDecoder().decode(result.body));
-  assertEquals(body.error.code, 'responses_item_routing_unavailable');
-});
-
-test('compact renders routing-unavailable when no candidate exposes the responses endpoint', async () => {
-  const repo = installRepo();
-  const id = createStoredResponsesItemId('compaction');
-  await repo.responsesItems.insertMany([{
-    id,
-    apiKeyId: API_KEY_ID,
-    upstreamId: 'up_forcing',
-    upstreamItemId: 'raw_cmp',
-    itemType: 'compaction',
-    origin: 'upstream',
-    contentHash: null,
-    encryptedContentHash: null,
-    payload: null,
-    createdAt: 1_000,
-    refreshedAt: 1_000,
-  }]);
-
-  queueResolution([makeCandidate({ upstream: 'up_b' })]);
-
-  const result = await responsesServe.compact({
-    payload: makePayload({ input: [{ type: 'item_reference', id }] }),
-    ctx: makeGatewayCtx(),
-    headers: new Headers(),
-  });
-
-  assertEquals(result.type, 'api-error');
-  if (result.type !== 'api-error') throw new Error('unreachable');
-  assertEquals(result.status, 400);
-  const body = JSON.parse(new TextDecoder().decode(result.body));
-  assertEquals(body.error.code, 'responses_item_routing_unavailable');
 });
 
 test('compact renders model-missing as a 404 when no candidates are available', async () => {
@@ -388,26 +381,22 @@ test('compact renders model-unsupported as a 400 when the only candidate\'s endp
 
 test('expandPreviousResponseId prepends snapshot items and strips the previous_response_id field', async () => {
   const repo = installRepo();
-  const previousMessageId = createStoredResponsesItemId('message');
+  const previousMessageId = createResponsesItemId('message');
   await repo.responsesItems.insertMany([{
     id: previousMessageId,
     apiKeyId: API_KEY_ID,
     upstreamId: null,
     upstreamItemId: null,
     itemType: 'message',
-    origin: 'input',
-    contentHash: null,
-    encryptedContentHash: null,
+    contentHash: 'previous-message-hash',
     payload: { item: { type: 'message', id: previousMessageId, role: 'user', content: 'first turn' } },
     createdAt: 1_000,
-    refreshedAt: 1_000,
   }]);
   const snapshot: StoredResponsesSnapshot = {
     id: 'resp_prev',
     apiKeyId: API_KEY_ID,
     itemIds: [previousMessageId],
     createdAt: 1_000,
-    refreshedAt: 1_000,
   };
   await repo.responsesSnapshots.insert(snapshot);
 
@@ -431,40 +420,33 @@ test('expandPreviousResponseId prepends snapshot items and strips the previous_r
 // that lives nowhere else.
 const memoryStore = async (snapshots: readonly StoredResponsesSnapshot[], items: readonly StoredResponsesItem[]) => {
   const backing = new MemoryStatefulResponsesBacking();
-  for (const item of items) await backing.insertItems([item], { durable: true });
+  for (const item of items) await backing.insertItems([item]);
   for (const snapshot of snapshots) await backing.insertSnapshot(snapshot);
   return new LayeredStatefulResponsesStore({
     apiKeyId: API_KEY_ID,
     reads: [backing],
-    itemWrites: [{ backing, durable: true }],
-    snapshotWrites: [{ backing, durable: true }],
-    stageInputs: true,
-    shouldStorePayload: true,
+    writes: [backing],
   });
 };
 
 test('expandPreviousResponseId resolves snapshots from a non-repo-backed store', async () => {
   installRepo(); // affinity lookups in the wider flow still need a repo, but here the helper only touches the store.
-  const id = createStoredResponsesItemId('message');
+  const id = createResponsesItemId('message');
   const item: StoredResponsesItem = {
     id,
     apiKeyId: API_KEY_ID,
     upstreamId: null,
     upstreamItemId: null,
     itemType: 'message',
-    origin: 'input',
-    contentHash: null,
-    encryptedContentHash: null,
+    contentHash: 'memory-message-hash',
     payload: { item: { type: 'message', id, role: 'user', content: 'remembered' } },
     createdAt: 1_000,
-    refreshedAt: 1_000,
   };
   const snapshot: StoredResponsesSnapshot = {
     id: 'resp_mem',
     apiKeyId: API_KEY_ID,
     itemIds: [id],
     createdAt: 1_000,
-    refreshedAt: 1_000,
   };
   const store = await memoryStore([snapshot], [item]);
 
@@ -559,141 +541,16 @@ test('generate falls through translate-out to chat-completions target', async ()
   assertEquals(callChatCompletions.mock.calls.length, 1);
 });
 
-test('generate reuses an existing input row when a later turn echoes the same user message', async () => {
-  const repo = installRepo();
-  let turn = 0;
-  const callResponses = vi.fn(async (): Promise<ProviderResponsesResult> => {
-    turn += 1;
-    return {
-      action: 'generate', ok: true,
-      events: makeProtocolFrames([{
-        type: 'response.completed',
-        sequence_number: 0,
-        response: makeResponsesResult(`resp_turn_${turn}`),
-      }]),
-      modelKey: 'test-model-key',
-      headers: new Headers(),
-    };
-  });
-  const store = createResponsesHttpStore(API_KEY_ID, true);
-  const payload = makePayload({ input: [{ type: 'message', role: 'user', content: 'hello' }] });
-
-  queueResolution([makeCandidate({ callResponses })]);
-  const turn1 = await responsesServe.generate({ payload, ctx: makeGatewayCtx(store), headers: new Headers() });
-  if (turn1.type !== 'events') throw new Error('turn 1: expected events');
-  const turn1Events = await collectEvents(turn1.events);
-
-  queueResolution([makeCandidate({ callResponses })]);
-  const turn2 = await responsesServe.generate({ payload, ctx: makeGatewayCtx(store), headers: new Headers() });
-  if (turn2.type !== 'events') throw new Error('turn 2: expected events');
-  const turn2Events = await collectEvents(turn2.events);
-
-  // Both snapshots' first item id is the staged user message; a working
-  // content-hash preload makes turn 2 reuse turn 1's row instead of minting
-  // a fresh one. Look up by the Floway-minted response id wrap puts on
-  // each terminal event — the upstream's `resp_turn_N` id is discarded.
-  const turn1ResponseId = (turn1Events.find(e => e.type === 'response.completed') as Extract<ResponsesStreamEvent, { type: 'response.completed' }>).response.id;
-  const turn2ResponseId = (turn2Events.find(e => e.type === 'response.completed') as Extract<ResponsesStreamEvent, { type: 'response.completed' }>).response.id;
-  const snap1 = await repo.responsesSnapshots.lookup(API_KEY_ID, turn1ResponseId);
-  const snap2 = await repo.responsesSnapshots.lookup(API_KEY_ID, turn2ResponseId);
-  if (snap1 === null || snap2 === null) throw new Error('expected both snapshots to be persisted');
-  const turn1InputId = snap1.itemIds[0];
-  const turn2InputId = snap2.itemIds[0];
-  if (turn1InputId === undefined || turn2InputId === undefined) throw new Error('expected each snapshot to start with a staged input item');
-  assertEquals(turn2InputId, turn1InputId);
-});
-
-test('generate treats compaction_trigger-bearing input as compaction: snapshot replaces prior history with the compaction output alone, trigger reaches the wire but never stores a row', async () => {
-  const repo = installRepo();
-
-  // Seed a prior conversation: one user message + a snapshot pointing at it.
-  // The compacting turn references that snapshot via previous_response_id, so
-  // generate without the trigger would normally append [prior items + this
-  // turn's input + output] into the new snapshot. The trigger flips that to
-  // 'replace' so the new snapshot only carries the compaction blob — the
-  // whole point of compaction is to drop the prior history.
-  const priorMessageId = createStoredResponsesItemId('message');
-  await repo.responsesItems.insertMany([{
-    id: priorMessageId,
-    apiKeyId: API_KEY_ID,
-    upstreamId: null,
-    upstreamItemId: null,
-    itemType: 'message',
-    origin: 'input',
-    contentHash: null,
-    encryptedContentHash: null,
-    payload: { item: { type: 'message', id: priorMessageId, role: 'user', content: 'old turn' } },
-    createdAt: 1_000,
-    refreshedAt: 1_000,
-  }]);
-  await repo.responsesSnapshots.insert({
-    id: 'resp_before_compact',
-    apiKeyId: API_KEY_ID,
-    itemIds: [priorMessageId],
-    createdAt: 1_000,
-    refreshedAt: 1_000,
-  });
-
-  let receivedInput: unknown = null;
-  const callResponses = vi.fn(async (_model: unknown, body: unknown): Promise<ProviderResponsesResult> => {
-    receivedInput = (body as { input: unknown }).input;
-    return {
-      action: 'generate', ok: true,
-      events: makeProtocolFrames([{
-        type: 'response.completed',
-        sequence_number: 0,
-        response: {
-          ...makeResponsesResult(),
-          output: [{ type: 'compaction', id: 'upstream_cmp_id', encrypted_content: 'ENC' }] as unknown as ResponsesResult['output'],
-        },
-      }]),
-      modelKey: 'test-model-key',
-      headers: new Headers(),
-    };
-  });
-  queueResolution([makeCandidate({ upstream: 'up_a', callResponses })]);
-
-  const result = await responsesServe.generate({
-    payload: makePayload({
-      previous_response_id: 'resp_before_compact',
-      input: [{ type: 'compaction_trigger' }],
-    }),
-    ctx: makeGatewayCtx(),
-    headers: new Headers(),
-  });
-
-  if (result.type !== 'events') throw new Error('expected events');
-  const events = await collectEvents(result.events);
-  const completed = events.find(e => e.type === 'response.completed') as Extract<ResponsesStreamEvent, { type: 'response.completed' }>;
-  const responseId = completed.response.id;
-
-  // 'replace' semantics: only the new compaction row, no item_reference to
-  // priorMessageId and no row for the trigger. (The test would also throw
-  // outright at `stageInputItem` if the trigger early-return regressed,
-  // since createStoredResponsesItemId('compaction_trigger') has no prefix.)
-  const snap = await repo.responsesSnapshots.lookup(API_KEY_ID, responseId);
-  if (snap === null) throw new Error('expected snapshot to be persisted');
-  assertEquals(snap.itemIds.length, 1);
-  const onlyItemId = snap.itemIds[0];
-  if (onlyItemId === undefined) throw new Error('unreachable');
-  assertEquals(onlyItemId.startsWith('cmp_'), true);
-
-  // The trigger still reaches the upstream — the gateway only intercepts at
-  // the storage seam, not on the wire. The expanded prefix puts item_reference
-  // first, the trigger last.
-  if (!Array.isArray(receivedInput)) throw new Error('expected the wire input to be an array');
-  assertEquals((receivedInput.at(-1) as { type?: unknown })?.type, 'compaction_trigger');
-});
-
 test('alias resolution swaps the inbound model id for the target and overlays rules onto the Responses IR', async () => {
   installRepo();
   const capturedBodies: ResponsesPayload[] = [];
-  const callResponses = vi.fn(async (_model: unknown, body: unknown): Promise<ProviderResponsesResult> => {
+  const observedModelIds: string[] = [];
+  const callResponses = vi.fn(async (model: unknown, body: unknown): Promise<ProviderResponsesResult> => {
+    observedModelIds.push((model as { id: string }).id);
     capturedBodies.push(body as ResponsesPayload);
     return { action: 'generate', ok: true, events: makeProtocolFrames([{ type: 'response.completed', sequence_number: 0, response: makeResponsesResult() }]), modelKey: 'gpt-5.4', headers: new Headers() };
   });
-  const candidate = makeCandidate({ upstream: 'up_a', callResponses });
-  Object.assign(candidate.model, { id: 'gpt-5.4' });
+  const candidate = makeCandidate({ upstream: 'up_a', modelId: 'gpt-5.4', callResponses });
   queueResolution([candidate], {
     aliasRules: { reasoning: { effort: 'high', summary: 'detailed' }, verbosity: 'medium', serviceTier: 'priority' },
   });
@@ -709,12 +566,11 @@ test('alias resolution swaps the inbound model id for the target and overlays ru
   if (result.type !== 'events') throw new Error('unreachable');
   await collectEvents(result.events);
 
-  // Resolver saw the inbound alias id; serve rewrote the prepared payload's
-  // model to the target id before dispatching. (The attempt strips `model`
-  // from the body — the provider re-stamps it from `candidate.model.id` —
-  // so we only verify payload rewriting via `payload.model` here.)
+  // Resolver and caller payload retain the inbound alias; the provider model
+  // argument carries the resolved target id while the body omits `model`.
   assertEquals(lastResolveCall.model, 'gpt-fast');
-  assertEquals(payload.model, 'gpt-5.4');
+  assertEquals(observedModelIds, ['gpt-5.4']);
+  assertEquals(payload.model, 'gpt-fast');
   const observed = capturedBodies[0]!;
   assertEquals(observed.reasoning?.effort, 'high');
   assertEquals(observed.reasoning?.summary, 'detailed');

@@ -49,10 +49,14 @@ export const flagDefaultsForKind = (kind: UpstreamProviderKind): FlagDefaults =>
 // (this, getModels) so a caller can never omit it and silently receive the
 // full, unscoped catalog — a missing scope is a compile error, not a runtime
 // leak. Pass `null` to deliberately request every enabled upstream.
+//
+// `preFetchedUpstreams` lets a caller reuse a list it already loaded on
+// this request instead of paying a second `upstreams.list()` round-trip.
 export const listModelProviders = async (
   upstreamFilter: readonly string[] | null,
+  preFetchedUpstreams?: readonly UpstreamRecord[],
 ): Promise<Provider[]> => {
-  const upstreams = await getRepo().upstreams.list();
+  const upstreams = preFetchedUpstreams ?? await getRepo().upstreams.list();
   const enabledById = new Map<string, UpstreamRecord>();
   const knownIds = new Set<string>();
   for (const upstream of upstreams) {
@@ -86,7 +90,7 @@ export const listModelProviders = async (
 // The provider model is stored verbatim under that entry so dispatch hands
 // the same reference back to the provider's `callXxx`.
 const internalModelFromProviderModel = (providerModel: ProviderModel, upstreamId: string): InternalModel => {
-  const { providerData, enabledFlags, flagOverrides, endpoints, ...metadata } = providerModel;
+  const { providerData, enabledFlags, flagOverrides, rerankTarget, endpoints, ...metadata } = providerModel;
   return {
     ...metadata,
     endpoints: { ...endpoints },
@@ -457,14 +461,14 @@ const orderAliasTargets = (alias: ModelAliasRecord): readonly ModelAliasRecord['
 // `model.endpoints`, or checking the specific `imagesEdits` /
 // `imagesGenerations` / `completions` endpoint key — is the caller's job.
 // This function stays endpoint-blind so the same path serves chat,
-// embeddings, image generation/edits, and legacy completions.
+// embeddings, image generation/edits, rerank, and legacy completions.
 //
 // The alias walk is a natural top-of-chain check: by construction an
 // alias's target id is a real model id, so the shadow pattern (an alias
 // whose first target matches its own name) resolves to the real model on
 // the first pass; alias names never re-enter the alias layer.
 export const enumerateModelCandidates = async ({
-  upstreamIds, model, kind, scheduler, currentColo,
+  upstreamIds, model, kind, scheduler, runtimeLocation,
 }: {
   // null = unrestricted; empty list = no providers visible.
   upstreamIds: readonly string[] | null;
@@ -474,16 +478,16 @@ export const enumerateModelCandidates = async ({
   // catalog lookup hits the SWR-cached `fetchUpstreamModelsCached` instead
   // of round-tripping to the upstream on every request.
   scheduler: BackgroundScheduler;
-  // Current colo for this request — see GatewayCtx.currentColo. Threaded
-  // into the per-request fetcher so colo-scoped fallback entries can be
-  // honoured at dial time.
-  currentColo: string;
+  // Runtime location tag for this request — see GatewayCtx.runtimeLocation.
+  // Threaded into the per-request fetcher so colo-scoped fallback entries
+  // can be honoured at dial time.
+  runtimeLocation: string;
 }): Promise<{
   readonly candidates: readonly ModelCandidate[];
   readonly sawModel: boolean;
   readonly failedUpstreams: readonly string[];
 }> => {
-  const fetcherForUpstream = await createPerRequestFetcher(currentColo);
+  const fetcherForUpstream = await createPerRequestFetcher(runtimeLocation);
   const providers = await listModelProviders(upstreamIds);
 
   const alias = await getRepo().modelAliases.getByName(model);

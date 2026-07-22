@@ -1,9 +1,8 @@
 import { chatCompletionsContentToResponsesInputContent, chatCompletionsContentToText } from '../shared/chat-completions-and-responses/content.ts';
 import { scalarToResponsesReasoningItem, translateChatCompletionsReasoningItems } from '../shared/chat-completions-and-responses/reasoning.ts';
-import { type CanonicalResponsesPayload } from '../shared/via-responses/responses-items.ts';
 import { TranslatorInputError } from '../translator-input-error.ts';
 import type { ChatCompletionsPayload, ChatCompletionsTool } from '@floway-dev/protocols/chat-completions';
-import type { ResponsesInputItem, ResponsesInputReasoning, ResponsesTool, ResponsesToolChoice } from '@floway-dev/protocols/responses';
+import type { CanonicalResponsesPayload, ResponsesInputItem, ResponsesInputReasoning, ResponsesTool, ResponsesToolChoice } from '@floway-dev/protocols/responses';
 
 const translateChatTools = (tools?: ChatCompletionsTool[] | null): ResponsesTool[] | null =>
   tools?.length
@@ -48,8 +47,8 @@ export const translateChatCompletionsToResponses = (payload: ChatCompletionsPayl
     }
 
     if (message.role === 'assistant') {
-      const reasoningItems = translateChatCompletionsReasoningItems<ResponsesInputReasoning>(message.reasoning_items, () => input.length);
-      const scalarReasoning = scalarToResponsesReasoningItem<ResponsesInputReasoning>(message.reasoning_text, `rs_${input.length}`);
+      const reasoningItems = translateChatCompletionsReasoningItems<ResponsesInputReasoning>(message.reasoning_items);
+      const scalarReasoning = scalarToResponsesReasoningItem<ResponsesInputReasoning>(message.reasoning_text);
       if (reasoningItems) {
         input.push(...reasoningItems);
       } else if (scalarReasoning) {

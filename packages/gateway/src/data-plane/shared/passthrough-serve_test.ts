@@ -11,7 +11,7 @@
 //   - its extractBilling reads the OpenAI-style `usage.prompt_tokens` off
 //     a 2xx JSON body, so a body with that shape triggers a real usage
 //     write;
-//   - it shares the exact same forwardUpstreamResponse + scheduleUsageRecord
+//   - it shares the exact same forwardUpstreamResponse + settle
 //     path as the images endpoints — the behaviors under test are owned by
 //     passthroughServe, not the endpoint shape.
 
@@ -75,13 +75,13 @@ test('passthrough-serve: usage-record failure does not turn upstream 2xx into 50
       },
     );
 
-    assertEquals(errorSpy.mock.calls.some(call => call[0] === 'Failed to record token usage:'), true);
+    assertEquals(errorSpy.mock.calls.some(call => call[0] === 'Failed to record usage:'), true);
   } finally {
     errorSpy.mockRestore();
   }
 });
 
-test('passthrough-serve: non-JSON 2xx upstream body is forwarded verbatim with no usage record', async () => {
+test('passthrough-serve: non-JSON 2xx upstream body is forwarded verbatim with a request-only usage record', async () => {
   const { apiKey, repo } = await setupAppTest();
   await registerEmbeddingsUpstream(repo);
 
@@ -119,7 +119,9 @@ test('passthrough-serve: non-JSON 2xx upstream body is forwarded verbatim with n
     );
 
     const usage = await repo.usage.listAll();
-    assertEquals(usage.length, 0);
+    assertEquals(usage.length, 1);
+    assertEquals(usage[0].requests, 1);
+    assertEquals(usage[0].metrics, []);
     // The parse failure is observable through console.warn so operators can
     // correlate missing usage rows against upstream body shape regressions.
     assertEquals(warnSpy.mock.calls.some(call => typeof call[0] === 'string' && call[0].includes('passthrough-serve: failed to parse 2xx upstream body for /embeddings')), true);
@@ -128,7 +130,7 @@ test('passthrough-serve: non-JSON 2xx upstream body is forwarded verbatim with n
   }
 });
 
-test('passthrough-serve: response header allow-list forwards expected headers and drops the rest', async () => {
+test('passthrough-serve: response header blocklist preserves vendor metadata and drops unsafe headers', async () => {
   const { apiKey, repo } = await setupAppTest();
   await registerEmbeddingsUpstream(repo);
 
@@ -174,7 +176,7 @@ test('passthrough-serve: response header allow-list forwards expected headers an
       assertEquals(response.headers.get('x-ratelimit-remaining'), '100');
       assertEquals(response.headers.get('retry-after'), '30');
       assertEquals(response.headers.get('cf-ray'), 'abc');
-      assertEquals(response.headers.get('x-internal-secret'), null);
+      assertEquals(response.headers.get('x-internal-secret'), 'leak');
       assertEquals(response.headers.get('set-cookie'), null);
       await response.json();
     },
@@ -330,4 +332,48 @@ test('passthrough-serve: when every candidate returns non-2xx the most recent up
       await flushAsyncWork();
     },
   );
+});
+
+// A throw during candidate rollover attributes the error row to the
+// throwing candidate, not the previously-succeeded one.
+test('passthrough-serve: throw during rollover attributes the error perf row to the throwing candidate, not the previous one', async () => {
+  const { apiKey, repo } = await setupAppTest();
+  await registerTwoEmbeddingsUpstreams(repo);
+
+  const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+  try {
+    await withMockedFetch(
+      request => {
+        const url = new URL(request.url);
+        if (url.pathname === '/v1/models') {
+          return jsonResponse({ object: 'list', data: [{ id: 'custom-embed-model' }] });
+        }
+        if (url.hostname === 'up-a.example.com' && url.pathname === '/v1/embeddings') {
+          return new Response('first upstream unavailable', { status: 503 });
+        }
+        if (url.hostname === 'up-b.example.com' && url.pathname === '/v1/embeddings') {
+          throw new Error('simulated network error to up_b');
+        }
+        throw new Error(`Unhandled fetch ${request.url}`);
+      },
+      async () => {
+        const response = await requestApp('/v1/embeddings', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-api-key': apiKey.key },
+          body: JSON.stringify({ model: 'custom-embed-model', input: 'hi' }),
+        });
+
+        assertEquals(response.status, 502);
+        await flushAsyncWork();
+      },
+    );
+
+    const perfRows = await repo.performance.listAll();
+    const errorRows = perfRows.filter(row => row.errorsNoOutput + row.errorsWithOutput > 0);
+    assertEquals(errorRows.length, 1);
+    assertEquals(errorRows[0].upstream, 'up_b');
+  } finally {
+    errorSpy.mockRestore();
+  }
 });

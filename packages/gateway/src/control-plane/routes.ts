@@ -1,14 +1,15 @@
 import { Hono, type Next } from 'hono';
 
+import { AGENT_SETUP_ROUTE_PATH, agentSetupControlRoutes } from './agent-setup.ts';
 import { createKey, deleteKey, listKeys, rotateKey, updateKey } from './api-keys/routes.ts';
 import { authLogin, authLogout, authMe } from './auth/routes.ts';
 import { exportData, importData } from './data-transfer/routes.ts';
 import { dumpRoutes } from './dump.ts';
 import { createAlias, deleteAlias, listAliases, updateAlias } from './model-aliases/routes.ts';
 import { controlPlaneModels } from './models/routes.ts';
-import { performanceOverview, performanceTelemetry } from './performance/routes.ts';
+import { performanceOverview } from './performance/routes.ts';
 import { createProxy, deleteProxy, listAllBackoffs, listProxies, listProxyBackoffs, resetProxyBackoffs, testProxy, updateProxy } from './proxies/routes.ts';
-import { authLoginBody, changeOwnPasswordBody, claudeCodeOauthAuthorizeUrlBody, claudeCodeOauthExchangeBody, claudeCodeOauthRefreshBody, claudeCodeProbeBody, claudeCodeSetupTokenAuthorizeUrlBody, claudeCodeSetupTokenExchangeBody, codexOauthAuthorizeUrlBody, codexOauthExchangeBody, codexOauthRefreshBody, copilotOauthDeviceLoginPollBody, copilotQuotaBody, createAliasBody, createKeyBody, createProxyBody, createUpstreamBody, createUserBody, exportQuery, importBody, listModelsBody, modelsQuery, performanceQuery, resetBackoffBody, searchConfigSchema, searchUsageQuery, testProxyBody, tokenUsageQuery, updateAliasBody, updateKeyBody, updateProxyBody, updateUpstreamBody, updateUserBody } from './schemas.ts';
+import { authLoginBody, changeOwnPasswordBody, claudeCodeOauthAuthorizeUrlBody, claudeCodeOauthExchangeBody, claudeCodeOauthRefreshBody, claudeCodeProbeBody, claudeCodeSetupTokenAuthorizeUrlBody, claudeCodeSetupTokenExchangeBody, codexOauthAuthorizeUrlBody, codexOauthExchangeBody, codexOauthRefreshBody, copilotOauthDeviceLoginPollBody, copilotQuotaBody, createAliasBody, createKeyBody, createProxyBody, createUpstreamBody, createUserBody, exportQuery, importBody, listModelsBody, modelsQuery, performanceQuery, resetBackoffBody, rotateKeyBody, searchConfigSchema, searchUsageQuery, testProxyBody, tokenUsageQuery, updateAliasBody, updateKeyBody, updateProxyBody, updateUpstreamBody, updateUserBody } from './schemas.ts';
 import { getSearchConfigRoute, putSearchConfigRoute, testSearchConfigRoute } from './search-config/routes.ts';
 import { searchUsage } from './search-usage/routes.ts';
 import { tokenUsage } from './token-usage/routes.ts';
@@ -41,12 +42,11 @@ export const controlPlaneRoutes = new Hono<{ Variables: AuthVars }>()
   .get('/api/runtime-info', c => c.json(getRuntimeInfo(c.req.raw)))
   .get('/api/keys', listKeys)
   .post('/api/keys', zValidator('json', createKeyBody), createKey)
-  .post('/api/keys/:id/rotate', rotateKey)
+  .post('/api/keys/:id/rotate', zValidator('json', rotateKeyBody), rotateKey)
   .patch('/api/keys/:id', zValidator('json', updateKeyBody), updateKey)
   .delete('/api/keys/:id', deleteKey)
   .get('/api/token-usage', zValidator('query', tokenUsageQuery), tokenUsage)
   .get('/api/search-usage', zValidator('query', searchUsageQuery), searchUsage)
-  .get('/api/performance', zValidator('query', performanceQuery), performanceTelemetry)
   .get('/api/performance/overview', zValidator('query', performanceQuery), performanceOverview)
   .get('/api/models', zValidator('query', modelsQuery), controlPlaneModels)
   // Minimal upstream picker exposed to non-admin users so they can scope a key
@@ -56,6 +56,10 @@ export const controlPlaneRoutes = new Hono<{ Variables: AuthVars }>()
   // this endpoint just feeds the picker UI.
   .get('/api/upstream-options', listUpstreamOptions)
   .route('/api/dump', dumpRoutes)
+  // Per-user Agent Setup lease control routes (POST / PUT / heartbeat). Not
+  // admin-gated. The public GET/HEAD setup-script routes are mounted separately
+  // in app.ts, ahead of this middleware chain.
+  .route(AGENT_SETUP_ROUTE_PATH, agentSetupControlRoutes)
   // Self-service password change is session-only (the current-password check
   // pairs with a logged-in dashboard session); admins reset other users'
   // passwords through PATCH /api/users/:id below, which is admin-gated.

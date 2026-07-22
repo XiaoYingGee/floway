@@ -17,58 +17,17 @@ import type { PassthroughServeApiName } from './api-names.ts';
 import { appendFailedUpstreams } from './failed-upstreams.ts';
 import { iterateCandidates } from './iterate-candidates.ts';
 import { passthroughAttempt } from './passthrough-attempt.ts';
-import type { PerformanceTelemetryContext } from './telemetry/performance.ts';
-import { recordRequestPerformance } from './telemetry/performance.ts';
-import { recordTokenUsage } from './telemetry/usage.ts';
+import { recordFailedRequest } from './telemetry/performance.ts';
+import { settle } from './telemetry/settle.ts';
+import { forwardUpstreamHeaders, forwardUpstreamResponse } from './upstream-response.ts';
 import type { AuthedContext } from '../../middleware/auth.ts';
 import type { TokenUsage } from '../../repo/types.ts';
 import type { GatewayCtx } from '../chat/shared/gateway-ctx.ts';
 import { type StreamCompletion, writeSSEFrames } from '../chat/shared/stream/sse.ts';
 import { enumerateModelCandidates } from '../providers/registry.ts';
-import type { BackgroundScheduler } from '@floway-dev/platform';
 import { doneFrame, eventFrame, type ModelKind, parseSSEStream, parseTargetStreamFrames, type ProtocolFrame, sseCommentFrame, sseFrame } from '@floway-dev/protocols/common';
 import { httpResponseToResponse, ProviderModelsUnavailableError, toInternalDebugError } from '@floway-dev/provider';
-import type { InternalModel, Provider, ProviderCallResult, ProviderModel, UpstreamCallOptions } from '@floway-dev/provider';
-
-// Headers we forward verbatim from a successful upstream response, plus
-// content-type with an application/json fallback when the upstream omitted
-// it. The set is intentionally narrow and matches the passthrough contract
-// OpenAI clients (and the OpenAI Node SDK retry policy) expect to see —
-// correlation, organisation/model metadata, quota signals, retry-after.
-const FORWARDED_RESPONSE_HEADER_PREFIXES = ['openai-', 'x-ratelimit-'] as const;
-const FORWARDED_RESPONSE_HEADERS = new Set(['x-request-id', 'retry-after', 'cf-ray']);
-
-const isForwardedResponseHeader = (name: string): boolean => {
-  const lower = name.toLowerCase();
-  return FORWARDED_RESPONSE_HEADERS.has(lower) || FORWARDED_RESPONSE_HEADER_PREFIXES.some(prefix => lower.startsWith(prefix));
-};
-
-const forwardUpstreamResponse = (resp: Response): Response => {
-  const headers = new Headers({ 'content-type': resp.headers.get('content-type') ?? 'application/json' });
-  for (const [name, value] of resp.headers.entries()) {
-    if (name.toLowerCase() === 'content-type') continue;
-    if (isForwardedResponseHeader(name)) headers.set(name, value);
-  }
-  return new Response(resp.body, { status: resp.status, headers });
-};
-
-// Stage forwardable upstream headers onto the Hono context so the streaming
-// SSE response Hono builds emits them. `streamSSE`'s internal `c.newResponse`
-// honors anything set via `c.header()` before it runs.
-const stageForwardedResponseHeaders = (c: Context, resp: Response): void => {
-  for (const [name, value] of resp.headers.entries()) {
-    if (isForwardedResponseHeader(name)) c.header(name, value);
-  }
-};
-
-// Fire-and-forget the usage record. A transient D1/KV failure here must not
-// surface as a 502 to a client whose upstream call already succeeded with a
-// 200 response body in hand. We log so the failure is still observable.
-const scheduleUsageRecord = (scheduler: BackgroundScheduler, promise: Promise<void>): void => {
-  scheduler(promise.catch(error => {
-    console.error('Failed to record token usage:', error);
-  }));
-};
+import type { PerformanceOperation, InternalModel, Provider, ProviderCallResult, ProviderModel, UpstreamCallOptions } from '@floway-dev/provider';
 
 // `json` (embeddings, images): single-shot body, `extractBilling` reads
 // usage / metadata off the parsed root. `sse` (/v1/completions): frame
@@ -89,6 +48,7 @@ interface PassthroughServeContext {
   readonly c: AuthedContext;
   readonly ctx: GatewayCtx;
   readonly sourceApi: PassthroughServeApiName;
+  readonly operation: PerformanceOperation;
   // Already-validated public model id the client requested. The helper
   // resolves it against the provider registry; if no upstream serves the
   // id with the requested kind, the client sees a 404 with the standard
@@ -103,13 +63,8 @@ interface PassthroughServeContext {
   // contributing upstream, so those endpoints come verbatim from the emitting
   // upstream's `ProviderModel`.
   readonly modelServesEndpoint: (model: InternalModel) => boolean;
-  // Performs the upstream HTTP call for the chosen (provider, model) pair.
   // Any throw here is preserved and becomes a 502 with the internal-debug
-  // envelope — exceptions thrown from the actual fetch must not be silently
-  // swallowed. `opts` carries the per-call hooks the gateway threads in
-  // (the recordUpstreamLatency wrapper for the upstream_success metric);
-  // the callback forwards it verbatim to the chosen provider call method.
-  // `model` is the emitting upstream's `ProviderModel`.
+  // envelope. `model` is the emitting upstream's `ProviderModel`.
   readonly call: (provider: Provider, model: ProviderModel, opts: UpstreamCallOptions) => Promise<ProviderCallResult>;
   readonly response: PassthroughResponseHandling;
 }
@@ -119,13 +74,7 @@ export const passthroughApiError = (c: Context, message: string, status: Content
   c.json({ error: { message, type: 'api_error' } }, status);
 
 export const passthroughServe = async (input: PassthroughServeContext): Promise<Response> => {
-  const { c, ctx, sourceApi, model, kind, modelServesEndpoint, call, response: responseHandling } = input;
-  const requestStartedAt = performance.now();
-  // Populated as attempts land so a throw from `passthroughAttempt` (or
-  // the response handling below) can still attribute request-perf to the
-  // most recent candidate the loop touched. A throw before any candidate
-  // fired leaves this undefined; the outer catch below is happy with that.
-  let lastPerformance: PerformanceTelemetryContext | undefined;
+  const { c, ctx, sourceApi, operation, model, kind, modelServesEndpoint, call, response: responseHandling } = input;
 
   try {
     // The shared resolver returns every candidate of the requested kind:
@@ -148,7 +97,7 @@ export const passthroughServe = async (input: PassthroughServeContext): Promise<
       model,
       kind,
       scheduler: ctx.backgroundScheduler,
-      currentColo: ctx.currentColo,
+      runtimeLocation: ctx.runtimeLocation,
     });
     if (candidates.length === 0) {
       ctx.dump?.error('gateway');
@@ -174,22 +123,19 @@ export const passthroughServe = async (input: PassthroughServeContext): Promise<
     }
 
     // Iterate the viable list. Each candidate's attempt runs the upstream
-    // HTTP call and records `upstream_success` telemetry; the shared
+    // HTTP call and records performance telemetry; the shared
     // iterator returns the first 2xx or, on exhaustion, the last non-2xx
     // result. Request-perf and dump attribution wait until this point so
     // they land against the terminal candidate.
     const result = await iterateCandidates(
       viable,
       'passthroughServe',
-      async candidate => {
-        const attempted = await passthroughAttempt({
-          c, ctx, candidate,
-          stream: responseHandling.format === 'sse',
-          call,
-        });
-        lastPerformance = attempted.performance;
-        return attempted;
-      },
+      ctx,
+      operation,
+      candidate => passthroughAttempt({
+        c, ctx, candidate, operation,
+        call,
+      }),
     );
     const { response, performance: performanceContext, identity } = result;
 
@@ -197,7 +143,7 @@ export const passthroughServe = async (input: PassthroughServeContext): Promise<
       // Exhausted — forward the last upstream response verbatim so clients
       // still see real upstream telemetry (status, retry-after, request-id,
       // ...) rather than a synthetic gateway envelope.
-      recordRequestPerformance(ctx.backgroundScheduler, performanceContext, true, performance.now() - requestStartedAt);
+      recordFailedRequest(ctx, performanceContext);
       ctx.dump?.error('upstream', identity.upstream);
       return forwardUpstreamResponse(response);
     }
@@ -215,10 +161,7 @@ export const passthroughServe = async (input: PassthroughServeContext): Promise<
       }
       const usage = parsed !== undefined ? responseHandling.extractBilling(parsed) : null;
       ctx.dump?.success(identity, usage);
-      if (usage) {
-        scheduleUsageRecord(ctx.backgroundScheduler, recordTokenUsage(ctx.apiKeyId, identity, usage));
-      }
-      recordRequestPerformance(ctx.backgroundScheduler, performanceContext, false, performance.now() - requestStartedAt);
+      settle(ctx, performanceContext, identity, usage, false);
       return forwardUpstreamResponse(response);
     }
 
@@ -228,13 +171,13 @@ export const passthroughServe = async (input: PassthroughServeContext): Promise<
     const upstreamBody = response.body;
     if (!upstreamBody) {
       ctx.dump?.failed(`${sourceApi} streaming upstream returned no body`);
-      recordRequestPerformance(ctx.backgroundScheduler, performanceContext, true, performance.now() - requestStartedAt);
+      recordFailedRequest(ctx, performanceContext);
       // Preserve upstream correlation headers (x-request-id, cf-ray, ...)
       // on the synthesized 502 so this rare edge case is still traceable.
-      stageForwardedResponseHeaders(c, response);
+      forwardUpstreamHeaders(c, response.headers);
       return passthroughApiError(c, 'Upstream returned a streaming response with no body.', 502);
     }
-    stageForwardedResponseHeaders(c, response);
+    forwardUpstreamHeaders(c, response.headers);
     return streamSSE(c, async stream => {
       let completion: StreamCompletion = 'error';
       let streamError: unknown;
@@ -276,10 +219,7 @@ export const passthroughServe = async (input: PassthroughServeContext): Promise<
         // tokens already metered upstream should bill even when the
         // downstream half of the round-trip turned out badly. The chat
         // streaming endpoints follow the same rule.
-        if (usage) {
-          scheduleUsageRecord(ctx.backgroundScheduler, recordTokenUsage(ctx.apiKeyId, identity, usage));
-        }
-        recordRequestPerformance(ctx.backgroundScheduler, performanceContext, failed, performance.now() - requestStartedAt);
+        settle(ctx, performanceContext, identity, usage, failed);
       }
     });
   } catch (e) {
@@ -290,7 +230,8 @@ export const passthroughServe = async (input: PassthroughServeContext): Promise<
         return forwarded;
       }
     }
-    recordRequestPerformance(ctx.backgroundScheduler, lastPerformance, true, performance.now() - requestStartedAt);
+    // Attributes to whichever candidate iterateCandidates was on (or short-circuits if none started).
+    recordFailedRequest(ctx, ctx.attempt.telemetry);
     ctx.dump?.failed(e);
     return c.json({ error: toInternalDebugError(e) }, 502);
   }

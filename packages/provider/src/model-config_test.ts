@@ -3,56 +3,41 @@ import { describe, expect, test } from 'vitest';
 import { chatField, modelsField, pricingField } from './model-config.ts';
 import { assertEquals, assertThrows } from '@floway-dev/test-utils';
 
-test('pricingField parses bare dimensions and drops empty objects', () => {
-  assertEquals(pricingField(undefined, 'cost'), undefined);
-  assertEquals(pricingField({}, 'cost'), undefined);
-  assertEquals(
-    pricingField({ input: 5, output: 25, input_cache_read: 0.5 }, 'cost'),
-    { input: 5, output: 25, input_cache_read: 0.5 },
-  );
-});
-
-test('pricingField parses per-tier overlays alongside base rates', () => {
-  const result = pricingField(
-    {
-      input: 5,
-      output: 25,
-      tiers: {
-        fast: { input: 30, output: 150 },
-        flex: { input: 2.5 },
-      },
-    },
-    'cost',
-  );
-  assertEquals(result, {
-    input: 5,
-    output: 25,
-    tiers: {
-      fast: { input: 30, output: 150 },
-      flex: { input: 2.5 },
-    },
+test('pricingField parses explicit flat entries', () => {
+  assertEquals(pricingField(undefined, 'pricing'), undefined);
+  const value = {
+    entries: [
+      { rates: { input_tokens: '5', output_tokens: '25' } },
+      { selector: { inputTokens: { operator: 'gt', value: 272000 } }, rates: { input_tokens: '15', output_tokens: '75' } },
+      { selector: { serviceTier: 'fast', inputTokens: { operator: 'gt', value: 272000 } }, rates: { input_tokens: '30', output_tokens: '150' } },
+    ],
+  };
+  assertEquals(pricingField(value, 'pricing'), {
+    entries: [
+      { rates: { input_tokens: '5', output_tokens: '25' } },
+      { selector: { inputTokens: { operator: 'gt', value: 272000 } }, rates: { input_tokens: '15', output_tokens: '75' } },
+      { selector: { serviceTier: 'fast', inputTokens: { operator: 'gt', value: 272000 } }, rates: { input_tokens: '30', output_tokens: '150' } },
+    ],
   });
 });
 
-test('pricingField preserves empty tier overlays and skips unknown keys inside them', () => {
-  const result = pricingField(
-    {
-      input: 5,
-      tiers: {
-        fast: { input: 30, bogus_key: 99 },
-        priority: {},
-      },
-    },
-    'cost',
-  );
-  assertEquals(result, { input: 5, tiers: { fast: { input: 30 }, priority: {} } });
-});
-
-test('pricingField rejects non-object tiers, empty names, and negative rates', () => {
-  assertThrows(() => pricingField({ tiers: 'nope' }, 'cost'), Error, 'tiers');
-  assertThrows(() => pricingField({ tiers: { '': { input: 5 } } }, 'cost'), Error, 'tier name');
-  assertThrows(() => pricingField({ tiers: { fast: 1 } }, 'cost'), Error, 'tiers.fast');
-  assertThrows(() => pricingField({ tiers: { fast: { input: -1 } } }, 'cost'), Error, 'non-negative');
+test('pricingField rejects malformed entries and duplicate coordinates', () => {
+  assertThrows(() => pricingField({}, 'pricing'), Error, 'non-empty array');
+  assertThrows(() => pricingField({ entries: [{ rates: { input_tokens: '1' } }], fallback: true }, 'pricing'), Error, 'unknown fields: fallback');
+  assertThrows(() => pricingField({ entries: [{ rates: {} }] }, 'pricing'), Error, 'at least one rate');
+  assertThrows(() => pricingField({ entries: [{ selector: { serviceTier: '' }, rates: { input_tokens: '1' } }] }, 'pricing'), Error, 'non-empty string');
+  assertThrows(() => pricingField({ entries: [{ selector: { inputTokens: { operator: 'gt', value: 1.5 } }, rates: { input_tokens: '1' } }] }, 'pricing'), Error, 'positive safe integer');
+  assertThrows(() => pricingField({ entries: [{ rates: { input_tokens: '1', ouput: 4 } }] }, 'pricing'), Error, 'unknown metrics: ouput');
+  assertThrows(() => pricingField({ entries: [{ rates: { input_tokens: '1' }, fallback: true }] }, 'pricing'), Error, 'unknown fields: fallback');
+  assertThrows(() => pricingField({
+    entries: [
+      { rates: { input_tokens: '1' } },
+      { selector: { serviceTier: 'priority' }, rates: { input_tokens: '2' } },
+      { selector: { serviceTier: 'priority' }, rates: { input_tokens: '3' } },
+    ],
+  }, 'pricing'), Error, 'duplicate pricing entry selector');
+  assertThrows(() => pricingField({ entries: [{ rates: { input_tokens: '-1' } }] }, 'pricing'), Error, 'non-negative');
+  assertThrows(() => pricingField({ entries: [{ rates: { input_tokens: 1 } }] }, 'pricing'), Error, 'must be a decimal string');
 });
 
 describe('chatField', () => {
@@ -227,5 +212,51 @@ describe('modelsField chat integration', () => {
       chat: { modalities: { input: ['text'], output: ['text'] } },
     }], 'p');
     expect(m.chat?.modalities?.input).toEqual(['text']);
+  });
+});
+
+describe('modelsField rerank targets', () => {
+  test('requires an explicit target for a rerank model', () => {
+    expect(() => modelsField([{
+      upstreamModelId: 'reranker',
+      kind: 'rerank',
+      endpoints: { rerank: {} },
+    }], 'p')).toThrow(/rerankTarget is required/);
+  });
+
+  test('accepts a supported protocol and normalized model-specific path', () => {
+    const [model] = modelsField([{
+      upstreamModelId: 'reranker',
+      kind: 'rerank',
+      endpoints: { rerank: {} },
+      rerankTarget: { protocol: 'dashscope-native', path: ' /custom/rerank ' },
+    }], 'p');
+    expect(model.rerankTarget).toEqual({ protocol: 'dashscope-native', path: '/custom/rerank' });
+  });
+
+  test('validates targets against the endpoint-derived runtime kind', () => {
+    expect(() => modelsField([{
+      upstreamModelId: 'chat',
+      kind: 'chat',
+      endpoints: { chatCompletions: {} },
+      rerankTarget: { protocol: 'cohere-v2' },
+    }], 'p')).toThrow(/rerankTarget is only allowed/);
+    expect(() => modelsField([{
+      upstreamModelId: 'reranker',
+      kind: 'rerank',
+      endpoints: { chatCompletions: {} },
+      rerankTarget: { protocol: 'cohere-v2' },
+    }], 'p')).toThrow(/rerankTarget is only allowed/);
+  });
+
+  test('accepts an explicit chat kind when endpoints select rerank', () => {
+    const [model] = modelsField([{
+      upstreamModelId: 'reranker',
+      kind: 'chat',
+      endpoints: { rerank: {} },
+      rerankTarget: { protocol: 'cohere-v2' },
+    }], 'p');
+    expect(model.kind).toBe('chat');
+    expect(model.rerankTarget).toEqual({ protocol: 'cohere-v2' });
   });
 });

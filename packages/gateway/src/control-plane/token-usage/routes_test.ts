@@ -1,5 +1,6 @@
 import { test } from 'vitest';
 
+import { tokenUsageMetrics } from '../../repo/usage-metrics.ts';
 import { requestApp, setupAppTest } from '../../test-helpers.ts';
 import { assertEquals } from '@floway-dev/test-utils';
 
@@ -16,10 +17,9 @@ const seedUsage = async (
     upstream: 'up_test',
     modelKey: model,
     hour,
-    tier: null,
+    pricingSelector: {},
     requests,
-    tokens: { input: 100, output: 50 },
-    cost: null,
+    metrics: tokenUsageMetrics({ input: 100, output: 50 }, null),
   });
 };
 
@@ -55,6 +55,7 @@ test('/api/token-usage self-by-key surfaces soft-deleted keys metadata to their 
     userId: apiKey.userId,
     name: 'Fresh',
     key: 'raw_fresh_key',
+    serverSecret: '00'.repeat(32),
     createdAt: '2026-04-30T11:00:00.000Z',
     upstreamIds: null,
     deletedAt: null,

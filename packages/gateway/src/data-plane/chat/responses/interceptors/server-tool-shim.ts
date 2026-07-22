@@ -6,17 +6,19 @@ import { truncatePreservingCodePoints } from '../../shared/text.ts';
 import type { StatefulResponsesStore } from '../items/store.ts';
 import type { InterceptorRun } from '@floway-dev/interceptor';
 import { eventFrame, type ProtocolFrame } from '@floway-dev/protocols/common';
-import type {
-  ResponsesHostedTool,
-  ResponsesInputItem,
-  ResponsesOutputItem,
-  ResponsesResult,
-  ResponsesStreamEvent,
-  ResponsesTool,
-  ResponsesToolChoice,
+import {
+  createRandomResponsesItemId,
+  type CanonicalResponsesPayload,
+  type ResponsesFunctionTool,
+  type ResponsesHostedTool,
+  type ResponsesInputItem,
+  type ResponsesOutputItem,
+  type ResponsesResult,
+  type ResponsesStreamEvent,
+  type ResponsesTool,
+  type ResponsesToolChoice,
 } from '@floway-dev/protocols/responses';
 import type { EventResultMetadata, ExecuteResult } from '@floway-dev/provider';
-import type { CanonicalResponsesPayload } from '@floway-dev/translate/via-responses/responses-items';
 
 export interface MergeUsage {
   input_tokens?: number;
@@ -54,11 +56,10 @@ export interface ServerToolTerminal {
   item: ServerToolOutputItem;
   endEvents: ServerToolLifecycleEvent[];
   /**
-   * Optional server-only blob registered on
-   * `request.statefulResponsesStore` under `slot.id` before
-   * the slot's wire item leaves materialize. The persistence layer stores it in
-   * `payload.private`; the replay-side `transformItems` reads it back to
-   * reconstruct the full IR.
+   * Optional server-only blob registered on the request's item store under
+   * `slot.id` before the slot's wire item leaves materialize. The persistence
+   * layer stores it in `payload.private`; the replay-side `transformItems`
+   * reads it back to reconstruct the full IR.
    */
   privatePayload?: unknown;
 }
@@ -97,27 +98,21 @@ export type ServerToolDispatcher = (args: {
   loopState: ServerToolLoopState;
 }) => ServerToolResultSlot[];
 
-// Grouped together so a partial declaration is a compile error rather
-// than a registration that silently never dispatches. `canonicalize` is
-// the sole raw→canonical boundary: every downstream caller
-// (`buildFunctionTool`, dispatcher input, echo restore) only ever sees
-// canonical form. `hostedTypes` exists only for the
-// `tool_choice: { type }` rewrite path, where no full tool object is
-// available to canonicalize.
+// Keep hosted matching, function injection, and dispatch atomic so a
+// registration cannot silently omit part of a server-tool family.
 export interface ServerToolHostedDispatch {
   hostedTypes: readonly string[];
   canonicalize: (raw: ResponsesTool) => ResponsesHostedTool | undefined;
-  buildFunctionTool: (canonical: ResponsesHostedTool, toolName: string) => ResponsesTool;
+  buildFunctionTool: (canonical: ResponsesHostedTool, toolName: string) => ResponsesFunctionTool;
   dispatcher: ServerToolDispatcher;
 }
 
 export type ServerToolPrepareResult =
   | { type: 'inactive' }
-  // `code` overrides the envelope's `error.code` for tools that emulate a
-  // specific upstream's rejection vocabulary (e.g. `unknown_parameter` /
-  // `invalid_value` for the public Responses surface). Omitted falls back
-  // to the generic `invalid_request_error`.
-  | { type: 'invalid-request'; message: string; param: string; code?: string }
+  // `errorType` / `code` override the envelope for tools that emulate an
+  // upstream's rejection vocabulary. An omitted code falls back to the
+  // generic `invalid_request_error`; explicit null is preserved verbatim.
+  | { type: 'invalid-request'; message: string; param: string | null; errorType?: string; code?: string | null }
   | {
     type: 'active';
     baseToolName: string;
@@ -126,8 +121,8 @@ export type ServerToolPrepareResult =
     // upstream-readable even on a request that no longer declares the
     // hosted tool.
     transformItems?: (items: ResponsesInputItem[], toolName: string) => ResponsesInputItem[];
-    // Present only when the request actually declares this tool's hosted
-    // form; absent for replay-only activation.
+    // Present only when the request declares this hosted tool; absent for
+    // replay-only activation.
     hosted?: ServerToolHostedDispatch;
   };
 
@@ -135,10 +130,10 @@ export type ServerToolRegistration = (invocation: ResponsesInvocation, gatewayCt
 
 type ActiveServerTool = Extract<ServerToolPrepareResult, { type: 'active' }> & {
   toolName: string;
-  hasHostedTool: boolean;
-  // Present iff `hasHostedTool` is true; drives echo restore on the
-  // synthesized envelope's `tools` and `tool_choice`.
+  // Absent only for replay activation; otherwise drives `tools` echo restore.
   canonicalHostedTool: ResponsesHostedTool | undefined;
+  // Captures the exact forced choice shape before request rewriting.
+  originalToolChoice: Exclude<ResponsesToolChoice, string> | undefined;
 };
 
 // How a single upstream turn ended, as observed while consuming its
@@ -230,32 +225,25 @@ const usageOf = (usage: ResponsesResult['usage']): MergeUsage => {
 };
 
 const rewriteHostedToolChoice = (
-  toolChoice: ResponsesToolChoice | undefined,
+  toolChoice: ResponsesToolChoice | null | undefined,
   active: readonly ActiveServerTool[],
-): ResponsesToolChoice | undefined => {
-  if (toolChoice === undefined || typeof toolChoice === 'string') return toolChoice;
+): ResponsesToolChoice | null | undefined => {
+  if (toolChoice == null || typeof toolChoice === 'string') return toolChoice;
   for (const entry of active) {
-    if (!entry.hasHostedTool || entry.hosted === undefined) continue;
+    if (entry.hosted === undefined) continue;
     if (entry.hosted.hostedTypes.includes(toolChoice.type)) return { type: 'function', name: entry.toolName };
   }
   return toolChoice;
 };
 
-// Reverse of `rewriteHostedToolChoice` for the upstream-echoed
-// `tool_choice` on the synthesized envelope: a function-typed choice
-// whose name matches an active shim's `toolName` was originally a
-// hosted-type choice. Restore it by stripping the function shape down
-// to `{ type: <hosted-type> }` using the canonical hosted entry's
-// discriminant.
+// The shim demotes forced choice to `auto` after the first turn, so synthesized
+// echoes restore the captured client shape rather than the final upstream echo.
 const restoreEchoedToolChoice = (
-  toolChoice: ResponsesToolChoice | undefined,
+  toolChoice: ResponsesToolChoice | null | undefined,
   active: readonly ActiveServerTool[],
-): ResponsesToolChoice | undefined => {
-  if (toolChoice === undefined || typeof toolChoice === 'string' || toolChoice.type !== 'function') return toolChoice;
+): ResponsesToolChoice | null | undefined => {
   for (const entry of active) {
-    if (entry.canonicalHostedTool === undefined) continue;
-    if (toolChoice.name !== entry.toolName) continue;
-    return { type: entry.canonicalHostedTool.type };
+    if (entry.originalToolChoice !== undefined) return entry.originalToolChoice;
   }
   return toolChoice;
 };
@@ -291,29 +279,35 @@ export const resolveServerToolName = (baseName: string, tools: readonly Response
   throw new Error(`Unable to resolve a free server tool function name for ${baseName} within ${MAX_NAME_RESOLUTION_ATTEMPTS} attempts`);
 };
 
-// First canonicalized hit wins; subsequent same-type hosted entries
-// are silently deduped, matching upstream Copilot's observed behavior
-// (two `{type:'web_search'}` entries collapse into one expanded echo).
-// The returned canonical entry feeds echo-restore and the dispatcher's
-// hosted-tool view.
+// Azure and Copilot both deduplicate repeated hosted-tool declarations as one
+// family and retain the last complete declaration, including aliases and
+// configuration. The replacement occupies the first declaration's array slot
+// so unrelated tools retain their relative order.
+// https://github.com/Menci/Floway/pull/172#issuecomment-4971739422
 const rewriteToolsForHostedShim = (
   tools: readonly ResponsesTool[],
   hosted: ServerToolHostedDispatch,
   toolName: string,
-): { rewritten: ResponsesTool[]; canonicalHostedTool: ResponsesHostedTool | undefined } => {
+): { rewritten: ResponsesTool[]; canonicalHostedTool: ResponsesHostedTool } => {
   const rewritten: ResponsesTool[] = [];
   let canonicalHostedTool: ResponsesHostedTool | undefined = undefined;
+  let replacementIndex = -1;
   for (const raw of tools) {
     const canonical = hosted.canonicalize(raw);
-    if (canonical !== undefined) {
-      if (canonicalHostedTool === undefined) {
-        canonicalHostedTool = canonical;
-        rewritten.push(hosted.buildFunctionTool(canonical, toolName));
-      }
+    if (canonical === undefined) {
+      rewritten.push(raw);
       continue;
     }
-    rewritten.push(raw);
+    if (replacementIndex === -1) {
+      replacementIndex = rewritten.length;
+      rewritten.push(raw);
+    }
+    canonicalHostedTool = canonical;
   }
+  if (canonicalHostedTool === undefined) {
+    throw new Error('Hosted server-tool registration did not match any request tool');
+  }
+  rewritten[replacementIndex] = hosted.buildFunctionTool(canonicalHostedTool, toolName);
   return { rewritten, canonicalHostedTool };
 };
 
@@ -331,14 +325,15 @@ export const parseServerToolArguments = (argumentsJson: string): Record<string, 
   return parsed as Record<string, unknown>;
 };
 
-const syntheticInProgressResponse = (
+const syntheticPrologueResponse = (
   state: MergeState,
   id: string,
   model: string,
   active: readonly ActiveServerTool[],
+  status: 'queued' | 'in_progress',
 ): ResponsesResult => {
   if (state.upstreamResponseSnapshot === undefined) {
-    throw new Error('Server-tool shim cannot synthesize a Responses in-progress envelope before upstream `response.created` is captured.');
+    throw new Error('Server-tool shim cannot synthesize a Responses prologue envelope before an upstream response snapshot is captured.');
   }
   const snapshot = state.upstreamResponseSnapshot;
   const restoredTools = restoreEchoedTools(snapshot.tools, active);
@@ -349,7 +344,7 @@ const syntheticInProgressResponse = (
     object: 'response',
     model,
     output: [],
-    status: 'in_progress',
+    status,
     error: null,
     incomplete_details: null,
     ...(restoredTools !== undefined ? { tools: restoredTools } : {}),
@@ -499,16 +494,17 @@ export const consumeTurnStreaming = async function* (
     }
     const event = frame.event;
 
-    if (event.type === 'response.created') {
+    if (event.type === 'response.queued' || event.type === 'response.created') {
       const reportedModel = event.response.model;
       if (typeof reportedModel === 'string' && reportedModel.length > 0) merge.lastSeenModel = reportedModel;
       merge.upstreamResponseSnapshot = event.response;
       ensureModel();
       if (isFirstTurn) {
+        const status = event.type === 'response.queued' ? 'queued' : 'in_progress';
         yield stamp({
-          type: 'response.created',
-          response: syntheticInProgressResponse(merge, merge.synthesizedResponseId, ensureModel(), active),
-        });
+          type: event.type,
+          response: syntheticPrologueResponse(merge, merge.synthesizedResponseId, ensureModel(), active, status),
+        } as ResponsesStreamEvent);
       }
       continue;
     }
@@ -517,7 +513,7 @@ export const consumeTurnStreaming = async function* (
       if (isFirstTurn) {
         yield stamp({
           type: 'response.in_progress',
-          response: syntheticInProgressResponse(merge, merge.synthesizedResponseId, ensureModel(), active),
+          response: syntheticPrologueResponse(merge, merge.synthesizedResponseId, ensureModel(), active, 'in_progress'),
         });
       }
       continue;
@@ -589,7 +585,7 @@ export const consumeTurnStreaming = async function* (
       const itemId = typeof upstreamItemId === 'string' && upstreamItemId.length > 0
         ? upstreamItemId
         : item.type === 'message'
-          ? `msg_${downstreamIndex}`
+          ? createRandomResponsesItemId('message')
           : undefined;
       if (itemId !== undefined) openItemIds.set(upstreamIndex, itemId);
       yield stamp({
@@ -750,15 +746,16 @@ const buildErrorFromResult = (
 
 const invalidRequestEnvelope = (
   message: string,
-  param: string,
-  code = 'invalid_request_error',
+  param: string | null,
+  code: string | null | undefined,
+  errorType = 'invalid_request_error',
 ): ExecuteResult<ProtocolFrame<ResponsesStreamEvent>> => {
   const body = JSON.stringify({
     error: {
       message,
-      type: 'invalid_request_error',
+      type: errorType,
       param,
-      code,
+      code: code === undefined ? 'invalid_request_error' : code,
     },
   });
   return {
@@ -833,7 +830,7 @@ const synthesizeTerminalEnvelope = (
 async function* materializeServerToolItems(
   dispatched: ReadonlyArray<{ slots: DispatchedServerToolSlot[] }>,
   merge: MergeState,
-  statefulResponsesStore: StatefulResponsesStore,
+  store: StatefulResponsesStore,
 ): AsyncGenerator<ProtocolFrame<ResponsesStreamEvent>, void> {
   for (const d of dispatched) {
     for (const { slot, outputIndex } of d.slots) {
@@ -843,13 +840,10 @@ async function* materializeServerToolItems(
         yield stampServerToolEvent(merge, outputIndex, slot.id, step.value);
         step = await lifecycle.next();
       }
-      // The slot item is gateway-synthesized, not upstream-emitted; register
-      // its id so persistence stores it with no upstream identity even on a
-      // native Responses stream. The private payload (when the dispatcher
-      // produced one) registers under the same id so persistence captures it
-      // and the next loop turn's replay-side `transformItems` finds it by the
-      // accumulated output item's id.
-      statefulResponsesStore.addSyntheticItem(slot.id, step.value.privatePayload);
+      // Register private dispatcher state under the emitted item id so output
+      // persistence captures it and replay-side `transformItems` can restore
+      // it on the next loop turn.
+      store.addSyntheticItem(slot.id, step.value.privatePayload);
       yield* serverToolEndFrames(merge, outputIndex, slot, step.value);
     }
   }
@@ -863,13 +857,13 @@ async function* runMultiTurnLoop(args: {
   demoteForcedServerToolChoiceAfterFirstTurn: boolean;
   turn1Iter: AsyncGenerator<ProtocolFrame<ResponsesStreamEvent>, TurnSummary>;
   dispatchers: ReadonlyMap<string, ServerToolDispatcher>;
-  statefulResponsesStore: StatefulResponsesStore;
+  store: StatefulResponsesStore;
   canonicalInput: ResponsesInputItem[];
   active: readonly ActiveServerTool[];
   metadata: LatestUpstreamMetadata;
   resolveFinalMetadata: (m: EventResultMetadata) => void;
 }): AsyncGenerator<ProtocolFrame<ResponsesStreamEvent>> {
-  const { ctx, run, merge, loopState, demoteForcedServerToolChoiceAfterFirstTurn, turn1Iter, dispatchers, statefulResponsesStore, active, metadata, resolveFinalMetadata } = args;
+  const { ctx, run, merge, loopState, demoteForcedServerToolChoiceAfterFirstTurn, turn1Iter, dispatchers, store, active, metadata, resolveFinalMetadata } = args;
   const baseInput = args.canonicalInput;
   let midStreamError: unknown = undefined;
   try {
@@ -880,12 +874,12 @@ async function* runMultiTurnLoop(args: {
       const executedShim = turn.dispatched.length > 0;
 
       if (turn.terminalStatus.kind === 'failed') {
-        if (executedShim) yield* materializeServerToolItems(turn.dispatched, merge, statefulResponsesStore);
+        if (executedShim) yield* materializeServerToolItems(turn.dispatched, merge, store);
         yield synthesizeTerminalEnvelope(merge, { kind: 'failed', error: turn.terminalStatus.response.error }, active);
         return;
       }
       if (turn.terminalStatus.kind === 'incomplete') {
-        if (executedShim) yield* materializeServerToolItems(turn.dispatched, merge, statefulResponsesStore);
+        if (executedShim) yield* materializeServerToolItems(turn.dispatched, merge, store);
         yield synthesizeTerminalEnvelope(merge, { kind: 'incomplete', incompleteDetails: turn.terminalStatus.response.incomplete_details }, active);
         return;
       }
@@ -901,7 +895,7 @@ async function* runMultiTurnLoop(args: {
         return;
       }
 
-      yield* materializeServerToolItems(turn.dispatched, merge, statefulResponsesStore);
+      yield* materializeServerToolItems(turn.dispatched, merge, store);
       if (turn.sawClientToolCall) {
         yield synthesizeTerminalEnvelope(merge, { kind: 'completed' }, active);
         return;
@@ -963,18 +957,25 @@ export const withResponsesServerToolShim = (
   for (const prepareServerTool of registrations) {
     const prepared = await prepareServerTool(ctx, gatewayCtx);
     if (prepared.type === 'inactive') continue;
-    if (prepared.type === 'invalid-request') return invalidRequestEnvelope(prepared.message, prepared.param, prepared.code);
+    if (prepared.type === 'invalid-request') {
+      return invalidRequestEnvelope(prepared.message, prepared.param, prepared.code, prepared.errorType);
+    }
     const currentTools = Array.isArray(ctx.payload.tools) ? ctx.payload.tools : [];
     const toolName = resolveServerToolName(prepared.baseToolName, currentTools);
     const { hosted } = prepared;
-    const hasHostedTool = hosted !== undefined && currentTools.some(t => hosted.canonicalize(t) !== undefined);
     let canonicalHostedTool: ResponsesHostedTool | undefined = undefined;
-    if (hasHostedTool && hosted !== undefined) {
+    if (hosted !== undefined) {
       const rewrite = rewriteToolsForHostedShim(currentTools, hosted, toolName);
       canonicalHostedTool = rewrite.canonicalHostedTool;
       ctx.payload = { ...ctx.payload, tools: rewrite.rewritten };
     }
-    active.push({ ...prepared, toolName, hasHostedTool, canonicalHostedTool });
+    const originalToolChoice = hosted !== undefined
+      && typeof ctx.payload.tool_choice === 'object'
+      && ctx.payload.tool_choice !== null
+      && hosted.hostedTypes.includes(ctx.payload.tool_choice.type)
+      ? ctx.payload.tool_choice
+      : undefined;
+    active.push({ ...prepared, toolName, canonicalHostedTool, originalToolChoice });
   }
 
   if (active.length === 0) return await run();
@@ -990,7 +991,7 @@ export const withResponsesServerToolShim = (
 
   const hostedActive = active.filter(
     (entry): entry is ActiveServerTool & { hosted: ServerToolHostedDispatch } =>
-      entry.hasHostedTool && entry.hosted !== undefined,
+      entry.hosted !== undefined,
   );
   if (hostedActive.length === 0) return await run();
 
@@ -1031,7 +1032,7 @@ export const withResponsesServerToolShim = (
       demoteForcedServerToolChoiceAfterFirstTurn,
       turn1Iter,
       dispatchers,
-      statefulResponsesStore: gatewayCtx.store,
+      store: gatewayCtx.store,
       canonicalInput,
       active,
       metadata,
