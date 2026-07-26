@@ -19,6 +19,9 @@ export interface ApiKey {
   deletedAt: string | null;
   // null = dump capture disabled; positive integer = seconds of retention.
   dumpRetentionSeconds: number | null;
+  // 0 = durable Stateful Responses disabled; a positive value is seconds in
+  // whole-day increments. Reuse lifetime is quantized to UTC days.
+  responsesRetentionSeconds: number;
 }
 
 export interface User {
@@ -32,7 +35,6 @@ export interface User {
   // null = unrestricted at the user level; an array intersects with the
   // per-key whitelist when both are present.
   upstreamIds: string[] | null;
-  canViewGlobalTelemetry: boolean;
   createdAt: string;
   deletedAt: string | null;
 }
@@ -155,10 +157,16 @@ export interface ApiKeyRepo {
   findByRawKey(rawKey: string): Promise<ApiKey | null>;
   getById(id: string): Promise<ApiKey | null>;
   save(key: ApiKey): Promise<void>;
+  update(id: string, patch: ApiKeyUpdate): Promise<ApiKey | null>;
   softDelete(id: string): Promise<boolean>;
   softDeleteByUserId(userId: number): Promise<number>;
   deleteAll(): Promise<void>;
 }
+
+export type ApiKeyUpdate = Partial<Pick<
+  ApiKey,
+  'name' | 'key' | 'lastUsedAt' | 'upstreamIds' | 'dumpRetentionSeconds' | 'responsesRetentionSeconds'
+>>;
 
 export interface UsersRepo {
   list(): Promise<User[]>;
@@ -361,12 +369,9 @@ export interface ModelAliasesRepo {
 export interface StoredResponsesItem {
   id: string;
   apiKeyId: string;
-  upstreamId: string | null;
-  upstreamItemId: string | null;
-  itemType: string;
   payload: StoredResponsesItemPayload;
-  contentHash: string | null;
-  createdAt: number;
+  itemHash: string;
+  refreshedAt: number;
 }
 
 export interface StoredResponsesItemPayload {
@@ -379,11 +384,12 @@ export interface StoredResponsesItemPayload {
 }
 
 export interface ResponsesItemsRepo {
-  lookupMany(apiKeyId: string, ids: readonly string[]): Promise<StoredResponsesItem[]>;
-  lookupManyByContentHash(apiKeyId: string, hashes: readonly string[]): Promise<StoredResponsesItem[]>;
-  insertMany(items: readonly StoredResponsesItem[]): Promise<void>;
-  refreshMany(items: readonly StoredResponsesItem[], createdAt: number): Promise<void>;
-  deleteOlderThan(createdBefore: number): Promise<number>;
+  lookupMany(apiKeyId: string, ids: readonly string[], earliestVisibleCutoff: number): Promise<StoredResponsesItem[]>;
+  lookupManyByItemHash(apiKeyId: string, hashes: readonly string[], earliestVisibleCutoff: number): Promise<StoredResponsesItem[]>;
+  insertMany(items: readonly StoredResponsesItem[], earliestVisibleCutoff: number): Promise<void>;
+  refreshMany(items: readonly StoredResponsesItem[], refreshedAt: number, earliestVisibleCutoff: number): Promise<void>;
+  deleteExpiredBatch(apiKeyId: string, now: number, limit: number): Promise<number>;
+  findOldestRefreshedAt(apiKeyId: string): Promise<number | null>;
   deleteAll(): Promise<void>;
 }
 
@@ -391,14 +397,39 @@ export interface StoredResponsesSnapshot {
   id: string;
   apiKeyId: string;
   itemIds: string[];
-  createdAt: number;
+  refreshedAt: number;
 }
 
 export interface ResponsesSnapshotsRepo {
-  lookup(apiKeyId: string, id: string): Promise<StoredResponsesSnapshot | null>;
+  lookup(apiKeyId: string, id: string, earliestVisibleCutoff: number): Promise<StoredResponsesSnapshot | null>;
   insert(snapshot: StoredResponsesSnapshot): Promise<void>;
-  deleteOlderThan(createdBefore: number): Promise<number>;
+  deleteExpiredBatch(apiKeyId: string, now: number, limit: number): Promise<number>;
+  findOldestRefreshedAt(apiKeyId: string): Promise<number | null>;
   deleteAll(): Promise<void>;
+}
+
+export interface SpilledFilesRepo {
+  claimCollectible(token: string, now: number, staleClaimedBefore: number, limit: number): Promise<string[]>;
+  acknowledge(token: string): Promise<number>;
+}
+
+export type ExpirationDomain = 'responses' | 'dumps';
+
+export interface ExpirationSweepClaim {
+  domain: ExpirationDomain;
+  keyId: string;
+  revision: number;
+}
+
+export type ExpirationSweepCompletion =
+  | { kind: 'drained'; nextDueAt: number | null }
+  | { kind: 'partial'; retryAt: number };
+
+export interface ExpirationSweepsRepo {
+  backfillCleanupTracking(limit: number): Promise<void>;
+  schedule(domain: ExpirationDomain, keyId: string, dueAt: number): Promise<void>;
+  claim(token: string, now: number, staleClaimedBefore: number): Promise<ExpirationSweepClaim | null>;
+  complete(token: string, expectedRevision: number, completion: ExpirationSweepCompletion): Promise<void>;
 }
 
 // The Agent Setup lease store. Its shape, record, and mutation discriminants
@@ -421,5 +452,7 @@ export interface Repo {
   modelAliases: ModelAliasesRepo;
   responsesItems: ResponsesItemsRepo;
   responsesSnapshots: ResponsesSnapshotsRepo;
+  spilledFiles: SpilledFilesRepo;
+  expirationSweeps: ExpirationSweepsRepo;
   agentSetup: AgentSetupRepository;
 }

@@ -59,6 +59,7 @@ test('API key users only see their own key in /api/keys', async () => {
     upstreamIds: null,
     deletedAt: null,
     dumpRetentionSeconds: null,
+    responsesRetentionSeconds: 0,
   });
 
   const response = await requestApp('/api/keys', {
@@ -109,6 +110,7 @@ test('/api/token-usage scopes to the actor\'s keys when called with an API key',
     upstreamIds: null,
     deletedAt: null,
     dumpRetentionSeconds: null,
+    responsesRetentionSeconds: 0,
   });
   await repo.usage.set({
     keyId: apiKey.id,
@@ -131,7 +133,7 @@ test('/api/token-usage scopes to the actor\'s keys when called with an API key',
     metrics: tokenUsageMetrics({ input: 20, output: 8, input_cache_read: 6, input_cache_write: 2 }, null),
   });
 
-  const response = await requestApp('/api/token-usage?start=2026-03-15T00&end=2026-03-16T00', {
+  const response = await requestApp('/api/token-usage?start=2026-03-15T00&end=2026-03-16T00&view=self-by-key', {
     headers: { 'x-api-key': apiKey.key },
   });
 
@@ -158,6 +160,7 @@ test('/api/token-usage in self-by-key mode includes per-key metadata for the act
     upstreamIds: null,
     deletedAt: null,
     dumpRetentionSeconds: null,
+    responsesRetentionSeconds: 0,
   });
   await repo.usage.set({
     keyId: 'key_actor_secondary',
@@ -170,7 +173,7 @@ test('/api/token-usage in self-by-key mode includes per-key metadata for the act
     metrics: tokenUsageMetrics({ input: 20, output: 8 }, null),
   });
 
-  const response = await requestApp('/api/token-usage?start=2026-03-16T00&end=2026-03-17T00&include_key_metadata=1', {
+  const response = await requestApp('/api/token-usage?start=2026-03-16T00&end=2026-03-17T00&include_key_metadata=1&view=self-by-key', {
     headers: { 'x-api-key': apiKey.key },
   });
 
@@ -208,7 +211,20 @@ test('/api/token-usage all-by-user view aggregates across keys per user', async 
   assertEquals(displayQuantity(body[0], 'input'), '10');
 });
 
-test('/api/token-usage rejects all-by-user from a user without canViewGlobalTelemetry', async () => {
+test('usage endpoints require an explicit view', async () => {
+  const { apiKey } = await setupAppTest();
+  const paths = [
+    '/api/token-usage?start=2026-03-15T00&end=2026-03-16T00',
+    '/api/search-usage?start=2026-03-15T00&end=2026-03-16T00',
+  ];
+  for (const path of paths) {
+    const response = await requestApp(path, { headers: { 'x-api-key': apiKey.key } });
+    assertEquals(response.status, 400, path);
+    assertEquals(await response.json(), { error: "view must be 'all-by-user' or 'self-by-key'" }, path);
+  }
+});
+
+test('/api/token-usage rejects all-by-user from a non-admin user', async () => {
   const { apiKey } = await setupAppTest();
   const response = await requestApp(
     '/api/token-usage?start=2026-03-15T00&end=2026-03-16T00&view=all-by-user',
@@ -250,7 +266,7 @@ test('/api/token-usage merges Claude variants into backend base model records', 
     metrics: tokenUsageMetrics({ input: 3, output: 4 }, null),
   });
 
-  const response = await requestApp('/api/token-usage?start=2026-03-17T00&end=2026-03-18T00', { headers: { 'x-api-key': apiKey.key } });
+  const response = await requestApp('/api/token-usage?start=2026-03-17T00&end=2026-03-18T00&view=self-by-key', { headers: { 'x-api-key': apiKey.key } });
 
   assertEquals(response.status, 200);
   const body = await response.json();

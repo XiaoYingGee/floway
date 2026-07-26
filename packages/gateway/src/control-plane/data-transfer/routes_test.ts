@@ -38,6 +38,7 @@ const KEY_A: ApiKey = {
   upstreamIds: null,
   deletedAt: null,
   dumpRetentionSeconds: null,
+  responsesRetentionSeconds: 0,
 };
 
 const KEY_B: ApiKey = {
@@ -50,6 +51,7 @@ const KEY_B: ApiKey = {
   upstreamIds: null,
   deletedAt: null,
   dumpRetentionSeconds: null,
+  responsesRetentionSeconds: 0,
 };
 
 const SEED_ADMIN: User = {
@@ -58,7 +60,6 @@ const SEED_ADMIN: User = {
   passwordHash: null,
   isAdmin: true,
   upstreamIds: null,
-  canViewGlobalTelemetry: true,
   createdAt: '2026-01-01T00:00:00.000Z',
   deletedAt: null,
 };
@@ -69,7 +70,6 @@ const USER_BOB: User = {
   passwordHash: 'pbkdf2-sha256$600000$c2FsdA==$aGFzaA==',
   isAdmin: false,
   upstreamIds: null,
-  canViewGlobalTelemetry: false,
   createdAt: '2026-02-01T00:00:00.000Z',
   deletedAt: null,
 };
@@ -226,14 +226,11 @@ const SEARCH_USAGE_2: SearchUsageRecord = {
 };
 
 const STORED_RESPONSES_ITEM: StoredResponsesItem = {
-  id: 'msg_z1mVjw_0xVvS8c_KjD1sBkZk5qbdA',
+  id: 'msg_producer',
   apiKeyId: 'key-a',
-  upstreamId: null,
-  upstreamItemId: null,
-  itemType: 'message',
-  contentHash: 'stored-content-hash',
-  payload: { item: { type: 'message', id: 'msg_z1mVjw_0xVvS8c_KjD1sBkZk5qbdA', role: 'assistant', content: [] } },
-  createdAt: 1_000,
+  itemHash: 'stored-content-hash',
+  payload: { item: { type: 'message', id: 'msg_producer', role: 'assistant', content: [] } },
+  refreshedAt: 1_000,
 };
 
 const PERFORMANCE_1: PerformanceTelemetryRecord = {
@@ -293,7 +290,7 @@ const doExport = async (app: Hono, includePerformance = false) => {
   return (await resp.json()) as Record<string, any>;
 };
 
-const doImport = async (app: Hono, mode: string, data: unknown, version: unknown = 14) => {
+const doImport = async (app: Hono, mode: string, data: unknown, version: unknown = 17) => {
   const resp = await app.request('/import', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -331,13 +328,13 @@ test('import validates generic pricing selectors', async () => {
   assertEquals(String(fractional.body.error).includes('positive safe integer'), true);
 });
 
-test('export emits the v13 envelope with users and upstreams', async () => {
+test('export emits the v17 envelope with users and upstreams', async () => {
   const { app, repo } = setup();
   await repo.users.save(SEED_ADMIN);
 
   const result = await doExport(app);
 
-  assertEquals(result.version, 14);
+  assertEquals(result.version, 17);
   assertEquals(typeof result.exportedAt, 'string');
   assertEquals(result.data.users, [SEED_ADMIN]);
   assertEquals(result.data.apiKeys, []);
@@ -402,7 +399,7 @@ test('import rejects any version other than the current one before deleting data
   await repo.apiKeys.save(KEY_A);
   await repo.upstreams.save(CUSTOM_UPSTREAM);
 
-  const VERSION_ERROR = 'version must be 14 — older export formats are not supported; re-export from the current deployment';
+  const VERSION_ERROR = 'version must be 17 — older export formats are not supported; re-export from the current deployment';
   const previousV11 = await doImport(app, 'replace', latestImportData(), 11);
   const ancientVersion = await doImport(app, 'replace', { apiKeys: [] }, 1);
   const missingVersionResponse = await app.request('/import', {
@@ -424,11 +421,11 @@ test('import rejects any version other than the current one before deleting data
 
 test('import replace writes upstreams and clears replaced collections', async () => {
   const { app, repo } = setup();
-  await repo.apiKeys.save(KEY_A);
+  await repo.apiKeys.save({ ...KEY_A, responsesRetentionSeconds: 24 * 60 * 60 });
   await repo.upstreams.save(CUSTOM_UPSTREAM);
   await repo.usage.set(USAGE_1);
   await repo.searchUsage.set(SEARCH_USAGE_1);
-  await repo.responsesItems.insertMany([STORED_RESPONSES_ITEM]);
+  await repo.responsesItems.insertMany([STORED_RESPONSES_ITEM], 0);
   await repo.searchConfig.save({
     provider: 'tavily',
     tavily: { apiKey: 'old' },
@@ -455,11 +452,13 @@ test('import replace writes upstreams and clears replaced collections', async ()
 
   assertEquals(result.status, 200);
   assertEquals(result.body.imported, { users: 1, apiKeys: 1, upstreams: 1, proxies: 0, usage: 1, searchUsage: 1, performance: 0 });
-  assertEquals(await repo.apiKeys.list(), [KEY_B]);
+  const restoredKey = await repo.apiKeys.findByRawKey(KEY_B.key);
+  if (restoredKey === null) throw new Error('restored key missing');
+  assertEquals(restoredKey, KEY_B);
   assertEquals(await repo.upstreams.list(), [AZURE_UPSTREAM]);
   assertEquals(await repo.usage.listAll(), [USAGE_2]);
   assertEquals(await repo.searchUsage.listAll(), [SEARCH_USAGE_2]);
-  assertEquals(await repo.responsesItems.lookupMany('key-a', [STORED_RESPONSES_ITEM.id]), []);
+  assertEquals(await repo.responsesItems.lookupMany('key-a', [STORED_RESPONSES_ITEM.id], 0), []);
   assertEquals(await repo.searchConfig.get(), {
     provider: 'microsoft-grounding',
     tavily: { apiKey: '' },
@@ -467,6 +466,26 @@ test('import replace writes upstreams and clears replaced collections', async ()
     jina: { apiKey: '' },
     passthroughOpenAiSearch: { enabled: false, upstreamId: '', model: '' },
   });
+});
+
+test('replace import preserves API-key IDs and imported references', async () => {
+  const { app, repo } = setup();
+  await repo.apiKeys.save(KEY_A);
+  const result = await doImport(app, 'replace', latestImportData({
+    apiKeys: [KEY_A],
+    usage: [USAGE_1],
+    searchUsage: [SEARCH_USAGE_1],
+    performanceIncluded: true,
+    performance: [PERFORMANCE_1],
+  }));
+  assertEquals(result.status, 200);
+
+  const restored = await repo.apiKeys.findByRawKey(KEY_A.key);
+  if (restored === null) throw new Error('restored key missing');
+  assertEquals(restored.id, KEY_A.id);
+  assertEquals((await repo.usage.listAll())[0].keyId, KEY_A.id);
+  assertEquals((await repo.searchUsage.listAll())[0].keyId, KEY_A.id);
+  assertEquals((await repo.performance.listAll())[0].keyId, KEY_A.id);
 });
 
 test('import merge upserts by repository key without clearing unrelated rows', async () => {
@@ -515,6 +534,26 @@ test('import replace handles performance inclusion explicitly', async () => {
 
   assertEquals(replace.status, 200);
   assertEquals(await repo.performance.listAll(), [PERFORMANCE_2]);
+});
+
+test('import accepts audio transcription performance rows', async () => {
+  const { app, repo } = setup();
+  const audioPerformance: PerformanceTelemetryRecord = {
+    ...PERFORMANCE_2,
+    operation: 'audio_transcription',
+    ttftSamplesOk: 0,
+    neutral: PERFORMANCE_2.requests,
+    tpotSamples: 0,
+    ttftMsSum: 0,
+    tpotUsSum: 0,
+    buckets: [],
+  };
+  const result = await doImport(app, 'replace', latestImportData({
+    performanceIncluded: true,
+    performance: [audioPerformance],
+  }));
+  assertEquals(result.status, 200);
+  assertEquals(await repo.performance.listAll(), [audioPerformance]);
 });
 
 test('import rejects performance records that break the recorder invariants', async () => {
@@ -698,7 +737,7 @@ test('import rejects negative historical unit prices with a metric-specific erro
   assertEquals(result.body.error, 'invalid usage at index 0: metric unitPrice must be non-negative: "-0.01"');
 });
 
-test('v13 import validates usage metric rows', async () => {
+test('v17 import validates usage metric rows', async () => {
   const { app } = setup();
   const missingMetrics = await doImport(app, 'replace', latestImportData({
     usage: [{ ...USAGE_2, metrics: undefined }],
@@ -858,8 +897,25 @@ test('import preserves a positive dumpRetentionSeconds on api keys', async () =>
   }));
 
   assertEquals(result.status, 200);
-  const restored = await repo.apiKeys.getById(KEY_A.id);
+  const restored = await repo.apiKeys.findByRawKey(KEY_A.key);
   assertEquals(restored?.dumpRetentionSeconds, 3600);
+});
+
+test('v17 import preserves and validates Responses retention', async () => {
+  const { app, repo } = setup();
+  const retained = await doImport(app, 'replace', latestImportData({
+    apiKeys: [{ ...KEY_A, responsesRetentionSeconds: 7 * 24 * 60 * 60 }],
+  }));
+  assertEquals(retained.status, 200);
+  assertEquals((await repo.apiKeys.findByRawKey(KEY_A.key))?.responsesRetentionSeconds, 7 * 24 * 60 * 60);
+
+  for (const value of [-1, 1, 3600, 86_401, 315_360_001, 86_400.5]) {
+    const invalid = await doImport(app, 'replace', latestImportData({
+      apiKeys: [{ ...KEY_A, responsesRetentionSeconds: value }],
+    }));
+    assertEquals(invalid.status, 400);
+    assertEquals(String(invalid.body.error).includes('responsesRetentionSeconds must be 0 or a whole-day integer'), true);
+  }
 });
 
 test('import rejects api keys whose dumpRetentionSeconds is out of range', async () => {
@@ -931,7 +987,7 @@ test('import rejects legacy enabled_fixes payloads before mutating', async () =>
   assertEquals(await repo.upstreams.list(), [CUSTOM_UPSTREAM]);
 });
 
-test('import rejects missing latest-v13 arrays before clearing existing data', async () => {
+test('import rejects missing latest-v17 arrays before clearing existing data', async () => {
   const { app, repo } = setup();
   await repo.apiKeys.save(KEY_A);
   await repo.upstreams.save(CUSTOM_UPSTREAM);
@@ -957,14 +1013,14 @@ test('import rejects missing latest-v13 arrays before clearing existing data', a
 test('import validates mode and data before mutating', async () => {
   const { app } = setup();
 
-  const invalidMode = await doImport(app, 'invalid', {}, 14);
+  const invalidMode = await doImport(app, 'invalid', {}, 17);
   const missingData = await app.request('/import', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ mode: 'replace', version: 14 }),
+    body: JSON.stringify({ mode: 'replace', version: 17 }),
   });
-  const missingUpstreams = await doImport(app, 'merge', {}, 14);
-  const emptyMerge = await doImport(app, 'merge', latestImportData(), 14);
+  const missingUpstreams = await doImport(app, 'merge', {}, 17);
+  const emptyMerge = await doImport(app, 'merge', latestImportData(), 17);
 
   assertEquals(invalidMode.status, 400);
   assertEquals(invalidMode.body.error, "mode must be 'merge' or 'replace'");
@@ -1116,7 +1172,7 @@ test('import replace wipes proxy_upstream_backoffs alongside the proxies it cool
   assertEquals(await repo.proxyBackoffs.listAll(), []);
 });
 
-test('v13 export/import round-trips users and per-key user_id', async () => {
+test('v17 export/import round-trips users and per-key user_id', async () => {
   const { app, repo } = setup();
   await repo.users.save(SEED_ADMIN);
   await repo.users.save(USER_BOB);
@@ -1124,21 +1180,21 @@ test('v13 export/import round-trips users and per-key user_id', async () => {
   await repo.apiKeys.save({ ...KEY_B, userId: USER_BOB.id });
 
   const exportResult = await doExport(app);
-  assertEquals(exportResult.version, 14);
+  assertEquals(exportResult.version, 17);
   assertEquals(exportResult.data.users.map((u: any) => u.id).sort(), [SEED_ADMIN.id, USER_BOB.id]);
 
-  const result = await doImport(app, 'replace', exportResult.data, 14);
+  const result = await doImport(app, 'replace', exportResult.data, 17);
   assertEquals(result.status, 200);
   assertEquals(result.body.imported.users, 2);
   assertEquals(result.body.imported.apiKeys, 2);
 
   const restoredUsers = await repo.users.listIncludingDeleted();
   assertEquals(restoredUsers.find(u => u.id === USER_BOB.id)?.passwordHash, USER_BOB.passwordHash);
-  const restoredKey = await repo.apiKeys.getById(KEY_B.id);
+  const restoredKey = await repo.apiKeys.findByRawKey(KEY_B.key);
   assertEquals(restoredKey?.userId, USER_BOB.id);
 });
 
-test('v13 import rejects api_keys whose user_id does not appear in the payload', async () => {
+test('v17 import rejects api_keys whose user_id does not appear in the payload', async () => {
   const { app, repo } = setup();
   await repo.users.save(SEED_ADMIN);
 
@@ -1150,13 +1206,13 @@ test('v13 import rejects api_keys whose user_id does not appear in the payload',
     searchUsage: [],
     performanceIncluded: false,
     searchConfig: DEFAULT_SEARCH_CONFIG,
-  }, 14);
+  }, 17);
 
   assertEquals(result.status, 400);
   assertEquals(result.body.error, 'invalid apiKeys at index 0: user_id 99 does not match any user in the payload');
 });
 
-test('v13 import rejects malformed users (bad username, bad password_hash)', async () => {
+test('v17 import rejects malformed users (bad username, bad password_hash)', async () => {
   const { app } = setup();
 
   const badUsername = await doImport(app, 'replace', {
@@ -1167,7 +1223,7 @@ test('v13 import rejects malformed users (bad username, bad password_hash)', asy
     searchUsage: [],
     performanceIncluded: false,
     searchConfig: DEFAULT_SEARCH_CONFIG,
-  }, 14);
+  }, 17);
   assertEquals(badUsername.status, 400);
   assertEquals(String(badUsername.body.error).startsWith('invalid users at index 0:'), true);
 
@@ -1179,7 +1235,7 @@ test('v13 import rejects malformed users (bad username, bad password_hash)', asy
     searchUsage: [],
     performanceIncluded: false,
     searchConfig: DEFAULT_SEARCH_CONFIG,
-  }, 14);
+  }, 17);
   assertEquals(badHash.status, 400);
   assertEquals(String(badHash.body.error).includes('passwordHash'), true);
 });
@@ -1201,7 +1257,7 @@ test('import rejects a pre-accounts v3 export instead of coercing its legacy api
   }, 3);
 
   assertEquals(result.status, 400);
-  assertEquals(String(result.body.error).includes('version must be 14'), true);
+  assertEquals(String(result.body.error).includes('version must be 17'), true);
   // Rejected at the version gate, before touching any data.
   assertEquals(await repo.apiKeys.list(), [KEY_A]);
   assertEquals((await repo.users.list()).map(u => u.id), [SEED_ADMIN.id]);
@@ -1222,7 +1278,7 @@ test('replace-mode import clears sessions before writing users', async () => {
     searchUsage: [],
     performanceIncluded: false,
     searchConfig: DEFAULT_SEARCH_CONFIG,
-  }, 14);
+  }, 17);
 
   assertEquals(result.status, 200);
   // No public listAll on sessions; create a fresh session and check the
@@ -1231,7 +1287,7 @@ test('replace-mode import clears sessions before writing users', async () => {
   assertEquals(await repo.sessions.deleteByUserId(USER_BOB.id), 0);
 });
 
-test('v13 import rejects users[i].upstreamIds === undefined', async () => {
+test('v17 import rejects users[i].upstreamIds === undefined', async () => {
   const { app } = setup();
   const result = await doImport(app, 'replace', {
     users: [SEED_ADMIN, { ...USER_BOB, upstreamIds: undefined }],
@@ -1241,12 +1297,12 @@ test('v13 import rejects users[i].upstreamIds === undefined', async () => {
     searchUsage: [],
     performanceIncluded: false,
     searchConfig: DEFAULT_SEARCH_CONFIG,
-  }, 14);
+  }, 17);
   assertEquals(result.status, 400);
   expect(result.body.error).toMatch(/upstreamIds/);
 });
 
-test('v13 import rejects users[i].deletedAt of non-string non-null type', async () => {
+test('v17 import rejects users[i].deletedAt of non-string non-null type', async () => {
   const { app } = setup();
   const result = await doImport(app, 'replace', {
     users: [SEED_ADMIN, { ...USER_BOB, deletedAt: 42 }],
@@ -1256,12 +1312,12 @@ test('v13 import rejects users[i].deletedAt of non-string non-null type', async 
     searchUsage: [],
     performanceIncluded: false,
     searchConfig: DEFAULT_SEARCH_CONFIG,
-  }, 14);
+  }, 17);
   assertEquals(result.status, 400);
   expect(result.body.error).toMatch(/deletedAt/);
 });
 
-test('v13 replace import refuses payload missing user 1', async () => {
+test('v17 replace import refuses payload missing user 1', async () => {
   const { app } = setup();
   const result = await doImport(app, 'replace', {
     users: [USER_BOB],
@@ -1271,12 +1327,12 @@ test('v13 replace import refuses payload missing user 1', async () => {
     searchUsage: [],
     performanceIncluded: false,
     searchConfig: DEFAULT_SEARCH_CONFIG,
-  }, 14);
+  }, 17);
   assertEquals(result.status, 400);
   expect(result.body.error).toMatch(/user 1/);
 });
 
-test('a full v13 export re-imports verbatim — the export→import round trip is closed', async () => {
+test('a full v17 export re-imports verbatim — the export→import round trip is closed', async () => {
   const { app, repo } = setup();
   await repo.users.save(SEED_ADMIN);
   await repo.users.save(USER_BOB);
@@ -1302,21 +1358,23 @@ test('a full v13 export re-imports verbatim — the export→import round trip i
   await repo.searchConfig.save(config);
 
   const exported = await doExport(app, true);
-  assertEquals(exported.version, 14);
+  assertEquals(exported.version, 17);
 
   // Replace-import the export's own `data`, verbatim. If the export emits any
   // shape the import parser rejects, this 400s — the round trip is the
   // invariant, so this test fails the moment the two sides drift.
-  const result = await doImport(app, 'replace', exported.data, 14);
+  const result = await doImport(app, 'replace', exported.data, 17);
   assertEquals(result.status, 200);
   assertEquals(result.body.imported, { users: 2, apiKeys: 2, upstreams: 4, proxies: 0, usage: 2, searchUsage: 2, performance: 2 });
 
   // Spot-check fidelity across collection types (order-independent).
   assertEquals((await repo.upstreams.list()).find(u => u.id === 'up_codex_a')?.state, CODEX_UPSTREAM.state);
   assertEquals((await repo.users.listIncludingDeleted()).find(u => u.id === USER_BOB.id), USER_BOB);
-  assertEquals((await repo.apiKeys.getById('key-b'))?.userId, USER_BOB.id);
-  assertEquals((await repo.usage.listAll()).find(u => u.keyId === 'key-a' && u.hour === USAGE_1.hour), USAGE_1);
-  assertEquals((await repo.performance.listAll()).find(p => p.keyId === 'key-a' && p.hour === PERFORMANCE_1.hour), PERFORMANCE_1);
+  assertEquals((await repo.apiKeys.findByRawKey(KEY_B.key))?.userId, USER_BOB.id);
+  const restoredKeyA = await repo.apiKeys.findByRawKey(KEY_A.key);
+  if (restoredKeyA === null) throw new Error('restored key A missing');
+  assertEquals((await repo.usage.listAll()).find(u => u.keyId === restoredKeyA.id && u.hour === USAGE_1.hour), { ...USAGE_1, keyId: restoredKeyA.id });
+  assertEquals((await repo.performance.listAll()).find(p => p.keyId === restoredKeyA.id && p.hour === PERFORMANCE_1.hour), { ...PERFORMANCE_1, keyId: restoredKeyA.id });
   assertEquals(await repo.searchConfig.get(), config);
 });
 
@@ -1338,10 +1396,10 @@ test('any data bearing a historical version is rejected on the version gate, bef
     searchConfig: DEFAULT_SEARCH_CONFIG,
   };
 
-  for (const version of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]) {
+  for (const version of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]) {
     const result = await doImport(app, 'replace', wellFormed, version);
     assertEquals(result.status, 400);
-    assertEquals(String(result.body.error).includes('version must be 14'), true);
+    assertEquals(String(result.body.error).includes('version must be 17'), true);
   }
 
   // Nothing was touched — the version gate runs before any delete or write.
@@ -1349,7 +1407,7 @@ test('any data bearing a historical version is rejected on the version gate, bef
   assertEquals((await repo.upstreams.list()).map(u => u.id), ['up_custom_a']);
 });
 
-test('replace-mode import purges every pre-existing key dump and cuts SSE subscribers', async () => {
+test('replace-mode import cuts SSE subscribers for every pre-existing dump key', async () => {
   const { app, repo } = setup();
   await repo.apiKeys.save({ ...KEY_A, dumpRetentionSeconds: 3600 });
   await repo.apiKeys.save({ ...KEY_B, dumpRetentionSeconds: 1800 });
@@ -1359,8 +1417,6 @@ test('replace-mode import purges every pre-existing key dump and cuts SSE subscr
     apiKeys: [{ ...KEY_A, dumpRetentionSeconds: 3600 }],
   }));
   assertEquals(result.status, 200);
-  assertEquals(stubs.purgedAll.includes(KEY_A.id), true);
-  assertEquals(stubs.purgedAll.includes(KEY_B.id), true);
   assertEquals(stubs.closedChannels.some(c => c.keyId === KEY_A.id), true);
   assertEquals(stubs.closedChannels.some(c => c.keyId === KEY_B.id), true);
 });
@@ -1375,10 +1431,9 @@ test('replace-mode import succeeds when the broker close hook throws', async () 
     apiKeys: [{ ...KEY_A, dumpRetentionSeconds: 3600 }],
   }));
   assertEquals(result.status, 200);
-  assertEquals(stubs.purgedAll.includes(KEY_A.id), true);
 });
 
-test('merge-mode import flipping retention to null purges + closes the channel', async () => {
+test('merge-mode import flipping retention to null closes the channel', async () => {
   const { app, repo } = setup();
   await repo.apiKeys.save({ ...KEY_A, dumpRetentionSeconds: 3600 });
   const stubs = installDumpStubs(initDumpStore, initDumpBroker);
@@ -1387,11 +1442,10 @@ test('merge-mode import flipping retention to null purges + closes the channel',
     apiKeys: [{ ...KEY_A, dumpRetentionSeconds: null }],
   }));
   assertEquals(result.status, 200);
-  assertEquals(stubs.purgedAll.includes(KEY_A.id), true);
   assertEquals(stubs.closedChannels.some(c => c.keyId === KEY_A.id), true);
 });
 
-test('merge-mode import shrinking retention purges expired with the new window', async () => {
+test('merge-mode import shrinking retention succeeds without closing the channel', async () => {
   const { app, repo } = setup();
   await repo.apiKeys.save({ ...KEY_A, dumpRetentionSeconds: 7200 });
   const stubs = installDumpStubs(initDumpStore, initDumpBroker);
@@ -1400,9 +1454,7 @@ test('merge-mode import shrinking retention purges expired with the new window',
     apiKeys: [{ ...KEY_A, dumpRetentionSeconds: 1800 }],
   }));
   assertEquals(result.status, 200);
-  const call = stubs.purgedExpired.find(c => c.keyId === KEY_A.id);
-  expect(call).toBeDefined();
-  assertEquals(call!.retentionSeconds, 1800);
+  assertEquals(stubs.closedChannels.some(c => c.keyId === KEY_A.id), false);
 });
 
 test('merge-mode retention transition tolerates dump-broker failure', async () => {
@@ -1415,45 +1467,4 @@ test('merge-mode retention transition tolerates dump-broker failure', async () =
     apiKeys: [{ ...KEY_A, dumpRetentionSeconds: null }],
   }));
   assertEquals(result.status, 200);
-  assertEquals(stubs.purgedAll.includes(KEY_A.id), true);
-});
-
-test('replace-mode import surfaces a purgeAll failure', async () => {
-  // Replace mode promises data isolation: a reused key id in the imported
-  // payload cannot inherit the previous owner's captures. A swallowed
-  // purgeAll failure would defeat that — let the throw propagate so the
-  // operator sees a 500 instead of silently importing on top of stale dumps.
-  const { app, repo } = setup();
-  await repo.apiKeys.save({ ...KEY_A, dumpRetentionSeconds: 3600 });
-  const stubs = installDumpStubs(initDumpStore, initDumpBroker);
-  stubs.failOn('purgeAll', new Error('store down'));
-
-  const resp = await app.request('/import', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      mode: 'replace', version: 14, data: latestImportData({
-        apiKeys: [{ ...KEY_A, dumpRetentionSeconds: 3600 }],
-      }),
-    }),
-  });
-  assertEquals(resp.status, 500);
-});
-
-test('merge-mode retention transition surfaces a purgeAll failure', async () => {
-  const { app, repo } = setup();
-  await repo.apiKeys.save({ ...KEY_A, dumpRetentionSeconds: 3600 });
-  const stubs = installDumpStubs(initDumpStore, initDumpBroker);
-  stubs.failOn('purgeAll', new Error('store down'));
-
-  const resp = await app.request('/import', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      mode: 'merge', version: 14, data: latestImportData({
-        apiKeys: [{ ...KEY_A, dumpRetentionSeconds: null }],
-      }),
-    }),
-  });
-  assertEquals(resp.status, 500);
 });

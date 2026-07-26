@@ -19,6 +19,7 @@ import { z } from 'zod';
 
 import { normalizeDisabledPublicModelIds } from '../repo/disabled-public-models.ts';
 import { CUSTOM_API_KEY_MAX_LENGTH, KEY_SOURCES } from '../shared/api-key-tokens.ts';
+import { RETENTION_MAX_SECONDS, SECONDS_PER_DAY } from '../shared/retention.ts';
 import { kindForEndpoints, MODEL_KINDS, parseNonNegativeDecimalString, RERANK_PROTOCOLS } from '@floway-dev/protocols/common';
 import { type FlagOverrides, MODEL_PREFIX_MAX_LENGTH, MODEL_PREFIX_REGEX, normalizeUpstreamColor, parseFlagOverridesWire } from '@floway-dev/provider';
 
@@ -54,6 +55,7 @@ const modelEndpointsSchema = z.object({
   embeddings: z.object({}).optional(),
   imagesGenerations: z.object({}).optional(),
   imagesEdits: z.object({}).optional(),
+  audioTranscriptions: z.object({}).optional(),
   rerank: z.object({}).optional(),
 });
 
@@ -73,6 +75,8 @@ const pricingMetricShape = {
   input_cache_write_1h_tokens: priceSchema.optional(),
   input_image_tokens: priceSchema.optional(),
   output_image_tokens: priceSchema.optional(),
+  input_audio_tokens: priceSchema.optional(),
+  input_audio_seconds: priceSchema.optional(),
   rerank_searches: priceSchema.optional(),
 };
 
@@ -238,7 +242,6 @@ export const createUserBody = z.object({
   password: passwordSchema,
   isAdmin: z.boolean().optional(),
   upstreamIds: upstreamIdsValueSchema.optional(),
-  canViewGlobalTelemetry: z.boolean().optional(),
 });
 
 export const updateUserBody = z.object({
@@ -246,7 +249,6 @@ export const updateUserBody = z.object({
   password: passwordSchema.optional(),
   isAdmin: z.boolean().optional(),
   upstreamIds: upstreamIdsValueSchema.optional(),
-  canViewGlobalTelemetry: z.boolean().optional(),
 });
 
 export const changeOwnPasswordBody = z.object({
@@ -261,8 +263,13 @@ export const changeOwnPasswordBody = z.object({
 // which has no sensible behavior, so it is rejected at the schema layer.
 // The 10-year upper bound rejects absurd inputs as a clean validation error
 // rather than letting them through as de-facto "never expire".
-export const DUMP_RETENTION_MAX_SECONDS = 10 * 365 * 24 * 60 * 60;
-const dumpRetentionSecondsSchema = z.number().int().positive().max(DUMP_RETENTION_MAX_SECONDS).nullable();
+const dumpRetentionSecondsSchema = z.number().int().positive().max(RETENTION_MAX_SECONDS).nullable();
+// Keep the wire/storage unit aligned with dump retention while requiring the
+// dashboard's whole-day Responses contract at every control-plane boundary.
+const responsesRetentionSecondsSchema = z.union([
+  z.literal(0),
+  z.number().int().min(SECONDS_PER_DAY).max(RETENTION_MAX_SECONDS).multipleOf(SECONDS_PER_DAY),
+]);
 
 // `key_source` picks how the raw key on this create/rotate request is
 // produced: 'generate' means the gateway mints an sk-...T3BlbkFJ... token
@@ -278,6 +285,7 @@ export const createKeyBody = z.object({
   name: z.string().min(1),
   upstream_ids: upstreamIdsValueSchema.optional(),
   dump_retention_seconds: dumpRetentionSecondsSchema.optional(),
+  responses_retention_seconds: responsesRetentionSecondsSchema.optional(),
   ...keySourceShape,
 });
 
@@ -287,6 +295,7 @@ export const updateKeyBody = z.object({
   name: z.string().min(1).optional(),
   upstream_ids: upstreamIdsValueSchema.optional(),
   dump_retention_seconds: dumpRetentionSecondsSchema.optional(),
+  responses_retention_seconds: responsesRetentionSecondsSchema.optional(),
 });
 
 // --- upstreams ---
@@ -637,7 +646,7 @@ const aliasBodyCore = z.object(aliasBaseShape);
 
 // superRefine cross-validates each target's `rules` against the alias-level
 // kind. Chat: parse through `chatAliasRulesSchema` and surface the inner
-// issue verbatim. Embedding / image / rerank: the slot must be `{}` until a future
+// issue verbatim. Non-chat kinds require `{}` until a future
 // schema lands. `announced_metadata.chat` is bound to the same invariant:
 // a chat block on a non-chat alias would land on the InternalModel row and
 // leak an incoherent `chat: {...}` sidecar onto `/v1/models` for a row
@@ -690,7 +699,7 @@ export const updateAliasBody = aliasBodyCore.superRefine(aliasBodyRulesRefinemen
 // --- data transfer ---
 
 export const importBody = z.object({
-  version: z.literal(14, { error: 'version must be 14 — older export formats are not supported; re-export from the current deployment' }),
+  version: z.literal(17, { error: 'version must be 17 — older export formats are not supported; re-export from the current deployment' }),
   mode: z.enum(['merge', 'replace'], { error: "mode must be 'merge' or 'replace'" }),
   data: z.unknown().optional(),
 });
@@ -701,9 +710,15 @@ export const exportQuery = z.object({
 
 // --- query strings (token-usage, search-usage, performance) ---
 //
+// `view` is required on the usage endpoints. The two views return different
+// payload shapes, so deriving one from the caller's capability would make the
+// same URL answer differently per user — and silently widen as soon as
+// someone's role changes. Declaring it required in the schema also makes the
+// RPC client demand it at compile time.
+//
 // start/end stay optional in the schema (rather than `.min(1)`) so the
 // handler can return the canonical "start and end query parameters are
-// required" message its tests assert on. The schema's job here is to
+// required" message its tests assert on. The schema's job there is to
 // inform the RPC client of the available fields, not duplicate the
 // required-ness check.
 
@@ -713,7 +728,7 @@ const usageBaseQuery = {
   key_id: z.string().optional(),
   include_key_metadata: z.string().optional(),
   include_user_metadata: z.string().optional(),
-  view: z.enum(['all-by-user', 'self-by-key']).optional(),
+  view: z.enum(['all-by-user', 'self-by-key'], { error: "view must be 'all-by-user' or 'self-by-key'" }),
 };
 
 export const tokenUsageQuery = z.object(usageBaseQuery);
@@ -734,7 +749,9 @@ export const searchUsageQuery = z.object({
   provider: z.string().optional(),
 });
 
-export const performanceQuery = z.object(usageBaseQuery).omit({ include_key_metadata: true, include_user_metadata: true }).extend({
+export const performanceQuery = z.object({
+  start: z.string().optional(),
+  end: z.string().optional(),
   group_by: z.enum(['keyId', 'userId', 'model', 'upstream', 'operation', 'runtimeLocation']).optional(),
   bucket: z.enum(['hour', '4h', '8h', 'day', 'all']).optional(),
   timezone_offset_minutes: z.string().optional(),

@@ -1,18 +1,14 @@
 import type { User } from '../../repo/types.ts';
 
-export const userToEffectiveWire = (user: User) => ({
+// The self-description returned by /auth/login and /auth/me.
+export const userToSessionWire = (user: User) => ({
   id: user.id,
   username: user.username,
   isAdmin: user.isAdmin,
-  canViewGlobalTelemetry: user.isAdmin || user.canViewGlobalTelemetry,
   upstreamIds: user.upstreamIds,
 });
 
-export const userToRawWire = (user: User) => ({
-  id: user.id,
-  username: user.username,
-  isAdmin: user.isAdmin,
-  canViewGlobalTelemetry: user.canViewGlobalTelemetry,
-  upstreamIds: user.upstreamIds,
+export const userToAdminWire = (user: User) => ({
+  ...userToSessionWire(user),
   createdAt: user.createdAt,
 });

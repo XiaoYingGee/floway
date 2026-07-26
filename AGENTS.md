@@ -11,6 +11,10 @@
   without running any test, lint, or typecheck first. Verification belongs to
   the completion and merge-to-main gate, not to each in-flight worktree
   commit.
+- When investigating Copilot upstream quirks, compare at least one other
+  Copilot gateway implementation before inventing a policy. For generic
+  adapter behavior, compare at least one Copilot gateway and one general
+  LLM gateway. Do not cargo-cult from a single project.
 - This file describes only the current system. Removed concepts must not
   appear anywhere in the repo — code, comments, tests, docs, this file
   included. Migrations are the only place an old name is allowed to survive.
@@ -35,7 +39,8 @@ dependencies remain targeted at their predecessor branches and remain drafts.
 
 Floway is an LLM API gateway. It exposes OpenAI Completions, Anthropic
 Messages, OpenAI Responses, OpenAI Chat Completions, Embeddings, OpenAI
-Images, Cohere/Jina/Voyage-compatible Rerank, and Google Gemini-compatible APIs over a unified upstream
+Images, OpenAI Audio Transcriptions, Cohere/Jina/Voyage-compatible Rerank,
+and Google Gemini-compatible APIs over a unified upstream
 model. Provider kinds are
 `copilot`, `custom`, `azure`, `codex` (ChatGPT subscription via the
 Codex CLI's OAuth client), `claude-code` (Claude.ai Pro/Max subscription
@@ -86,6 +91,13 @@ Allowed:
   picker by the same pattern. Mirroring the CLI's own expectation, not
   Floway asserting an endpoint mapping. Scope must be the CLI setup
   helper; general model pickers still read `endpoints` from the DTO.
+- **Per-provider pricing tables** (`pricing.ts`) — return null for
+  unknown keys.
+- **Provider config discriminators naming the OWN kind** —
+  `kind: 'claude-code'`.
+- **Vendor-locked provider packages** (`provider-claude-code`,
+  `provider-codex`) doing fixed-catalog request/header mimicry captured
+  verbatim from a live wire probe with a reference URL.
 
 Forbidden — silent narrowing at wire / translate / control-plane
 boundaries. Open-string fields declared `| (string & {})` or bare
@@ -104,14 +116,6 @@ budget bin edges, canonical enum values, header sets, protocol quirks.
 Prose like "per Anthropic's vision docs" without a permalink doesn't
 count.
 
-Beyond the allowed patterns above, three carve-outs also fall outside
-the prohibition: per-provider pricing tables (`pricing.ts` — return
-null for unknown keys); provider config discriminators naming the OWN
-kind (`kind: 'claude-code'`); and vendor-locked provider packages
-(`provider-claude-code`, `provider-codex`) doing fixed-catalog
-request/header mimicry captured verbatim from a live wire probe with a
-reference URL.
-
 ## Architecture
 
 Stack: Hono on Web APIs, TypeScript, pnpm, Vitest. The dashboard is a
@@ -122,6 +126,8 @@ SQL. The `@floway-dev/platform` package owns the abstract runtime
 contracts (`FileProvider`, `ImageProcessor`, `ExternalResourceFetcher`,
 `SqlDatabase`, `BackgroundScheduler`, `EnvGetter`, `SocketDial`); each
 `apps/platform-*` app supplies the concrete impls and its own entry.
+
+## Workspace Layout
 
 ```text
 Floway/
@@ -139,7 +145,7 @@ Floway/
 │   ├── provider-copilot/     # @floway-dev/provider-copilot — GitHub Copilot provider
 │   ├── provider-custom/      # @floway-dev/provider-custom — configurable multi-protocol HTTP provider
 │   ├── provider-ollama/      # @floway-dev/provider-ollama — Ollama (ollama.com or self-hosted)
-│   ├── proxy/                # @floway-dev/proxy — proxy URI parsing + per-protocol byte-stream dialers
+│   ├── proxy/                # @floway-dev/proxy — proxy URI parsing, per-protocol byte-stream dialers, proxy-backed and direct request runners
 │   ├── test-utils/           # @floway-dev/test-utils — shared Vitest fixtures and stubs (test-only)
 │   ├── translate/            # @floway-dev/translate — cross-protocol translation pairs
 │   └── ui/                   # @floway-dev/ui — internal Vue component library
@@ -150,46 +156,35 @@ Floway/
 ```
 
 Dependency direction is strict. The leaf-most packages are `protocols`,
-`interceptor`, and `http` (HTTP/1.1 over a duplex byte stream + userspace
-TLS + WebSocket upgrade, no runtime dependencies). `translate` depends on
-`protocols`. `agent-setup` is the self-contained Agent Setup domain —
-configuration schema, language-native installer prefix rendering, canonical
-Bash/PowerShell common fragments plus per-agent fragments, dependency-injected
-Hono public and control route factories, and the lease
-`AgentSetupRepository` contract — and depends only on `hono` / `zod` /
-`@hono/zod-validator`; it never imports the gateway or any app, and knows
-nothing of databases, HTTP auth/CORS/logging, host mount paths, or runtimes.
-`proxy` depends on `http`; it parses subscription-style proxy URIs,
-dispatches to per-protocol byte-stream dialers, and exposes request runners
-for both proxy-backed and direct TCP streams. Both compose dial → optional
-userspace TLS → fetch-on-stream. All dialers — including `vless-ws`, which layers
-`wsUpgradeAndFrame` over the runtime's TLS-wrapped duplex — stay
-runtime-agnostic by taking the raw TCP `socketDial` primitive through
-`DialOptions`, so they never import `@floway-dev/platform`. `provider`
-depends on `platform` + `protocols` + `interceptor`; the per-vendor
-`provider-*` packages depend on `provider`.
+`interceptor`, and `http`, none of which have runtime dependencies.
+`translate` depends on `protocols`. `agent-setup` depends only on
+`hono` / `zod` / `@hono/zod-validator`; it never imports the gateway or any
+app, and knows nothing of databases, HTTP auth/CORS/logging, host mount
+paths, or runtimes. `proxy` depends on `http`; all its dialers — including
+`vless-ws`, which layers `wsUpgradeAndFrame` over the runtime's TLS-wrapped
+duplex — stay runtime-agnostic by taking the raw TCP `socketDial` primitive
+through `DialOptions`, so they never import `@floway-dev/platform`.
+`provider` depends on `platform` + `protocols` + `interceptor`; the
+per-vendor `provider-*` packages depend on `provider`.
 `gateway` depends on `platform` + `protocols` + `translate` + `http` +
 `proxy` + `agent-setup` + all `provider-*`, and is the runtime-agnostic
 gateway core; it threads `getSocketDial()` from `@floway-dev/platform` into
 the proxy library at the dial-layer composition root, and supplies the SQL /
-in-memory `AgentSetupRepository` implementations. A successful Agent Setup
-insert stores the replacement lease before pruning only that user's
-already-expired siblings. The gateway also supplies the auth-derived user id
-and the single host-owned route path used to mount both setup surfaces and
-project public script URLs. The public routes sit ahead of logger / CORS / auth
-middleware. `apps/platform-*` depend on
-`platform` + `gateway` plus their target's runtime libraries
-(`@cloudflare/workers-types`; `sharp` + `@hono/node-server`); they are the
-only places runtime-specific symbols (D1, R2, Images, KV, ExecutionContext,
-sharp, node:sqlite, fs) appear. `apps/web` depends on `ui` + `proxy` (the
-latter only via its `/url`, `/url-kind`, `/proxy-config`, and `/constants`
-subpath exports — chosen so the dashboard's proxy editor reuses URI
-parse/format and config types without pulling dialers, userspace TLS, or
-Node `crypto` into the SPA bundle), and type-imports
-`@floway-dev/gateway/app-type` for Hono RPC client typing. It does not depend
-on `@floway-dev/agent-setup` — the dashboard derives the Agent Setup
-configuration type from the RPC client — and ESLint blocks a runtime import of
-that package from `apps/web`.
+in-memory `AgentSetupRepository` implementations, the auth-derived user id,
+and the single host-owned route path that mounts both setup surfaces and
+project public script URLs ahead of logger / CORS / auth middleware.
+`apps/platform-*` depend on `platform` + `gateway` plus their target's
+runtime libraries (`@cloudflare/workers-types`; `sharp` +
+`@hono/node-server`); they are the only places runtime-specific symbols
+(D1, R2, Images, KV, ExecutionContext, sharp, node:sqlite, fs) appear.
+`apps/web` depends on `ui` + `proxy` (the latter only via its `/url`,
+`/url-kind`, `/proxy-config`, and `/constants` subpath exports — chosen so
+the dashboard's proxy editor reuses URI parse/format and config types
+without pulling dialers, userspace TLS, or Node `crypto` into the SPA
+bundle), and type-imports `@floway-dev/gateway/app-type` for Hono RPC
+client typing. It does not depend on `@floway-dev/agent-setup` — the
+dashboard derives the Agent Setup configuration type from the RPC client —
+and ESLint blocks a runtime import of that package from `apps/web`.
 
 ESLint forbids any workspace file from importing `@floway-dev/platform-*`
 by package name, plus a `no-restricted-paths` zone forbidding the
@@ -209,13 +204,6 @@ and request context live under `data-plane/chat/shared/affinity`; each source
 protocol owns its `affinity/ingress.ts` and `affinity/egress.ts`. Wire behavior
 lives in `docs/AFFINITY.md`, and candidate ordering lives in `docs/RESOLUTION.md`.
 
-Native Responses persistence is independent from affinity. It stores complete
-API-key-scoped items and snapshots for 30 days. A completed output item becomes
-reusable at `response.output_item.done`, so its row commits before that event is
-published; the response snapshot commits at the successful terminal event.
-HTTP `store: false` writes no state, while WebSocket `store: false` is
-session-local.
-
 Everything else — provider interfaces, request execution flow, interceptor
 shapes, control-plane route surface, flag resolution, pricing — lives in
 the code and its comments. Translation pair layout, model resolution, and
@@ -233,7 +221,6 @@ pnpm run test:agent-setup-installers  # assembled Agent Setup scripts vs. fake C
 To work on a single package, use pnpm filters (e.g.
 `pnpm --filter @floway-dev/translate run typecheck`). Wrangler commands
 go through the local dependency with `pnpm wrangler` or package scripts.
-When deploying, do not pass `--dry-run`.
 
 ## Development
 
@@ -258,14 +245,13 @@ backend-only `assets.run_worker_first` route list in the gitignored
 
 `dev:node` boots the Node deployment target. Configure via
 `FLOWAY_DB_PATH` (sqlite file path), `FLOWAY_FILES_DIR` (filesystem
-store root), `ADMIN_KEY` (admin secret; optional on dev, mandatory when
-`NODE_ENV=production`), `PORT`, and optionally `RUNTIME_LOCATION`
-(instance tag used as the perf-telemetry `runtimeLocation` dimension and
-the dial-time colo-whitelist key — uppercased on read, defaults to
-`LOCAL` when unset). The Node entry runs `applyMigrations` against
-`packages/gateway/migrations/*.sql` at boot, then serves the same Hono
-app through `@hono/node-server`. Static-asset serving is Workers-only;
-the Node target serves no SPA.
+store root), `ADMIN_KEY` (admin secret; see below), `PORT`, and
+optionally `RUNTIME_LOCATION` (instance tag used as the perf-telemetry
+`runtimeLocation` dimension and the dial-time colo-whitelist key —
+uppercased on read, defaults to `LOCAL` when unset). The Node entry runs
+`applyMigrations` against `packages/gateway/migrations/*.sql` at boot,
+then serves the same Hono app through `@hono/node-server`. Static-asset
+serving is Workers-only; the Node target serves no SPA.
 
 The public Agent Setup installers are composed from the checked-in
 `packages/agent-setup/installers/{bash,powershell}/common/` fragments
@@ -283,19 +269,13 @@ entry refuses to boot under `NODE_ENV=production` with an empty
 `ADMIN_KEY`, and the Cloudflare-side request handler refuses passwordless
 logins whenever the request carries a `CF-Ray` header (workerd's local
 inbound used by `wrangler dev` never writes CF-Ray; only Cloudflare's
-edge does).
+edge does). It is not a data-plane credential; its only purpose is to let
+an operator who lost the admin password log in via `POST /auth/login`.
 
 For manual data-plane validation, log into the dashboard with the
 `ADMIN_KEY` backdoor (or, on a dev instance, the passwordless shortcut)
 or with your own user, then create or pick an API key under your account
-and use it as `x-api-key`. `ADMIN_KEY` is not a data-plane credential;
-its only purpose is to let an operator who lost the admin password log
-in via `POST /auth/login`.
-
-When investigating Copilot upstream quirks, compare at least one other
-Copilot gateway implementation before inventing a policy. For generic
-adapter behavior, compare at least one Copilot gateway and one general
-LLM gateway. Do not cargo-cult from a single project.
+and use it as `x-api-key`.
 
 ## Deployment
 
@@ -348,10 +328,10 @@ message (which records the commit revision of that deployment).
 `d1 migrations list --remote` prints applied migrations and the pending
 diff this deploy would apply.
 
-**Step 2 — declare breaking changes.** Extract the deploy message of the
-currently active deployment from Step 1's output. The message is a short
-commit revision (recorded by the previous deploy's `--message` flag). Use
-it to diff `CHANGELOG.md` between that revision and the current working
+**Step 2 — declare breaking changes and collect recommended actions.**
+Extract the deploy message of the currently active deployment from Step 1's
+output. The message is the short commit revision the deploy script stamped.
+Use it to diff `CHANGELOG.md` between that revision and the current working
 tree:
 
 ```bash
@@ -364,17 +344,21 @@ workflow), and the database shows applied migrations (confirming Floway
 is already running in production), treat the entire content of
 `CHANGELOG.md` as potentially new to the user.
 
-When the diff (or full content) contains new breaking-change entries,
-summarize their combined user-facing impact to the user. When the same
-area was broken by consecutive entries, do not enumerate each
-intermediate state — synthesize the net effect. Tell the user that all
-listed breaking changes are intentional, describe their impact, and ask
-the user to confirm before proceeding. This is the **only** point in the
-deploy flow where the agent pauses and waits for user input.
+Classify every new entry by its heading. `hard` and `minor` entries are
+breaking changes; summarize their combined user-facing impact. When the same
+area was broken by consecutive entries, synthesize the net effect instead of
+enumerating intermediate states. Tell the user that all listed breaking
+changes are intentional, describe their impact, and ask the user to confirm
+before proceeding. This is the **only** point in the deploy flow where the
+agent pauses before deployment.
 
-When there are no new breaking-change entries, or when `CHANGELOG.md`
-does not exist at the previous revision and is empty now, skip
-confirmation and proceed to Step 3 immediately.
+`advisory` entries do not trigger confirmation. Recommended operations may
+appear in `hard`, `minor`, or `advisory` entries; collect all of them for the
+post-deploy report. A note is information, not authority to mutate state.
+
+When there are no new `hard` or `minor` entries, or when `CHANGELOG.md` does
+not exist at the previous revision and is empty now, skip confirmation and
+proceed to Step 3 immediately.
 
 **Step 3 — report findings and stage the rollback.** Tell the user the
 active version id, the active deployment timestamp, the latest applied
@@ -413,19 +397,26 @@ proceed straight to Step 4.
 
 **Step 4 — deploy with one chained command.** Migrate (when needed) and
 publish in the same command so the system spends as little time as
-possible in an inconsistent state. The deploy message is the short commit
-revision of HEAD at deploy time (`git rev-parse --short HEAD`):
+possible in an inconsistent state. `pnpm run deploy` stamps the deploy
+message with the short commit revision of HEAD:
 
 ```bash
-pnpm run db:migrate:remote && pnpm run deploy -- --message "$(git rev-parse --short HEAD)"
+pnpm run db:migrate:remote && pnpm run deploy
 ```
 
 Print this exact command before running it, and tell the user that if the
 deploy stops halfway they can rerun the same command to recover —
 `wrangler d1 migrations apply --remote` is idempotent on already-applied
 migrations and `wrangler deploy` always publishes the current code. When
-there are no pending migrations, the command reduces to
-`pnpm run deploy -- --message "$(git rev-parse --short HEAD)"`.
+there are no pending migrations, the command reduces to `pnpm run deploy`.
+Never pass `--dry-run`.
+
+After the Worker is live, report every recommended operation collected from
+the new Deployment Notes. Perform read-only checks directly when they are
+within scope. For any state-changing operation that was not already explicitly
+authorized, explain the recommendation and ask the user before doing it; never
+fold it silently into deployment automation. The deployment itself is complete
+even when a recommended follow-up remains for a later user turn.
 
 Worker rollback by version id (`pnpm wrangler rollback <VERSION_ID>`)
 works across the 100 most recent versions, but Cloudflare blocks rollback
@@ -442,26 +433,38 @@ from `account_id`, the one personal-only key the gate allowlists). So
 plain code rollback stays safe; D1 state is rolled back separately as
 above.
 
-A complete deploy without breaking changes fits in a strict turn budget:
+A complete deploy without `hard` or `minor` notes fits in a strict turn budget:
 **three agent turns when migrations are pending** (Step 1 = gather,
 Step 3 = bookmark + report + two rollback commands, Step 4 = deploy)
 and **two agent turns when no migrations are pending** (Step 3 collapses
 into Turn 1: gather + report + single code-rollback command; Turn 2 =
-deploy). Step 2 adds one turn only when new breaking-change entries
-exist.
+deploy). Step 2 adds one turn only when new `hard` or `minor` entries exist.
+Reporting recommended operations after deploy does not add a deployment turn;
+executing one may require a separate authorization turn.
 
-## Breaking Changes (CHANGELOG.md)
+## Deployment Notes (CHANGELOG.md)
 
-`CHANGELOG.md` records user-facing breaking changes. It is prepend-only:
-new entries go at the top, below the file header. Each entry has a date
-heading and a description of what broke and what users need to know.
+`CHANGELOG.md` records user-facing breaking changes and recommended deployment
+operations. It is prepend-only: new entries go at the top, below the file
+header. Each entry has a date heading, an impact level, and a description of
+what users need to know or do.
 
-Each entry carries a severity: **hard** (all users are affected;
-previously working functionality fails or behaves differently) or
-**minor** (specific behaviors, fields, or integration patterns change;
-users who depend on them need to adapt, but the primary functionality
-continues to work). The date heading format is `## YYYY-MM-DD · hard`
-or `## YYYY-MM-DD · minor`.
+Each entry carries one of three levels:
+
+- **hard** — all users are affected; previously working functionality fails or
+  behaves differently.
+- **minor** — a specific behavior, field, or integration pattern changes;
+  affected users need to adapt, but primary functionality continues to work.
+- **advisory** — no previously working behavior breaks, but the deployment
+  creates or reveals a condition for which an agent or operator should consider
+  a concrete follow-up action.
+
+The date heading format is `## YYYY-MM-DD · hard`,
+`## YYYY-MM-DD · minor`, or `## YYYY-MM-DD · advisory`, followed by a
+`### Short title` heading naming the change and then its description. Unlike
+this file, `CHANGELOG.md` is not hard-wrapped: each paragraph is one line.
+Recommended operations may appear in any level; they do not need a separate
+advisory entry when they belong to the same hard or minor change.
 
 A change qualifies as a breaking change when it causes previously working
 user-facing behavior to stop working or behave differently in a way
@@ -475,14 +478,16 @@ users must be aware of. Examples:
   data-plane output) that downstream consumers or cascaded Floway
   instances read.
 
-The following are NOT breaking changes and must not appear:
+An advisory qualifies only when there is a concrete deployment-related action
+to report. The following must not appear by themselves:
 
 - Database schema migrations (internal storage detail).
 - Control-plane API changes (admin-only surface).
-- Export version bumps, internal refactors, new features that do not
-  alter existing behavior.
+- Export version bumps, internal refactors, and new features that neither alter
+  existing behavior nor require an operator action.
 
 When working on a change and it is unclear whether it constitutes a
-breaking change, do not unilaterally add a CHANGELOG entry — ask the
-user to make the call. The user declares what is breaking; the agent
-records it.
+`hard` or `minor` breaking change, do not classify it unilaterally — ask the
+user to make the call. The user declares what is breaking; the agent records
+it. An advisory must state the recommended action, its reason, and enough scope
+to avoid accidentally applying it to unrelated state.

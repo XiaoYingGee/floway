@@ -60,10 +60,11 @@ test('/api/token-usage self-by-key surfaces soft-deleted keys metadata to their 
     upstreamIds: null,
     deletedAt: null,
     dumpRetentionSeconds: null,
+    responsesRetentionSeconds: 0,
   });
 
   const response = await requestApp(
-    '/api/token-usage?start=2026-04-30T00&end=2026-05-01T00&include_key_metadata=1',
+    '/api/token-usage?start=2026-04-30T00&end=2026-05-01T00&include_key_metadata=1&view=self-by-key',
     { headers: { 'x-api-key': 'raw_fresh_key' } },
   );
 

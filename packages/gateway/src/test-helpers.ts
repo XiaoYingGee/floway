@@ -131,7 +131,6 @@ export async function setupAppTest(options: SetupOptions = {}): Promise<AppTestC
     passwordHash: null,
     isAdmin: false,
     upstreamIds: null,
-    canViewGlobalTelemetry: false,
     createdAt: '2026-03-15T00:00:00.000Z',
     deletedAt: null,
   });
@@ -146,6 +145,7 @@ export async function setupAppTest(options: SetupOptions = {}): Promise<AppTestC
     upstreamIds: null,
     deletedAt: null,
     dumpRetentionSeconds: null,
+    responsesRetentionSeconds: 30 * 24 * 60 * 60,
   };
   await repo.apiKeys.save(apiKey);
 

@@ -1,7 +1,7 @@
 import { afterEach, test, vi } from 'vitest';
 
-import { createResponsesItemId } from './items/format.ts';
 import { createResponsesHttpStore, MemoryStatefulResponsesBacking, LayeredStatefulResponsesStore } from './items/store.ts';
+import { TEST_RESPONSES_RETENTION_SECONDS, testResponsesStatePolicy } from './test-policy.ts';
 import { initRepo } from '../../../repo/index.ts';
 import { InMemoryRepo } from '../../../repo/memory.ts';
 import type { StoredResponsesItem, StoredResponsesSnapshot } from '../../../repo/types.ts';
@@ -61,6 +61,12 @@ afterEach(() => { resolutionsQueue.length = 0; });
 const installRepo = (): InMemoryRepo => {
   const repo = new InMemoryRepo();
   initRepo(repo);
+  void repo.apiKeys.save({
+    id: API_KEY_ID, userId: 1, name: 'Responses test key', key: 'raw-responses-test',
+    serverSecret: '99'.repeat(32), createdAt: '2026-01-01T00:00:00.000Z',
+    upstreamIds: null, deletedAt: null, dumpRetentionSeconds: null,
+    responsesRetentionSeconds: TEST_RESPONSES_RETENTION_SECONDS,
+  });
   return repo;
 };
 
@@ -68,7 +74,7 @@ const makeGatewayCtx = (store?: ChatGatewayCtx['store']) =>
   mockChatGatewayCtx({
     apiKeyId: API_KEY_ID,
     wantsStream: true,
-    store: store ?? createResponsesHttpStore(API_KEY_ID, true),
+    store: store ?? createResponsesHttpStore(testResponsesStatePolicy(API_KEY_ID), Date.now(), true),
   });
 
 const makePayload = (overrides: Partial<CanonicalResponsesPayload> = {}): CanonicalResponsesPayload => ({
@@ -381,26 +387,23 @@ test('compact renders model-unsupported as a 400 when the only candidate\'s endp
 
 test('expandPreviousResponseId prepends snapshot items and strips the previous_response_id field', async () => {
   const repo = installRepo();
-  const previousMessageId = createResponsesItemId('message');
+  const previousMessageId = 'msg_previous';
   await repo.responsesItems.insertMany([{
     id: previousMessageId,
     apiKeyId: API_KEY_ID,
-    upstreamId: null,
-    upstreamItemId: null,
-    itemType: 'message',
-    contentHash: 'previous-message-hash',
+    itemHash: 'previous-message-hash',
     payload: { item: { type: 'message', id: previousMessageId, role: 'user', content: 'first turn' } },
-    createdAt: 1_000,
-  }]);
+    refreshedAt: Date.now(),
+  }], 0);
   const snapshot: StoredResponsesSnapshot = {
     id: 'resp_prev',
     apiKeyId: API_KEY_ID,
     itemIds: [previousMessageId],
-    createdAt: 1_000,
+    refreshedAt: Date.now(),
   };
   await repo.responsesSnapshots.insert(snapshot);
 
-  const store = createResponsesHttpStore(API_KEY_ID, true);
+  const store = createResponsesHttpStore(testResponsesStatePolicy(API_KEY_ID), Date.now(), true);
   const expanded = await expandPreviousResponseId(
     makePayload({
       previous_response_id: 'resp_prev',
@@ -431,22 +434,19 @@ const memoryStore = async (snapshots: readonly StoredResponsesSnapshot[], items:
 
 test('expandPreviousResponseId resolves snapshots from a non-repo-backed store', async () => {
   installRepo(); // affinity lookups in the wider flow still need a repo, but here the helper only touches the store.
-  const id = createResponsesItemId('message');
+  const id = 'msg_memory';
   const item: StoredResponsesItem = {
     id,
     apiKeyId: API_KEY_ID,
-    upstreamId: null,
-    upstreamItemId: null,
-    itemType: 'message',
-    contentHash: 'memory-message-hash',
+    itemHash: 'memory-message-hash',
     payload: { item: { type: 'message', id, role: 'user', content: 'remembered' } },
-    createdAt: 1_000,
+    refreshedAt: 1_000,
   };
   const snapshot: StoredResponsesSnapshot = {
     id: 'resp_mem',
     apiKeyId: API_KEY_ID,
     itemIds: [id],
-    createdAt: 1_000,
+    refreshedAt: 1_000,
   };
   const store = await memoryStore([snapshot], [item]);
 
@@ -558,7 +558,7 @@ test('alias resolution swaps the inbound model id for the target and overlays ru
   const payload = makePayload({ model: 'gpt-fast' });
   const result = await responsesServe.generate({
     payload,
-    ctx: makeGatewayCtx(createResponsesHttpStore(API_KEY_ID, true)),
+    ctx: makeGatewayCtx(createResponsesHttpStore(testResponsesStatePolicy(API_KEY_ID), Date.now(), true)),
     headers: new Headers(),
   });
 
@@ -584,7 +584,7 @@ test('alias whose targets have no kind-matching binding surfaces as the regular 
 
   const result = await responsesServe.generate({
     payload: makePayload({ model: 'gpt-fast' }),
-    ctx: makeGatewayCtx(createResponsesHttpStore(API_KEY_ID, true)),
+    ctx: makeGatewayCtx(createResponsesHttpStore(testResponsesStatePolicy(API_KEY_ID), Date.now(), true)),
     headers: new Headers(),
   });
 

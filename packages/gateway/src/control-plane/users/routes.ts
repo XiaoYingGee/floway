@@ -1,5 +1,5 @@
-import { userToRawWire } from './wire.ts';
-import { getDumpStore, notifyDisabledBestEffort } from '../../dump/registry.ts';
+import { userToAdminWire } from './wire.ts';
+import { notifyDisabledBestEffort } from '../../dump/registry.ts';
 import { type AuthedContext, sessionIdFromContext, userFromContext } from '../../middleware/auth.ts';
 import { type CtxWithJson } from '../../middleware/zod-validator.ts';
 import { getRepo } from '../../repo/index.ts';
@@ -24,7 +24,7 @@ const parseUserId = (raw: string): number | null => {
 
 export const listUsers = async (c: AuthedContext) => {
   const users = await getRepo().users.list();
-  return c.json(users.map(userToRawWire));
+  return c.json(users.map(userToAdminWire));
 };
 
 export const createUser = async (c: CtxWithJson<typeof createUserBody>) => {
@@ -44,7 +44,6 @@ export const createUser = async (c: CtxWithJson<typeof createUserBody>) => {
     passwordHash: await hashPassword(body.password),
     isAdmin: body.isAdmin ?? false,
     upstreamIds: body.upstreamIds ?? null,
-    canViewGlobalTelemetry: body.canViewGlobalTelemetry ?? false,
     createdAt: new Date().toISOString(),
     deletedAt: null,
   });
@@ -59,10 +58,11 @@ export const createUser = async (c: CtxWithJson<typeof createUserBody>) => {
     upstreamIds: null,
     deletedAt: null,
     dumpRetentionSeconds: null,
+    responsesRetentionSeconds: 0,
   };
   await repo.apiKeys.save(defaultKey);
 
-  return c.json({ user: userToRawWire(user) }, 201);
+  return c.json({ user: userToAdminWire(user) }, 201);
 };
 
 export const updateUser = async (c: CtxWithJson<typeof updateUserBody>) => {
@@ -93,7 +93,6 @@ export const updateUser = async (c: CtxWithJson<typeof updateUserBody>) => {
   if (body.password !== undefined) overrides.passwordHash = await hashPassword(body.password);
   if (body.isAdmin !== undefined) overrides.isAdmin = body.isAdmin;
   if (body.upstreamIds !== undefined) overrides.upstreamIds = body.upstreamIds;
-  if (body.canViewGlobalTelemetry !== undefined) overrides.canViewGlobalTelemetry = body.canViewGlobalTelemetry;
   const next: User = { ...existing, ...overrides };
   await repo.users.save(next);
 
@@ -103,7 +102,7 @@ export const updateUser = async (c: CtxWithJson<typeof updateUserBody>) => {
     else await repo.sessions.deleteByUserId(id);
   }
 
-  return c.json(userToRawWire(next));
+  return c.json(userToAdminWire(next));
 };
 
 export const deleteUser = async (c: AuthedContext) => {
@@ -115,14 +114,10 @@ export const deleteUser = async (c: AuthedContext) => {
 
   const repo = getRepo();
 
-  // Purge each owned key's dumps before the cascade so a purge failure leaves
-  // the user (and their keys) intact and retriable. We iterate live keys
-  // because soft-deleted keys were already purged at their own delete time.
-  // The broker close hook cuts any live SSE subscriber but is best-effort —
+  // The broker close hook cuts any live SSE subscriber but is best-effort;
   // broker availability never blocks the cascade.
   const keys = await repo.apiKeys.listByUserId(id);
   for (const key of keys) {
-    await getDumpStore().purgeAll(key.id);
     await notifyDisabledBestEffort(key.id, 'deleteUser cascade');
   }
 

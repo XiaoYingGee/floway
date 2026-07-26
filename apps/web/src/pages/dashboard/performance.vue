@@ -8,6 +8,7 @@ import { useRoute, useRouter } from 'vue-router';
 
 import {
   buildOverviewQuery,
+  clampToPermissions,
   emptyDisplayRecord,
   emptyOverview,
   parseUrlState,
@@ -17,7 +18,6 @@ import {
   type MetricView,
   type PercentileKey,
   type PerformanceOverviewResponse,
-  type PerformanceView,
   type SortDir,
   type TableSortKey,
   type UrlState,
@@ -34,10 +34,8 @@ import { OverlayScrollbars, Spinner } from '@floway-dev/ui';
 
 export const usePerformancePageData = defineBasicLoader('/dashboard/performance', async route => {
   const api = useApi();
-  const auth = useAuthStore();
-  const view: PerformanceView = auth.canViewGlobalTelemetry ? 'all-by-user' : 'self-by-key';
-  const initial = parseUrlState(route.query);
-  const query = buildOverviewQuery(initial, view, Date.now());
+  const initial = clampToPermissions(parseUrlState(route.query), useAuthStore().isAdmin);
+  const query = buildOverviewQuery(initial, Date.now());
   // Load upstream names in parallel with the perf overview so By-Upstream tables
   // and chart legends can resolve upstream ids to human-readable names. Store is
   // module-scoped, so this is a no-op when the user has already visited Settings.
@@ -55,7 +53,6 @@ export const usePerformancePageData = defineBasicLoader('/dashboard/performance'
         }),
   ]);
   return {
-    view,
     overview: overviewRes.data ?? emptyOverview(),
     error: overviewRes.error ? overviewRes.error.message : null,
   };
@@ -69,15 +66,15 @@ const route = useRoute();
 const router = useRouter();
 const initialOverview = usePerformancePageData();
 
-// View is resolved once from the caller's permission — admins see all users'
-// data, regular users see only their own keys. The dashboard doesn't expose
-// a toggle; the underlying backend `view` param is still threaded through.
-const performanceView: PerformanceView = initialOverview.data.value.view;
+// The backend returns no By-User rows to a non-administrator, so the page
+// offers neither the By-User breakdown nor the user filter. Read once: the page
+// is never kept alive, so every entry to the route re-reads the store.
+const attributeUsers = useAuthStore().isAdmin;
 
 // Initialize every ref from the URL so the page opens in the same state that
 // was captured when the URL was minted (bookmark / share). The URL-sync
 // watchEffect below writes changes back so refreshing preserves them.
-const initial = parseUrlState(route.query);
+const initial = clampToPermissions(parseUrlState(route.query), attributeUsers);
 const filterModel = ref<string>(initial.filterModel);
 const filterUpstream = ref<string>(initial.filterUpstream);
 const filterOperation = ref<string>(initial.filterOperation);
@@ -126,7 +123,7 @@ const load = async () => {
   const requestedRange = performanceRange.value;
   const requestedAt = Date.now();
   performanceLoading.value = true;
-  const query = buildOverviewQuery(currentUrlState(), performanceView, requestedAt);
+  const query = buildOverviewQuery(currentUrlState(), requestedAt);
   const { data, error: err } = await callApi<PerformanceOverviewResponse>(() => api.api.performance.overview.$get({ query }));
   if (requestId !== performanceRequestId) return;
   performanceLoading.value = false;
@@ -186,15 +183,15 @@ watchEffect(() => {
   void router.replace({ query: serializeUrlState(currentUrlState()) });
 });
 
-// By User is available only with global telemetry access. By API Key is
-// always scoped to the actor's own keys, including inside the global view.
+// The breakdown doubles as the scope selector: By API Key narrows the whole
+// page to the actor's own traffic, every other one spans all users.
 const groupByOptions: { value: GroupBy; label: string }[] = [
   { value: 'model', label: 'By Model' },
   { value: 'upstream', label: 'By Upstream' },
   { value: 'operation', label: 'By Operation' },
   { value: 'runtimeLocation', label: 'By Region' },
   { value: 'keyId', label: 'By API Key' },
-  ...(performanceView === 'all-by-user' ? [{ value: 'userId' as const, label: 'By User' }] : []),
+  ...(attributeUsers ? [{ value: 'userId' as const, label: 'By User' }] : []),
 ];
 
 const performanceSeriesIsolation = createSeriesIsolation();
@@ -476,7 +473,7 @@ const performanceSummary = computed<PerformanceDisplayRecord>(() => overview.val
             <option v-for="v in overview.dimensionValues.runtimeLocations" :key="v" :value="v">{{ v }}</option>
           </select>
         </label>
-        <label v-if="performanceView === 'all-by-user' && performanceGroupBy !== 'userId' && performanceGroupBy !== 'keyId'" class="flex items-center gap-1.5 text-xs text-gray-500">
+        <label v-if="attributeUsers && performanceGroupBy !== 'userId' && performanceGroupBy !== 'keyId'" class="flex items-center gap-1.5 text-xs text-gray-500">
           <span>User:</span>
           <select v-model="filterUserId" class="shrink-0 rounded-lg bg-surface-800 px-3 py-1.5 text-xs font-medium text-gray-300 outline-none">
             <option value="">All</option>

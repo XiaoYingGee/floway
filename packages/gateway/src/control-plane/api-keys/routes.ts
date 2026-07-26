@@ -1,4 +1,4 @@
-import { getDumpStore, notifyDisabledBestEffort } from '../../dump/registry.ts';
+import { notifyDisabledBestEffort } from '../../dump/registry.ts';
 import { type AuthedContext, userFromContext, userUpstreamIdsFromContext } from '../../middleware/auth.ts';
 import { type CtxWithJson } from '../../middleware/zod-validator.ts';
 import { getRepo } from '../../repo/index.ts';
@@ -18,6 +18,7 @@ const apiKeyToJson = (key: ApiKey) => ({
   last_used_at: key.lastUsedAt ?? null,
   upstream_ids: key.upstreamIds,
   dump_retention_seconds: key.dumpRetentionSeconds,
+  responses_retention_seconds: key.responsesRetentionSeconds,
 });
 
 const normalizeCustomKey = (value: unknown): string | Response => {
@@ -128,6 +129,7 @@ export const createKey = async (c: CtxWithJson<typeof createKeyBody>) => {
     upstreamIds: body.upstream_ids ?? null,
     deletedAt: null,
     dumpRetentionSeconds: body.dump_retention_seconds ?? null,
+    responsesRetentionSeconds: body.responses_retention_seconds ?? 0,
   } satisfies Omit<ApiKey, 'key'>;
 
   const key = await writeKeyForRequest(template, body);
@@ -139,10 +141,6 @@ export const deleteKey = async (c: AuthedContext) => {
   const id = c.req.param('id')!;
   const owned = await ownedKeyOr404(c, id);
   if (owned instanceof Response) return owned;
-  // Purge dump state before the soft-delete so a purge failure leaves a
-  // retriable, still-owned key rather than a half-deleted row whose dump
-  // records are orphaned beyond the operator's reach.
-  await getDumpStore().purgeAll(id);
   // Cut any live SSE subscribers so the dashboard sees a clean disconnect.
   // Broker availability shouldn't block the soft-delete — clients reconcile
   // on the next keys refetch regardless.
@@ -165,8 +163,8 @@ export const updateKey = async (c: CtxWithJson<typeof updateKeyBody>) => {
   const id = c.req.param('id')!;
   const body = c.req.valid('json');
 
-  if (body.name === undefined && body.upstream_ids === undefined && body.dump_retention_seconds === undefined) {
-    return c.json({ error: 'Provide a new name, upstream selection, or dump retention to update.' }, 400);
+  if (body.name === undefined && body.upstream_ids === undefined && body.dump_retention_seconds === undefined && body.responses_retention_seconds === undefined) {
+    return c.json({ error: 'Provide a new name, upstream selection, dump retention, or Stateful Responses retention to update.' }, 400);
   }
 
   const owned = await ownedKeyOr404(c, id);
@@ -177,29 +175,18 @@ export const updateKey = async (c: CtxWithJson<typeof updateKeyBody>) => {
     if (err) return c.json({ error: err }, 400);
   }
 
-  const updated: ApiKey = {
-    ...owned,
+  const updated = await getRepo().apiKeys.update(id, {
     ...(body.name !== undefined ? { name: body.name } : {}),
     ...(body.upstream_ids !== undefined ? { upstreamIds: body.upstream_ids } : {}),
     ...(body.dump_retention_seconds !== undefined ? { dumpRetentionSeconds: body.dump_retention_seconds } : {}),
-  };
-  await getRepo().apiKeys.save(updated);
+    ...(body.responses_retention_seconds !== undefined ? { responsesRetentionSeconds: body.responses_retention_seconds } : {}),
+  });
+  if (updated === null) throw new Error(`API key disappeared during update: ${id}`);
 
-  // Retention transitions:
-  //   positive → null: drop every stored record and cut every live subscriber.
-  //   null → positive: no purge; the new window only governs future captures.
-  //   positive → smaller positive: enforce the shorter window immediately by
-  //     sweeping anything already past the new cutoff.
-  //   positive → larger positive: nothing to purge; older records still fit.
-  if (body.dump_retention_seconds !== undefined) {
+  if (body.dump_retention_seconds !== undefined && body.dump_retention_seconds !== owned.dumpRetentionSeconds) {
     const previous = owned.dumpRetentionSeconds;
     const next = body.dump_retention_seconds;
-    if (next === null && previous !== null) {
-      await getDumpStore().purgeAll(id);
-      await notifyDisabledBestEffort(id, 'updateKey retention disable');
-    } else if (previous !== null && next !== null && next < previous) {
-      await getDumpStore().purgeExpired(id, next);
-    }
+    if (next === null && previous !== null) await notifyDisabledBestEffort(id, 'updateKey retention disable');
   }
 
   return c.json(apiKeyToJson(updated));
