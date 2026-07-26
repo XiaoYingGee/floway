@@ -2,12 +2,18 @@
 // six per-dimension breakdown tables, and dropdown menus, all built from a
 // single raw record query.
 //
-// View semantics mirror /api/token-usage and /api/search-usage:
-// - `self-by-key` scopes every axis to the actor's keys (active +
-//   soft-deleted). `group_by=userId` is rejected because every row belongs to
-//   the actor.
-// - `all-by-user` uses every row for global and per-user axes, while API-key
-//   axes, metadata, and filters remain scoped to the actor's own keys.
+// The requested breakdown decides the scope. `group_by=keyId` is inherently a
+// question about the actor's own traffic, so it aggregates the actor's keys
+// (active + soft-deleted) alone; every other breakdown — including the `model`
+// default — aggregates all users' rows. Latency is not sensitive on its own, so
+// that cross-user read is open to every user.
+//
+// Per-user attribution is the administrator-only part — the By-User rows, the
+// username listing, the userId dropdown, `group_by=userId`, and
+// `filter_user_id`. A regular user sees the whole picture without learning who
+// produced which row. API-key axes, key metadata, and `filter_key_id` stay
+// scoped to the actor's own keys in every breakdown, so other users' key ids
+// never surface either.
 
 import { aggregatePerformanceForDisplay, type PerformanceBucketGranularity, type PerformanceGroupBy } from './aggregate.ts';
 import { userFromContext } from '../../middleware/auth.ts';
@@ -15,7 +21,7 @@ import { type CtxWithQuery } from '../../middleware/zod-validator.ts';
 import { getRepo } from '../../repo/index.ts';
 import type { PerformanceTelemetryRecord } from '../../repo/types.ts';
 import type { performanceQuery } from '../schemas.ts';
-import { buildKeyToUserMap, loadTelemetryKeys, resolveTelemetryView, type ResolvedTelemetryView } from '../telemetry-view.ts';
+import { buildKeyToUserMap } from '../telemetry-view.ts';
 
 type Ctx = CtxWithQuery<typeof performanceQuery>;
 
@@ -29,7 +35,6 @@ interface PerformanceFilters {
 }
 
 interface PerformanceQueryParams {
-  keyId: string | undefined;
   start: string;
   end: string;
   bucket: PerformanceBucketGranularity;
@@ -56,7 +61,6 @@ const readPerformanceQuery = (
   return {
     type: 'ok',
     value: {
-      keyId: blank(query.key_id),
       start: query.start,
       end: query.end,
       bucket: query.bucket ?? 'hour',
@@ -74,42 +78,6 @@ const readPerformanceQuery = (
   };
 };
 
-const resolveView = (
-  c: Ctx,
-  params: PerformanceQueryParams,
-): ResolvedTelemetryView | { error: 'forbidden' | 'bad_request'; message: string } => {
-  const resolved = resolveTelemetryView(c, c.req.valid('query').view, params.keyId);
-  if ('error' in resolved) return resolved;
-  if (resolved.view === 'self-by-key' && params.groupBy === 'userId') {
-    return { error: 'bad_request', message: 'group_by=userId is not allowed in self-by-key mode' };
-  }
-  return resolved;
-};
-
-const queryRecordsForView = async (
-  resolved: ResolvedTelemetryView,
-  params: PerformanceQueryParams,
-  ownedKeyIds: ReadonlySet<string>,
-): Promise<readonly PerformanceTelemetryRecord[] | null> => {
-  const repo = getRepo();
-  if (resolved.view === 'all-by-user') {
-    return await repo.performance.query({
-      start: params.start,
-      end: params.end,
-    });
-  }
-
-  if (params.keyId !== undefined && !ownedKeyIds.has(params.keyId)) {
-    return null;
-  }
-  const rows = await repo.performance.query({
-    keyId: params.keyId,
-    start: params.start,
-    end: params.end,
-  });
-  return params.keyId !== undefined ? rows : rows.filter(r => ownedKeyIds.has(r.keyId));
-};
-
 // Distinct values per dimension observed in the UNFILTERED record set so the
 // dashboard dropdowns show the full menu regardless of which filters are
 // currently applied.
@@ -119,8 +87,8 @@ interface DimensionValues {
   operations: string[];
   runtimeLocations: string[];
   // The frontend joins these raw ids to the users/keys metadata below.
-  // keyIds always belongs to the actor; userIds spans all users only in the
-  // global view and stays empty in self-view.
+  // keyIds always belongs to the actor; userIds is populated only when the
+  // caller may attribute rows to users, and stays empty otherwise.
   keyIds: string[];
   userIds: number[];
 }
@@ -181,30 +149,34 @@ const partitionRecords = (
 export const performanceOverview = async (c: Ctx) => {
   const params = readPerformanceQuery(c);
   if (params.type === 'error') return c.json({ error: params.error }, 400);
+  const { start, end, bucket, groupBy, timezoneOffsetMinutes, filters } = params.value;
 
-  const resolved = resolveView(c, params.value);
-  if ('error' in resolved) return c.json({ error: resolved.message }, resolved.error === 'forbidden' ? 403 : 400);
+  const actor = userFromContext(c);
+  if (!actor.isAdmin) {
+    if (groupBy === 'userId') return c.json({ error: 'group_by=userId requires administrator privileges' }, 403);
+    if (filters.userId !== undefined) return c.json({ error: 'filter_user_id requires administrator privileges' }, 403);
+  }
 
   const repo = getRepo();
-  const allKeys = await loadTelemetryKeys(repo, resolved);
-  const actorUserId = userFromContext(c).id;
-  const ownedKeys = allKeys.filter(key => key.userId === actorUserId);
+  const allKeys = await repo.apiKeys.listIncludingDeleted();
+  const ownedKeys = allKeys.filter(key => key.userId === actor.id);
   const ownedKeyIds = new Set(ownedKeys.map(key => key.id));
-  if (resolved.view === 'all-by-user' && params.value.filters.keyId !== undefined && !ownedKeyIds.has(params.value.filters.keyId)) {
+  if (filters.keyId !== undefined && !ownedKeyIds.has(filters.keyId)) {
     return c.json({ error: 'Unknown filter_key_id' }, 404);
   }
 
-  const rawRecords = await queryRecordsForView(resolved, params.value, ownedKeyIds);
-  if (rawRecords === null) return c.json({ error: 'Unknown key_id' }, 404);
+  const rawRecords = await repo.performance.query({ start, end });
+  const scopedRecords = groupBy === 'keyId'
+    ? rawRecords.filter(r => ownedKeyIds.has(r.keyId))
+    : rawRecords;
 
-  const includeUserRows = resolved.view === 'all-by-user';
-  const users = includeUserRows ? await repo.users.listIncludingDeleted() : [];
+  const users = actor.isAdmin ? await repo.users.listIncludingDeleted() : [];
   const keyToUser = buildKeyToUserMap(allKeys);
-  const { filtered, dimensionValues } = partitionRecords(rawRecords, params.value.filters, keyToUser, ownedKeyIds, includeUserRows);
+  const { filtered, dimensionValues } = partitionRecords(scopedRecords, filters, keyToUser, ownedKeyIds, actor.isAdmin);
 
-  const tzOnly = { timezoneOffsetMinutes: params.value.timezoneOffsetMinutes };
+  const tzOnly = { timezoneOffsetMinutes };
   const { series, ...axes } = aggregatePerformanceForDisplay(filtered, {
-    series: { ...tzOnly, bucket: params.value.bucket, groupBy: params.value.groupBy },
+    series: { ...tzOnly, bucket, groupBy },
     // 'none' axis carries the summary row.
     none: { ...tzOnly, bucket: 'all', groupBy: 'none' as const },
     model: { ...tzOnly, bucket: 'all', groupBy: 'model' as const },
@@ -215,8 +187,6 @@ export const performanceOverview = async (c: Ctx) => {
     userId: { ...tzOnly, bucket: 'all', groupBy: 'userId' as const },
   }, keyToUser, ownedKeyIds);
 
-  // Global views expose user metadata for By User, while key metadata remains
-  // actor-owned for By API Key and its filter.
   const userMetadata = users
     .map(u => ({ id: u.id, username: u.username }))
     .sort((a, b) => a.id - b.id);
@@ -228,7 +198,7 @@ export const performanceOverview = async (c: Ctx) => {
     series,
     axes: {
       ...axes,
-      userId: includeUserRows ? axes.userId : [],
+      userId: actor.isAdmin ? axes.userId : [],
     },
     dimensionValues,
     users: userMetadata,

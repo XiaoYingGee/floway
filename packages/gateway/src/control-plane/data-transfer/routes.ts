@@ -15,19 +15,21 @@ import { createProviderInstance } from '../../data-plane/providers/registry.ts';
 import { parseSearchConfigDefault, parseSearchConfigStrict } from '../../data-plane/tools/web-search/search-config.ts';
 import type { SearchConfig } from '../../data-plane/tools/web-search/types.ts';
 import { createPerRequestFetcher } from '../../dial/per-request.ts';
-import { getDumpStore, notifyDisabledBestEffort } from '../../dump/registry.ts';
+import { notifyDisabledBestEffort } from '../../dump/registry.ts';
 import { type CtxWithJson, type CtxWithQuery } from '../../middleware/zod-validator.ts';
 import { parseDisabledPublicModelIdsWire } from '../../repo/disabled-public-models.ts';
 import { getRepo } from '../../repo/index.ts';
 import { DIRECT_FALLBACK_IDS, isDirectFallbackId, normalizeProxyFallbackList } from '../../repo/proxy-fallback-list.ts';
+import { isResponsesRetentionSeconds, RESPONSES_RETENTION_MAX_SECONDS, RESPONSES_RETENTION_MIN_SECONDS } from '../../repo/responses-retention.ts';
 import type { ApiKey, PerformanceBucketRow, PerformanceMetric, PerformanceTelemetryRecord, SearchUsageRecord, UsageMetricRecord, UsageRecord, User } from '../../repo/types.ts';
 import { backgroundSchedulerFromContext } from '../../runtime/background.ts';
 import { getRuntimeLocation } from '../../runtime/runtime-info.ts';
 import { PASSWORD_HASH_SCHEME } from '../../shared/passwords.ts';
+import { RETENTION_MAX_SECONDS } from '../../shared/retention.ts';
 import { parseServerSecret } from '../../shared/server-secret.ts';
 import { isWebSearchProviderName } from '../../shared/web-search-providers.ts';
 import { parseUpstreamIdsValue } from '../api-keys/upstream-ids.ts';
-import { USERNAME_PATTERN, type exportQuery, type importBody, DUMP_RETENTION_MAX_SECONDS } from '../schemas.ts';
+import { USERNAME_PATTERN, type exportQuery, type importBody } from '../schemas.ts';
 import { copilotConfigField, isRecord, nonEmptyStringField } from '../shared/field-validators.ts';
 import { type SerializedUpstreamRecord, upstreamRecordToFullJson } from '../upstreams/serialize.ts';
 import { BILLING_METRICS, canonicalizePricingSelector, type BillingMetric, parseNonNegativeDecimalString, type PricingSelector } from '@floway-dev/protocols/common';
@@ -49,7 +51,7 @@ interface SerializedProxy {
 }
 
 interface ExportPayload {
-  version: 14;
+  version: 17;
   exportedAt: string;
   data: {
     users: User[];
@@ -64,7 +66,7 @@ interface ExportPayload {
   };
 }
 
-const EXPORT_VERSION = 14;
+const EXPORT_VERSION = 17;
 const SEARCH_USAGE_HOUR_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}$/;
 const PERFORMANCE_METRICS = new Set<PerformanceMetric>(['ttft_ms', 'tpot_us']);
 const UPSTREAM_PROVIDERS = new Set<UpstreamProviderKind>(ALL_PROVIDER_KINDS);
@@ -253,8 +255,19 @@ const validateProxyFallbackReferences = (
 
 const parseImportedDumpRetention = (value: unknown): number | null => {
   if (value === undefined || value === null) return null;
-  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > DUMP_RETENTION_MAX_SECONDS) {
-    throw new Error(`dumpRetentionSeconds must be null or a positive integer up to ${DUMP_RETENTION_MAX_SECONDS}`);
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > RETENTION_MAX_SECONDS) {
+    throw new Error(`dumpRetentionSeconds must be null or a positive integer up to ${RETENTION_MAX_SECONDS}`);
+  }
+  return value;
+};
+
+const parseImportedResponsesRetention = (value: unknown): number => {
+  if (
+    !isResponsesRetentionSeconds(value)
+  ) {
+    throw new Error(
+      `responsesRetentionSeconds must be 0 or a whole-day integer from ${RESPONSES_RETENTION_MIN_SECONDS} to ${RESPONSES_RETENTION_MAX_SECONDS}`,
+    );
   }
   return value;
 };
@@ -287,6 +300,7 @@ const parseApiKeyRecords = (value: unknown): { type: 'ok'; records: ApiKey[] } |
         upstreamIds: upstreamIdsParsed.value,
         deletedAt: record.deletedAt,
         dumpRetentionSeconds: parseImportedDumpRetention(record.dumpRetentionSeconds),
+        responsesRetentionSeconds: parseImportedResponsesRetention(record.responsesRetentionSeconds),
       });
     } catch (error) {
       return { type: 'invalid', index: i, error: error instanceof Error ? error.message : String(error) };
@@ -318,7 +332,6 @@ const parseUserRecords = (value: unknown): { type: 'ok'; records: User[] } | { t
         throw new Error(`passwordHash must be null or start with ${PASSWORD_HASH_SCHEME}$`);
       }
       if (typeof record.isAdmin !== 'boolean') throw new Error('isAdmin must be a boolean');
-      if (typeof record.canViewGlobalTelemetry !== 'boolean') throw new Error('canViewGlobalTelemetry must be a boolean');
 
       if (record.upstreamIds === undefined) throw new Error('upstreamIds must be present (null or array)');
       const upstreamIdsParsed = parseUpstreamIdsValue(record.upstreamIds);
@@ -333,7 +346,6 @@ const parseUserRecords = (value: unknown): { type: 'ok'; records: User[] } | { t
         passwordHash: record.passwordHash,
         isAdmin: record.isAdmin,
         upstreamIds: upstreamIdsParsed.value,
-        canViewGlobalTelemetry: record.canViewGlobalTelemetry,
         createdAt: nonEmptyString(record.createdAt, 'createdAt'),
         deletedAt: record.deletedAt,
       });
@@ -765,16 +777,12 @@ export const importData = async (c: CtxWithJson<typeof importBody>) => {
   const performance = performanceResult.records;
 
   const repo = getRepo();
-  // Snapshot pre-import key state once and reuse it for identity validation
-  // and the dump-purge transitions below. Replace mode also needs to purge
-  // each pre-existing key's dumps (otherwise the new owner of a reused id
-  // silently inherits the old owner's captures); merge mode needs the prior
-  // `dumpRetentionSeconds` per key id so a retention shrink/disable in the
-  // imported payload triggers the same purge transition `updateKey` would.
+  // Merge mode needs each key's prior dump policy to identify transitions that
+  // must disconnect live subscribers after the replacement row is stored.
   const preImportKeys = await repo.apiKeys.listIncludingDeleted();
-  const preImportRetentionById = new Map<string, number | null>(preImportKeys.map(k => [k.id, k.dumpRetentionSeconds]));
   const apiKeyIdentityError = validateApiKeyIdentities(apiKeys, mode === 'merge' ? preImportKeys : [], mode);
   if (apiKeyIdentityError) return c.json({ error: `invalid apiKeys: ${apiKeyIdentityError}` }, 400);
+  const preImportRetentionById = new Map<string, number | null>(preImportKeys.map(k => [k.id, k.dumpRetentionSeconds]));
 
   // In merge mode an imported upstream's proxy_fallback_list may reference an
   // existing local proxy alongside an imported one; replace mode wipes the
@@ -784,11 +792,9 @@ export const importData = async (c: CtxWithJson<typeof importBody>) => {
   if (fallbackRefError) return c.json({ error: `invalid upstreams: ${fallbackRefError}` }, 400);
 
   if (mode === 'replace') {
-    // Wipe each existing key's dump capture before the replace deletes wave so
-    // a reused id in the imported payload cannot inherit the previous owner's
-    // captures, and any live SSE subscriber is told the key went away.
+    // Disconnect subscribers before the API-key deletion atomically schedules
+    // existing stored state for bounded reclamation.
     for (const k of preImportKeys) {
-      await getDumpStore().purgeAll(k.id);
       await notifyDisabledBestEffort(k.id, 'replace-mode import');
     }
 
@@ -830,16 +836,11 @@ export const importData = async (c: CtxWithJson<typeof importBody>) => {
     });
   }
   for (const key of apiKeys) {
-    // Merge mode mirrors `updateKey`'s purge transition when retention is
-    // flipped off or shrunk; replace mode already purged everything above.
     const previous = preImportRetentionById.get(key.id) ?? null;
     await repo.apiKeys.save(key);
     if (mode === 'merge' && previous !== key.dumpRetentionSeconds) {
       if (key.dumpRetentionSeconds === null && previous !== null) {
-        await getDumpStore().purgeAll(key.id);
         await notifyDisabledBestEffort(key.id, 'merge-mode retention disable');
-      } else if (previous !== null && key.dumpRetentionSeconds !== null && key.dumpRetentionSeconds < previous) {
-        await getDumpStore().purgeExpired(key.id, key.dumpRetentionSeconds);
       }
     }
   }

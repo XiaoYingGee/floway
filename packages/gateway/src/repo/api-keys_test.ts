@@ -22,6 +22,7 @@ const baseKey = (overrides: Partial<ApiKey> = {}): ApiKey => ({
   upstreamIds: null,
   deletedAt: null,
   dumpRetentionSeconds: null,
+  responsesRetentionSeconds: 0,
   ...overrides,
 });
 
@@ -71,6 +72,16 @@ for (const [backend, makeRepo] of REPO_BACKENDS) {
     await repo.apiKeys.save(baseKey({ serverSecret: secret }));
     assertEquals((await repo.apiKeys.findByRawKey('raw_dump_key'))?.serverSecret, secret);
 
+  });
+
+  test(`[${backend}] targeted Responses retention updates preserve unrelated fields`, async () => {
+    const repo = await makeRepo();
+    await repo.apiKeys.save(baseKey({ lastUsedAt: '2026-07-01T00:00:00.000Z' }));
+    const updated = await repo.apiKeys.update('key_dump', { responsesRetentionSeconds: 7 * 24 * 60 * 60 });
+
+    assertEquals(updated?.responsesRetentionSeconds, 7 * 24 * 60 * 60);
+    assertEquals(updated?.lastUsedAt, '2026-07-01T00:00:00.000Z');
+    assertEquals(updated?.dumpRetentionSeconds, null);
   });
 }
 

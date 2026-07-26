@@ -1,7 +1,7 @@
 import type { ExecutionContext } from 'hono';
 import { test, vi } from 'vitest';
 
-import { hashResponsesItemContent, isResponsesItemId, isResponsesResponseId } from './items/format.ts';
+import { hashResponsesItemContent } from './items/identity.ts';
 import { responsesServe } from './serve.ts';
 import { app } from '../../../app.ts';
 import { initDumpBroker, initDumpStore } from '../../../dump/registry.ts';
@@ -251,14 +251,14 @@ test('Responses WebSocket forwards stream events, echoes event_id, and sends res
       assert(messages.every(message => message.event_id === 'evt_1'));
       const completed = messages.find(message => message.type === 'response.completed') as { response?: { id?: unknown } } | undefined;
       assertExists(completed);
-      const flowayResponseId = (completed.response as { id?: unknown } | undefined)?.id;
-      assertEquals(typeof flowayResponseId, 'string');
-      assert(isResponsesResponseId(flowayResponseId as string), 'expected Floway-minted resp_ id, not the upstream blob');
+      const responseId = (completed.response as { id?: unknown } | undefined)?.id;
+      assertEquals(typeof responseId, 'string');
+      assert(responseId !== 'resp_ws', 'expected the source boundary to replace the upstream response id');
       assertEquals(messages.at(-1), {
         type: 'response.done',
         event_id: 'evt_1',
         response: {
-          id: flowayResponseId,
+          id: responseId,
           usage: { input_tokens: 3, output_tokens: 5, total_tokens: 8 },
         },
       });
@@ -759,14 +759,16 @@ test('Responses WebSocket store:false keeps session snapshots without durable re
       const firstMessages = await firstDone;
       const firstResponseId = responseDoneId(firstMessages);
 
-      assert(isResponsesResponseId(firstResponseId), 'expected a Floway response id');
-      assertEquals(await repo.responsesSnapshots.lookup(apiKey.id, firstResponseId), null);
-      const firstOutput = firstMessages.find(message => message.type === 'response.output_item.done') as { item?: { id?: string } } | undefined;
+      assert(firstResponseId !== 'resp_ws_store_false_1', 'expected the source boundary to replace the upstream response id');
+      assertEquals(await repo.responsesSnapshots.lookup(apiKey.id, firstResponseId, 0), null);
+      const firstOutput = firstMessages.find(message =>
+        message.type === 'response.output_item.done'
+        && (message as { item?: { type?: unknown } }).item?.type === 'message') as { item?: { id?: string } } | undefined;
       assertExists(firstOutput?.item?.id);
-      assert(isResponsesItemId(firstOutput.item.id), 'expected a Floway output item id');
-      assertEquals(await repo.responsesItems.lookupMany(apiKey.id, [firstOutput.item.id]), []);
+      assert(firstOutput.item.id !== 'assistant_ws_store_false_1', 'expected Copilot to replace the raw message id');
+      assertEquals(await repo.responsesItems.lookupMany(apiKey.id, [firstOutput.item.id], 0), []);
       assertEquals(
-        await repo.responsesItems.lookupManyByContentHash(apiKey.id, [await hashResponsesItemContent({ type: 'message', role: 'user', content: 'first question' })]),
+        await repo.responsesItems.lookupManyByItemHash(apiKey.id, [await hashResponsesItemContent({ type: 'message', role: 'user', content: 'first question' })], 0),
         [],
       );
 
@@ -783,7 +785,7 @@ test('Responses WebSocket store:false keeps session snapshots without durable re
       }));
       const secondMessages = await followupDone;
       const secondResponseId = responseDoneId(secondMessages);
-      assertEquals(await repo.responsesSnapshots.lookup(apiKey.id, secondResponseId), null);
+      assertEquals(await repo.responsesSnapshots.lookup(apiKey.id, secondResponseId, 0), null);
 
       const secondBody = upstreamBodies[1] as { previous_response_id?: unknown; input: Array<{ type: string; role?: string; content?: unknown }> };
       assertEquals(secondBody.previous_response_id, undefined);
@@ -874,8 +876,8 @@ test('Responses WebSocket store:true durable snapshots can chain through local s
     }),
   );
 
-  const firstSnapshot = await repo.responsesSnapshots.lookup(apiKey.id, firstResponseId!);
-  const secondSnapshot = await repo.responsesSnapshots.lookup(apiKey.id, secondResponseId!);
+  const firstSnapshot = await repo.responsesSnapshots.lookup(apiKey.id, firstResponseId!, 0);
+  const secondSnapshot = await repo.responsesSnapshots.lookup(apiKey.id, secondResponseId!, 0);
   assertExists(firstSnapshot);
   assertExists(secondSnapshot);
   assertEquals(secondSnapshot.itemIds.length > firstSnapshot.itemIds.length, true);
@@ -957,7 +959,7 @@ test('Responses WebSocket makes a done reasoning item reusable from a fresh conn
         const messages = await firstDone;
         const done = messages.find(message => message.type === 'response.output_item.done') as { item?: typeof originalReasoning } | undefined;
         assertExists(done?.item);
-        assert(isResponsesItemId(done.item.id));
+        assert(done.item.id !== originalReasoning.id, 'expected Copilot to replace the carried reasoning id');
         assert(done.item.encrypted_content !== originalReasoning.encrypted_content);
         firstClient.close();
 
@@ -1038,10 +1040,10 @@ test('Responses WebSocket session-level store: second message resolves prior ite
       // The first turn wrote to both the durable repo and the session-local
       // cache. Wipe the repo to prove the next lookup comes from the cache
       // alone.
-      assertExists(await repo.responsesSnapshots.lookup(apiKey.id, firstResponseId));
+      assertExists(await repo.responsesSnapshots.lookup(apiKey.id, firstResponseId, 0));
       await repo.responsesSnapshots.deleteAll();
       await repo.responsesItems.deleteAll();
-      assertEquals(await repo.responsesSnapshots.lookup(apiKey.id, firstResponseId), null);
+      assertEquals(await repo.responsesSnapshots.lookup(apiKey.id, firstResponseId, 0), null);
 
       const secondDone = waitForMessages(sessionA, messages => messages.some(message => message.type === 'response.done'));
       sessionA.send(JSON.stringify({
@@ -1065,9 +1067,9 @@ test('Responses WebSocket session-level store: second message resolves prior ite
         ['message', 'user', 'turn two input'],
       ]);
 
-      const restored = await repo.responsesSnapshots.lookup(apiKey.id, firstResponseId);
+      const restored = await repo.responsesSnapshots.lookup(apiKey.id, firstResponseId, 0);
       assertExists(restored);
-      assertEquals((await repo.responsesItems.lookupMany(apiKey.id, restored.itemIds)).length, restored.itemIds.length);
+      assertEquals((await repo.responsesItems.lookupMany(apiKey.id, restored.itemIds, 0)).length, restored.itemIds.length);
       await repo.responsesSnapshots.deleteAll();
       await repo.responsesItems.deleteAll();
 

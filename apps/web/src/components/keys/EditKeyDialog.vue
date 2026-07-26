@@ -3,11 +3,11 @@ import { computed, ref, watch } from 'vue';
 import { RouterLink } from 'vue-router';
 
 import { type KeySource, KEY_SOURCE_OPTIONS } from './keySource.ts';
+import RetentionField, { type RetentionFieldValue } from './RetentionField.vue';
 import { callApi, useApi } from '../../api/client.ts';
 import type { ApiKey } from '../../api/types.ts';
 import type { UpstreamOption } from '../../composables/useUpstreamOptions.ts';
 import { useAuthStore } from '../../stores/auth.ts';
-import { parseDuration } from '../../utils/parseDuration.ts';
 import UpstreamPicker, { type UpstreamPickerValue } from '../upstreams/UpstreamPicker.vue';
 import { Button, Dialog, Input, Select } from '@floway-dev/ui';
 
@@ -28,41 +28,24 @@ const visibleUpstreams = computed<UpstreamOption[]>(() => {
   return props.upstreams.filter(u => allowed.has(u.id));
 });
 
-type RetentionPreset = 'off' | '1h' | '6h' | '24h' | '7d' | 'custom';
+const dumpRetentionPresets = [
+  { seconds: 3600, label: '1 hour' },
+  { seconds: 6 * 3600, label: '6 hours' },
+  { seconds: 24 * 3600, label: '24 hours' },
+  { seconds: 7 * 86400, label: '7 days' },
+] as const;
 
-const retentionPresetSeconds: Record<Exclude<RetentionPreset, 'off' | 'custom'>, number> = {
-  '1h': 3600,
-  '6h': 6 * 3600,
-  '24h': 24 * 3600,
-  '7d': 7 * 86400,
-};
+const responsesRetentionPresets = [
+  { seconds: 7 * 86400, label: '7 days' },
+  { seconds: 30 * 86400, label: '30 days' },
+] as const;
 
-const retentionOptions: { value: RetentionPreset; label: string }[] = [
-  { value: 'off', label: 'Off (do not capture)' },
-  { value: '1h', label: '1 hour' },
-  { value: '6h', label: '6 hours' },
-  { value: '24h', label: '24 hours' },
-  { value: '7d', label: '7 days' },
-  { value: 'custom', label: 'Custom…' },
-];
-
-const retentionPresetFromValue = (sec: number | null): { preset: RetentionPreset; custom: string } => {
-  if (sec === null) return { preset: 'off', custom: '' };
-  for (const [preset, value] of Object.entries(retentionPresetSeconds)) {
-    if (value === sec) return { preset: preset as RetentionPreset, custom: '' };
-  }
-  if (sec % 86400 === 0) return { preset: 'custom', custom: `${sec / 86400}d` };
-  if (sec % 3600 === 0) return { preset: 'custom', custom: `${sec / 3600}h` };
-  if (sec % 60 === 0) return { preset: 'custom', custom: `${sec / 60}m` };
-  // Emit an explicit 's' suffix so raw seconds don't collide with the
-  // mixed-unit placeholder shown in the custom retention Input.
-  return { preset: 'custom', custom: `${sec}s` };
-};
+const responsesRetentionMaximumSeconds = 10 * 365 * 86400;
 
 const name = ref('');
 const upstreamSelection = ref<UpstreamPickerValue>({ override: false, ids: [] });
-const retentionPreset = ref<RetentionPreset>('off');
-const retentionCustom = ref('');
+const dumpRetention = ref<RetentionFieldValue>(null);
+const responsesRetention = ref<RetentionFieldValue>(0);
 const keySource = ref<KeySource>('generate');
 const customKey = ref('');
 const saving = ref(false);
@@ -72,8 +55,8 @@ const reset = () => {
   if (props.mode === 'create') {
     name.value = '';
     upstreamSelection.value = { override: false, ids: [] };
-    retentionPreset.value = 'off';
-    retentionCustom.value = '';
+    dumpRetention.value = null;
+    responsesRetention.value = 0;
     keySource.value = 'generate';
     customKey.value = '';
   } else {
@@ -82,25 +65,16 @@ const reset = () => {
       override: props.apiKey.upstream_ids !== null,
       ids: props.apiKey.upstream_ids ?? [],
     };
-    const { preset, custom } = retentionPresetFromValue(props.apiKey.dump_retention_seconds);
-    retentionPreset.value = preset;
-    retentionCustom.value = custom;
+    dumpRetention.value = props.apiKey.dump_retention_seconds;
+    responsesRetention.value = props.apiKey.responses_retention_seconds;
   }
   error.value = null;
 };
 
 watch(open, v => { if (v) reset(); }, { immediate: true });
 
-const proposedRetentionSeconds = computed<number | null | 'invalid'>(() => {
-  if (retentionPreset.value === 'off') return null;
-  if (retentionPreset.value === 'custom') {
-    return parseDuration(retentionCustom.value) ?? 'invalid';
-  }
-  return retentionPresetSeconds[retentionPreset.value];
-});
-
 const retentionEnabled = computed(() => {
-  const proposed = proposedRetentionSeconds.value;
+  const proposed = dumpRetention.value;
   return proposed !== null && proposed !== 'invalid';
 });
 
@@ -108,11 +82,19 @@ const retentionWarning = computed<string | null>(() => {
   if (props.mode === 'create') return null;
   const previous = props.apiKey.dump_retention_seconds;
   if (previous === null) return null;
-  const next = proposedRetentionSeconds.value;
+  const next = dumpRetention.value;
   if (next === 'invalid') return null;
-  if (next === null) return 'Saving will immediately delete dumps for this key.';
-  if (next < previous) return 'Saving will immediately delete dumps older than the new window.';
+  if (next === null) return 'Saving will make existing dumps unavailable and queue them for deletion.';
+  if (next < previous) return 'Saving will hide dumps older than the new window and queue them for deletion.';
   return null;
+});
+
+const responsesRetentionWarning = computed<string | null>(() => {
+  if (props.mode === 'create') return null;
+  const next = responsesRetention.value;
+  if (typeof next !== 'number' || next >= props.apiKey.responses_retention_seconds) return null;
+  if (next === 0) return 'Saving will hide all durable Stateful Responses chains and queue them for deletion. Re-enabling before cleanup may expose state inside the new window again.';
+  return 'Saving will make state older than the new window unavailable; chains that depend on it will stop resolving.';
 });
 
 const save = async () => {
@@ -125,9 +107,10 @@ const save = async () => {
     error.value = 'Select at least one upstream, or turn off the override to use every upstream available to you.';
     return;
   }
-  const proposedRetention = proposedRetentionSeconds.value;
-  if (proposedRetention === 'invalid') {
-    error.value = 'Retention must be an integer number of seconds, or a value like 30m / 2h / 3d.';
+  const nextDumpRetention = dumpRetention.value;
+  const nextResponsesRetention = responsesRetention.value;
+  if (nextDumpRetention === 'invalid' || typeof nextResponsesRetention !== 'number') {
+    error.value = 'Fix the invalid retention value before saving.';
     return;
   }
   const custom = customKey.value.trim();
@@ -141,7 +124,8 @@ const save = async () => {
   const commonBody = {
     name: trimmed,
     upstream_ids: upstreamSelection.value.override ? upstreamSelection.value.ids : null,
-    dump_retention_seconds: proposedRetention,
+    dump_retention_seconds: nextDumpRetention,
+    responses_retention_seconds: nextResponsesRetention,
   };
   const { data, error: err } = props.mode === 'create'
     ? await callApi<ApiKey>(() => api.api.keys.$post({
@@ -194,19 +178,15 @@ const save = async () => {
         />
       </div>
 
-      <div class="space-y-2">
-        <label class="block text-xs font-medium text-gray-500">Request dump retention</label>
-        <p class="text-xs text-gray-600">
-          When enabled, every model-invoking request through this key is recorded for the
-          configured window. Off means no capture.
-        </p>
-        <Select v-model="retentionPreset" :options="retentionOptions" />
-        <Input
-          v-if="retentionPreset === 'custom'"
-          v-model="retentionCustom"
-          placeholder="e.g. 30m, 2h, 3d, 1800"
-        />
-        <p v-if="retentionWarning" class="rounded-md border border-accent-amber/40 bg-accent-amber/10 px-3 py-2 text-xs text-accent-amber">
+      <RetentionField
+        v-model="dumpRetention"
+        label="Request dump retention"
+        description="When enabled, every model-invoking request through this key is recorded for the configured window. Off means no capture."
+        :off-value="null"
+        off-label="Off (do not capture)"
+        :presets="dumpRetentionPresets"
+      >
+        <p v-if="retentionWarning" role="status" aria-live="polite" class="rounded-md border border-accent-amber/40 bg-accent-amber/10 px-3 py-2 text-xs text-accent-amber">
           {{ retentionWarning }}
         </p>
         <p v-if="props.mode === 'edit' && retentionEnabled" class="text-xs text-gray-500">
@@ -214,7 +194,30 @@ const save = async () => {
             View captured requests →
           </RouterLink>
         </p>
-      </div>
+      </RetentionField>
+
+      <RetentionField
+        v-model="responsesRetention"
+        label="Stateful Responses retention"
+        :off-value="0"
+        off-label="Off (do not persist)"
+        :presets="responsesRetentionPresets"
+        :minimum-seconds="86400"
+        :maximum-seconds="responsesRetentionMaximumSeconds"
+        custom-input-unit="days"
+      >
+        <template #description>
+          <p>
+            When enabled, items and responses produced by <code class="rounded bg-surface-700 px-1 py-0.5 font-mono text-[11px] text-gray-300">store: true</code> Responses API requests are persisted for the configured number of days, so they can be referenced by <code class="rounded bg-surface-700 px-1 py-0.5 font-mono text-[11px] text-gray-300">item_reference</code> and <code class="rounded bg-surface-700 px-1 py-0.5 font-mono text-[11px] text-gray-300">previous_response_id</code> during that period.
+          </p>
+          <p class="mt-2">
+            Codex's WebSocket non-persistent session store works independently.
+          </p>
+        </template>
+        <p v-if="responsesRetentionWarning" role="status" aria-live="polite" class="rounded-md border border-accent-amber/40 bg-accent-amber/10 px-3 py-2 text-xs text-accent-amber">
+          {{ responsesRetentionWarning }}
+        </p>
+      </RetentionField>
 
       <p v-if="error" class="rounded-md border border-accent-rose/40 bg-accent-rose/10 px-3 py-2 text-xs text-accent-rose">{{ error }}</p>
 

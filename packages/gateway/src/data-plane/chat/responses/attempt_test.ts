@@ -2,10 +2,10 @@ import { test, vi } from 'vitest';
 
 import { prepareResponsesAffinity } from './affinity/ingress.ts';
 import { responsesAttempt } from './attempt.ts';
-import { createResponsesItemId } from './items/format.ts';
+import { hydrateResponsesPayload } from './items/hydrate.ts';
 import * as outputModule from './items/output.ts';
-import { hydrateResponsesPayload, rewriteResponsesItemsForCandidate } from './items/rewrite.ts';
 import { createResponsesHttpStore } from './items/store.ts';
+import { TEST_RESPONSES_RETENTION_SECONDS, testResponsesStatePolicy } from './test-policy.ts';
 import { initRepo } from '../../../repo/index.ts';
 import { InMemoryRepo } from '../../../repo/memory.ts';
 import type { StoredResponsesItem } from '../../../repo/types.ts';
@@ -85,20 +85,25 @@ const collectEvents = async (events: AsyncIterable<ProtocolFrame<ResponsesStream
 const installRepo = () => {
   const repo = new InMemoryRepo();
   initRepo(repo);
+  void repo.apiKeys.save({
+    id: API_KEY_ID, userId: 1, name: 'Responses test key', key: 'raw-responses-test',
+    serverSecret: '99'.repeat(32), createdAt: '2026-01-01T00:00:00.000Z',
+    upstreamIds: null, deletedAt: null, dumpRetentionSeconds: null,
+    responsesRetentionSeconds: TEST_RESPONSES_RETENTION_SECONDS,
+  });
   return repo;
 };
 
-const insertStoredItem = async (repo: InMemoryRepo, overrides: Partial<StoredResponsesItem> & Pick<StoredResponsesItem, 'id' | 'itemType'>): Promise<StoredResponsesItem> => {
+const insertStoredItem = async (repo: InMemoryRepo, overrides: Partial<StoredResponsesItem> & Pick<StoredResponsesItem, 'id'> & { type: string }): Promise<StoredResponsesItem> => {
+  const { type, ...itemOverrides } = overrides;
   const row: StoredResponsesItem = {
     apiKeyId: API_KEY_ID,
-    upstreamId: null,
-    upstreamItemId: null,
-    contentHash: `hash-${overrides.id}`,
-    payload: { item: { type: overrides.itemType, id: overrides.id } },
-    createdAt: 1_000,
-    ...overrides,
+    itemHash: `hash-${overrides.id}`,
+    payload: { item: { type, id: overrides.id } },
+    refreshedAt: Date.now(),
+    ...itemOverrides,
   };
-  await repo.responsesItems.insertMany([row]);
+  await repo.responsesItems.insertMany([row], 0);
   return row;
 };
 
@@ -118,7 +123,7 @@ test('generate native success leaves source-edge state ownership to the caller',
   }));
 
   const candidate = makeCandidate(callResponses);
-  const store = createResponsesHttpStore(API_KEY_ID, true);
+  const store = createResponsesHttpStore(testResponsesStatePolicy(API_KEY_ID), Date.now(), true);
   const ctx = makeGatewayCtx(store);
 
   const result = await responsesAttempt.generate({
@@ -158,7 +163,7 @@ test('generate treats a translated Responses payload as opaque to native affinit
     };
   });
   const candidate = makeCandidate(callResponses);
-  const store = createResponsesHttpStore(API_KEY_ID, true);
+  const store = createResponsesHttpStore(testResponsesStatePolicy(API_KEY_ID), Date.now(), true);
   const ctx = makeGatewayCtx(store);
   const carrier = await ctx.affinity.codec.wrap(
     undefined,
@@ -170,7 +175,7 @@ test('generate treats a translated Responses payload as opaque to native affinit
   );
   const unwrap = vi.spyOn(ctx.affinity.codec, 'unwrap');
   const getStoredItem = vi.spyOn(store, 'getItemById');
-  const itemId = createResponsesItemId('reasoning');
+  const itemId = 'rs_source_edge';
 
   const result = await responsesAttempt.generate({
     payload: makePayload({
@@ -223,7 +228,7 @@ test('generate applies role compatibility flags in target-chain order', async ()
         { type: 'message', role: 'system', content: 'inline instructions' },
       ],
     }),
-    ctx: makeGatewayCtx(createResponsesHttpStore(API_KEY_ID, false)),
+    ctx: makeGatewayCtx(createResponsesHttpStore(testResponsesStatePolicy(API_KEY_ID), Date.now(), false)),
     candidate,
     headers: new Headers(),
   });
@@ -307,7 +312,7 @@ test('generate defers role promotion until after translation to Chat Completions
         { type: 'message', role: 'system', content: 'inline instructions' },
       ],
     }),
-    ctx: makeGatewayCtx(createResponsesHttpStore(API_KEY_ID, false)),
+    ctx: makeGatewayCtx(createResponsesHttpStore(testResponsesStatePolicy(API_KEY_ID), Date.now(), false)),
     candidate,
     headers: new Headers(),
   });
@@ -336,7 +341,7 @@ test('generate passes non-events provider result through unchanged', async () =>
   const candidate = makeCandidate(callResponses);
   const result = await responsesAttempt.generate({
     payload: makePayload(),
-    ctx: makeGatewayCtx(createResponsesHttpStore(API_KEY_ID, true)),
+    ctx: makeGatewayCtx(createResponsesHttpStore(testResponsesStatePolicy(API_KEY_ID), Date.now(), true)),
     candidate,
     headers: new Headers(),
   });
@@ -377,7 +382,7 @@ test('compact returns the clean upstream result for source-edge affinity and sto
   });
 
   const candidate = makeCandidate(callResponses);
-  const store = createResponsesHttpStore(API_KEY_ID, true);
+  const store = createResponsesHttpStore(testResponsesStatePolicy(API_KEY_ID), Date.now(), true);
   const result = await responsesAttempt.invoke({
     payload: makePayload({
       input: [
@@ -450,7 +455,7 @@ test('generate inherits headers and injects external image loading across transl
         content: [{ type: 'input_image', image_url: 'https://example.com/image.png', detail: 'auto' }],
       }],
     }),
-    ctx: makeGatewayCtx(createResponsesHttpStore(API_KEY_ID, true)),
+    ctx: makeGatewayCtx(createResponsesHttpStore(testResponsesStatePolicy(API_KEY_ID), Date.now(), true)),
     candidate,
     headers: new Headers({ 'x-test': 'abc' }),
   });
@@ -467,25 +472,23 @@ test('generate inherits headers and injects external image loading across transl
 
 test('generate seeds privatePayload before interceptors so the web-search shim replays the prior wsc results on echo', async () => {
   // End-to-end contract: when a stateless client (e.g. Codex CLI) echoes a
-  // prior web_search_call by the gateway-minted id, the web-search shim's
+  // prior gateway-created web_search_call by its emitted id, the web-search shim's
   // `transformItems` (which runs as part of the interceptor chain) must
   // find the persisted `payload.private` and emit the cached function_call
   // + function_call_output pair to upstream — NOT the not-preserved
   // placeholder.
   //
   // The wire shape we model here:
-  //   - row.id = stored gateway id (`ws_<crc>_<body>`) — wrapResponsesClientOutput
-  //     emits this on the wire and clients echo it back as `wsc.id`.
-  //   - payload.item.id = the stored client-visible id; this gateway-generated
-  //     item has no native upstream id to restore.
+  //   - row.id = the public item id echoed as `wsc.id`.
+  //   - payload.item.id = that same public id.
   //   - payload.private = WebSearchCallPrivatePayload (v:1, functionCallItem, ir).
   //
-  // This regression caught a prior ordering bug where rewrite + beginAttempt
+  // This regression caught a prior ordering bug where hydration + beginAttempt
   // ran inside the interceptor closure, after the shim's input transform —
   // so privatePayload was always empty when the shim looked it up, and
   // every echoed wsc collapsed to the placeholder.
   const repo = installRepo();
-  const storedId = createResponsesItemId('web_search_call');
+  const storedId = `ws_${'a'.repeat(32)}`;
   const storedItem = {
     type: 'web_search_call' as const,
     id: storedId,
@@ -494,7 +497,7 @@ test('generate seeds privatePayload before interceptors so the web-search shim r
   };
   await insertStoredItem(repo, {
     id: storedId,
-    itemType: 'web_search_call',
+    type: 'web_search_call',
     payload: {
       item: storedItem,
       private: {
@@ -532,7 +535,7 @@ test('generate seeds privatePayload before interceptors so the web-search shim r
   });
   const candidate = makeCandidate(callResponses, new Set(['responses-web-search-shim']));
 
-  const store = createResponsesHttpStore(API_KEY_ID, true);
+  const store = createResponsesHttpStore(testResponsesStatePolicy(API_KEY_ID), Date.now(), true);
   await store.loadInputItems([{ type: 'web_search_call', id: storedId }], []);
   const ctx = makeGatewayCtx(store);
   const carrier = await ctx.affinity.codec.wrap(
@@ -560,16 +563,10 @@ test('generate seeds privatePayload before interceptors so the web-search shim r
   await store.loadInputItems(sourcePayload.input, sourcePayload.input);
   const hydrated = hydrateResponsesPayload(sourcePayload, store);
   const affinity = await prepareResponsesAffinity(hydrated.payload, ctx.affinity.codec);
-  const rewritten = rewriteResponsesItemsForCandidate(
-    affinity.payloadForCandidate(candidate),
-    hydrated.privatePayloads,
-    store,
-    candidate,
-  );
   const result = await responsesAttempt.generate({
-    payload: rewritten.payload,
+    payload: affinity.payloadForCandidate(candidate),
     sourceState: {
-      privatePayloads: rewritten.privatePayloads,
+      privatePayloads: hydrated.privatePayloads,
     },
     ctx,
     candidate,
@@ -615,7 +612,7 @@ test('generate propagates upstream response headers onto the EventResult so resp
     headers: upstreamHeaders,
   }));
   const candidate = makeCandidate(callResponses);
-  const store = createResponsesHttpStore(API_KEY_ID, true);
+  const store = createResponsesHttpStore(testResponsesStatePolicy(API_KEY_ID), Date.now(), true);
   const result = await responsesAttempt.generate({
     payload: makePayload(),
     ctx: makeGatewayCtx(store),

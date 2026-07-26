@@ -48,6 +48,7 @@ const buildApiKey = (overrides: Partial<ApiKey> = {}): ApiKey => ({
   upstreamIds: null,
   deletedAt: null,
   dumpRetentionSeconds: null,
+  responsesRetentionSeconds: 0,
   ...overrides,
 });
 
@@ -57,7 +58,6 @@ const buildUser = (overrides: Partial<User> = {}): User => ({
   passwordHash: null,
   isAdmin: false,
   upstreamIds: null,
-  canViewGlobalTelemetry: false,
   createdAt: '2026-01-01T00:00:00.000Z',
   deletedAt: null,
   ...overrides,

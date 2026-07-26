@@ -14,6 +14,7 @@ const seedSearchUsage = async (repo: import('../../repo/memory.ts').InMemoryRepo
     upstreamIds: null,
     deletedAt: null,
     dumpRetentionSeconds: null,
+    responsesRetentionSeconds: 0,
   });
 
   await repo.searchUsage.set({ provider: 'tavily', keyId: primaryKeyId, action: 'search', hour: '2026-03-15T10', requests: 2 });
@@ -25,7 +26,7 @@ test('/api/search-usage scopes to the actor\'s keys when called with an API key'
   const { repo, apiKey } = await setupAppTest();
   await seedSearchUsage(repo, apiKey.id);
 
-  const response = await requestApp('/api/search-usage?start=2026-03-15T00&end=2026-03-16T00', {
+  const response = await requestApp('/api/search-usage?start=2026-03-15T00&end=2026-03-16T00&view=self-by-key', {
     headers: { 'x-api-key': apiKey.key },
   });
 
@@ -53,7 +54,7 @@ test('/api/search-usage in self-by-key mode includes per-key metadata for the ac
     passthroughOpenAiSearch: { enabled: false, upstreamId: '', model: '' },
   });
 
-  const response = await requestApp('/api/search-usage?start=2026-03-15T00&end=2026-03-16T00&include_key_metadata=1', {
+  const response = await requestApp('/api/search-usage?start=2026-03-15T00&end=2026-03-16T00&include_key_metadata=1&view=self-by-key', {
     headers: { 'x-api-key': apiKey.key },
   });
 
@@ -110,7 +111,7 @@ test('/api/search-usage all-by-user view with include_user_metadata=1 includes u
   assertEquals(body.users.find((u: { id: number }) => u.id === 2).username, 'tester');
 });
 
-test('/api/search-usage rejects all-by-user from a user without canViewGlobalTelemetry', async () => {
+test('/api/search-usage rejects all-by-user from a non-admin user', async () => {
   const { apiKey } = await setupAppTest();
   const response = await requestApp('/api/search-usage?start=2026-03-15T00&end=2026-03-16T00&view=all-by-user', {
     headers: { 'x-api-key': apiKey.key },
@@ -122,7 +123,7 @@ test('/api/search-usage filters by provider and rejects invalid provider', async
   const { repo, apiKey } = await setupAppTest();
   await seedSearchUsage(repo, apiKey.id);
 
-  const filtered = await requestApp('/api/search-usage?start=2026-03-15T00&end=2026-03-16T00&provider=tavily', {
+  const filtered = await requestApp('/api/search-usage?start=2026-03-15T00&end=2026-03-16T00&provider=tavily&view=self-by-key', {
     headers: { 'x-api-key': apiKey.key },
   });
   assertEquals(filtered.status, 200);
@@ -130,7 +131,7 @@ test('/api/search-usage filters by provider and rejects invalid provider', async
     { provider: 'tavily', keyId: apiKey.id, hour: '2026-03-15T10', requests: 5 },
   ]);
 
-  const invalid = await requestApp('/api/search-usage?start=2026-03-15T00&end=2026-03-16T00&provider=disabled', {
+  const invalid = await requestApp('/api/search-usage?start=2026-03-15T00&end=2026-03-16T00&provider=disabled&view=self-by-key', {
     headers: { 'x-api-key': apiKey.key },
   });
   assertEquals(invalid.status, 400);
@@ -139,11 +140,11 @@ test('/api/search-usage filters by provider and rejects invalid provider', async
 test('/api/search-usage requires start and end', async () => {
   const { apiKey } = await setupAppTest();
 
-  const missingStart = await requestApp('/api/search-usage?end=2026-03-16T00', { headers: { 'x-api-key': apiKey.key } });
+  const missingStart = await requestApp('/api/search-usage?end=2026-03-16T00&view=self-by-key', { headers: { 'x-api-key': apiKey.key } });
   assertEquals(missingStart.status, 400);
   assertEquals(await missingStart.json(), { error: 'start and end query parameters are required (e.g. 2026-03-09T00)' });
 
-  const missingEnd = await requestApp('/api/search-usage?start=2026-03-15T00', { headers: { 'x-api-key': apiKey.key } });
+  const missingEnd = await requestApp('/api/search-usage?start=2026-03-15T00&view=self-by-key', { headers: { 'x-api-key': apiKey.key } });
   assertEquals(missingEnd.status, 400);
   assertEquals(await missingEnd.json(), { error: 'start and end query parameters are required (e.g. 2026-03-09T00)' });
 });

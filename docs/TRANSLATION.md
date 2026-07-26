@@ -163,11 +163,11 @@ steps.
 ### Responses — gateway flow and interceptors
 
 - resolves `previous_response_id` and every `item_reference` through the
-  gateway's Responses store before candidate dispatch. Affinity is classified
-  from each referenced item's stored type, then the candidate rewrite replaces
-  every reference with its durable payload. Same-upstream items recover their
-  upstream wire id; portable items receive a temporary id when needed. A
-  missing durable payload returns `item_not_found`, and no provider receives an
+  Responses store before candidate dispatch. Every reference is replaced with
+  the first durable client-facing item under its emitted ID before
+  affinity projects blobs for a candidate. Item IDs are opaque and never
+  reformatted or rewritten. A missing durable payload returns `item_not_found`,
+  and no provider receives an
   `item_reference` carrier.
 
 - executes hosted `web_search` and `image_generation` through the server-tool
@@ -223,15 +223,14 @@ The same boundary runs for both `/v1/responses` (streaming) and
 - restores a raw Copilot item ID only when the post-affinity request blob
   carries the provider's own plaintext `{version, origin, id}` trailer;
   foreign blobs and items without blobs pass through unchanged
-- allocates a stable type-correct random provider-facing ID as soon as each
+- allocates a stable type-correct random client-facing ID as soon as each
   streaming output item is added, rewrites its ID-bearing child and later
-  frames to that ID, and appends each frame's matching raw ID behind every available
-  reasoning, compaction, program, or agent-message blob. A source state store
-  with a write backing aliases this provider-facing ID; otherwise it passes
-  through. Verified shell-command child frames carry only `output_index` and
-  pass through unchanged. The compact value path applies the same rule to its
-  generated compaction item. Unknown Copilot output types fail closed before a
-  raw ID can reach the client
+  frames to that ID, and appends each frame's matching raw ID behind every
+  available reasoning, compaction, program, or agent-message blob. Verified
+  shell-command child frames carry only `output_index` and pass through
+  unchanged. The compact value path applies the same rule to its generated
+  compaction item. Unknown Copilot output types fail closed before a raw ID can
+  reach the client
 
 ### Responses — Codex provider boundary chain
 
@@ -792,7 +791,8 @@ The mapping from `AliasRules` fields onto target-protocol slots:
 | `serviceTier` | `service_tier` | `speed: 'fast'` for `'fast'`, else `service_tier` | `service_tier` |
 
 Passthrough endpoints (`/v1/embeddings`, `/v1/images/*`,
-`/v1/completions`) and rerank have no rule-application step; a non-chat alias
+`/v1/audio/transcriptions`, `/v1/completions`) and rerank have no
+rule-application step; a non-chat alias
 must be seeded with empty rules (enforced at write time by a zod
 refinement on the alias schema).
 
