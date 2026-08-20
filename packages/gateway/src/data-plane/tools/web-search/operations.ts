@@ -1,15 +1,15 @@
-// Shared parser, local-provider executor, and Responses web-search IR.
-// Responses always uses the parser and IR; its local mode also executes and
+// Shared parser, local-provider executor, and OpenAI Responses web-search IR.
+// OpenAI Responses always uses the parser and IR; its local mode also executes and
 // renders operations here, while alpha passthrough delegates the commands and
 // retains the upstream model-facing output. The Codex compatibility route uses
 // this engine only in its default local-provider mode.
 
 import { normalizeDomainList } from './domain-normalize.ts';
 import { fetchPageAndRecordUsage } from './fetch-page.ts';
-import { searchWebAndRecordUsage } from './search.ts';
+import { runWebSearchAndRecordUsage } from './search.ts';
 import type { ConfiguredWebSearchProvider, WebSearchProvider, WebSearchProviderName } from './types.ts';
-import { truncatePreservingCodePoints } from '../../chat/shared/text.ts';
-import type { ResponsesWebSearchAction, ResponsesWebSearchResult } from '@floway-dev/protocols/responses';
+import { truncatePreservingCodePoints } from '../../shared/text.ts';
+import type { OpenAIResponsesWebSearchAction, OpenAIResponsesWebSearchResult } from '@floway-dev/protocols/openai-responses';
 import { isAbortError } from '@floway-dev/provider';
 
 // Search-context-size → result-count mapping. Approximates the ~40 results
@@ -123,6 +123,53 @@ const missingArgError = (field: string): string =>
 
 const SUPPORTED_KEYS: ReadonlySet<string> = new Set(['search_query', 'open', 'find']);
 
+const LOCAL_SUPPORTED_COMMAND_FIELDS: Readonly<Record<'search_query' | 'open' | 'find', ReadonlySet<string>>> = {
+  search_query: new Set(['q']),
+  open: new Set(['ref_id']),
+  find: new Set(['ref_id', 'pattern']),
+};
+
+export const UNSUPPORTED_LOCAL_WEB_SEARCH_FEATURE_ERROR_NAME = 'UnsupportedLocalWebSearchFeatureError';
+
+export class UnsupportedLocalWebSearchFeatureError extends Error {
+  constructor(path: string) {
+    super(`The configured web search provider does not implement OpenAI search feature \`${path}\`.`);
+    this.name = UNSUPPORTED_LOCAL_WEB_SEARCH_FEATURE_ERROR_NAME;
+  }
+}
+
+const assertObjectHasOnly = (
+  value: unknown,
+  allowed: ReadonlySet<string>,
+  path: string,
+): void => {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return;
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) throw new UnsupportedLocalWebSearchFeatureError(`${path}.${key}`);
+  }
+};
+
+// The local Tavily, Jina, and Microsoft Web IQ adapters implement the
+// common text-search/open/find subset. OpenAI's complete command object remains
+// valid for alpha-search passthrough; reaching a local adapter with any other
+// command or nested command parameter is an explicit error so no request field
+// disappears.
+//
+// OpenAI Codex source of truth for SearchCommands:
+// https://github.com/openai/codex/blob/2f19a57704fb7b1db032bc38cf995034254eaebb/codex-rs/codex-api/src/search.rs#L31-L213
+export const assertLocalWebSearchSupport = (
+  commands: Record<string, unknown>,
+): void => {
+  for (const [key, value] of Object.entries(commands)) {
+    if (!SUPPORTED_KEYS.has(key)) throw new UnsupportedLocalWebSearchFeatureError(`commands.${key}`);
+    if (!Array.isArray(value)) continue;
+    const allowed = LOCAL_SUPPORTED_COMMAND_FIELDS[key as keyof typeof LOCAL_SUPPORTED_COMMAND_FIELDS];
+    for (let index = 0; index < value.length; index++) {
+      assertObjectHasOnly(value[index], allowed, `commands.${key}[${index}]`);
+    }
+  }
+};
+
 const stringField = (entry: unknown, key: string): string => {
   if (entry === null || typeof entry !== 'object') return '';
   const value = (entry as Record<string, unknown>)[key];
@@ -227,13 +274,13 @@ interface PageCacheEntry {
 export interface WebSearchExecutionSession {
   // Memoized lazy resolver. The first backend dispatch pays the
   // load+resolve cost; later dispatches reuse the cached result. Replay-only
-  // paths (Responses shim echoing prior items with no live op) never call
+  // paths (OpenAI Responses shim echoing prior items with no live op) never call
   // this, so an unconfigured search provider does not 500 the request.
   getProvider: () => Promise<ConfiguredWebSearchProvider>;
   filters: WebSearchFilters;
   apiKeyId: string;
   pageCache: Map<string, PageCacheEntry>;
-  // Whether to populate `action.sources` on search IRs. Native Responses
+  // Whether to populate `action.sources` on search IRs. Native OpenAI Responses
   // gates the field on `include: ["web_search_call.action.sources"]`; the
   // Codex path leaves it off (its output is plain text).
   includeSearchActionSources: boolean;
@@ -249,14 +296,14 @@ export interface WebSearchExecutionSession {
 // the result list the renderer formats. Thin DTO — any wire id and status
 // live on the caller's slot, not in here.
 export interface WebSearchCallIR {
-  action: ResponsesWebSearchAction;
-  results: ResponsesWebSearchResult[];
+  action: OpenAIResponsesWebSearchAction;
+  results: OpenAIResponsesWebSearchResult[];
   outputText?: string;
 }
 
 const searchIr = (
   query: string,
-  results: ResponsesWebSearchResult[],
+  results: OpenAIResponsesWebSearchResult[],
   sources?: { type: 'url'; url: string }[],
 ): WebSearchCallIR => searchIrFromQueries([query], results, sources);
 
@@ -266,7 +313,7 @@ const searchIr = (
 // single-string shape — see `actionSearchQueries`.
 const searchIrFromQueries = (
   queries: string[],
-  results: ResponsesWebSearchResult[],
+  results: OpenAIResponsesWebSearchResult[],
   sources?: { type: 'url'; url: string }[],
 ): WebSearchCallIR => ({
   action: {
@@ -280,7 +327,7 @@ const searchIrFromQueries = (
 
 const openPageIr = (
   url: string | undefined,
-  results: ResponsesWebSearchResult[],
+  results: OpenAIResponsesWebSearchResult[],
 ): WebSearchCallIR => ({
   // Omit `url` when undefined to match native's soft-failure shape;
   // never emit `url: ''`.
@@ -293,7 +340,7 @@ const openPageIr = (
 const findInPageIr = (
   url: string,
   pattern: string,
-  results: ResponsesWebSearchResult[],
+  results: OpenAIResponsesWebSearchResult[],
 ): WebSearchCallIR => ({
   action: { type: 'find_in_page', url, pattern },
   results,
@@ -309,6 +356,15 @@ export const schemaErrorIr = (
 ): WebSearchCallIR => ({
   action: { type: 'search', query: queryLabel, queries: [queryLabel] },
   results: [{ type: 'text_result', url: '', title, snippet }],
+});
+
+export const unsupportedLocalWebSearchFeatureIr = (
+  action: OpenAIResponsesWebSearchAction,
+  message: string,
+): WebSearchCallIR => ({
+  action,
+  results: [{ type: 'text_result', url: '', title: 'Unsupported search feature', snippet: message }],
+  outputText: message,
 });
 
 // ── Error / not-supported text ──
@@ -329,13 +385,13 @@ const searchFailedText = (providerMessage: string): string =>
 const openFailedText = (url: string, providerMessage: string): string =>
   `Error fetching URL \`${url}\`: ${providerMessage}`;
 
-const unsupportedOperationText = (subProperty: string): string =>
-  `Error: the \`${subProperty}\` sub-property is not supported by this gateway. Only \`search_query\`, \`open\`, and \`find\` are available.`;
+const unsupportedOperationError = (subProperty: string): UnsupportedLocalWebSearchFeatureError =>
+  new UnsupportedLocalWebSearchFeatureError(`commands.${subProperty}`);
 
 const wrongTypeOperationText = (subProperty: string, actualType: string): string =>
   `Error: the \`${subProperty}\` sub-property must be an array of objects; got ${actualType}.`;
 
-const errorSnippet = (title: string, snippet: string): ResponsesWebSearchResult => ({
+const errorSnippet = (title: string, snippet: string): OpenAIResponsesWebSearchResult => ({
   type: 'text_result',
   url: '',
   title,
@@ -347,7 +403,7 @@ const errorSnippet = (title: string, snippet: string): ResponsesWebSearchResult 
 // openai-python `ActionSearch.query` is a single string; some clients send
 // only `queries[]`. Accept both: the engine emits both fields on every
 // search action so typed SDKs reading either one keep working.
-export const actionSearchQueries = (action: Extract<ResponsesWebSearchAction, { type: 'search' }>): string[] => {
+export const actionSearchQueries = (action: Extract<OpenAIResponsesWebSearchAction, { type: 'search' }>): string[] => {
   if (action.queries !== undefined) return action.queries;
   if (action.query !== undefined) return [action.query];
   return [];
@@ -357,14 +413,14 @@ export const actionSearchQueries = (action: Extract<ResponsesWebSearchAction, { 
 // search hits in its final answer. Empty results emit `(no results)` rather
 // than a bare header so the model recognizes the call ran successfully but
 // returned nothing.
-const formatSearchResultsText = (query: string, results: readonly ResponsesWebSearchResult[]): string => {
+const formatSearchResultsText = (query: string, results: readonly OpenAIResponsesWebSearchResult[]): string => {
   const header = `Search results for "${query}":`;
   if (results.length === 0) return `${header}\n\n(no results)`;
   const sections = results.map((r, i) => `[${i + 1}] ${r.title}\n${r.url}\n${r.snippet}`);
   return `${header}\n\n${sections.join('\n\n')}`;
 };
 
-const renderOperationOutputText = (action: ResponsesWebSearchAction, results: ResponsesWebSearchResult[]): string => {
+const renderOperationOutputText = (action: OpenAIResponsesWebSearchAction, results: OpenAIResponsesWebSearchResult[]): string => {
   switch (action.type) {
   case 'search': {
     const queryLabel = actionSearchQueries(action).join(' | ');
@@ -387,7 +443,7 @@ export const renderWebSearchCallOutput = (ir: WebSearchCallIR): string =>
 
 // ── Domain filtering ──
 
-// Suffix-match per Tavily and Microsoft Grounding search-side filter
+// Suffix-match per Tavily and Microsoft Web IQ search-side filter
 // semantics: `example.com` matches `example.com`, `www.example.com`, and
 // `sub.example.com`, but NOT `evil-example.com`.
 const matchesAnyDomain = (hostname: string, domains: readonly string[]): boolean => {
@@ -489,7 +545,7 @@ const resolveActiveProvider = async (
 // ── search ──
 
 interface SearchQueryOutcome {
-  results: ResponsesWebSearchResult[];
+  results: OpenAIResponsesWebSearchResult[];
   sources?: { type: 'url'; url: string }[];
 }
 
@@ -507,7 +563,7 @@ const runOneSearchQuery = async (
       userLocation: session.filters.userLocation,
       ...(session.signal !== undefined ? { signal: session.signal } : {}),
     };
-    const result = await searchWebAndRecordUsage({
+    const result = await runWebSearchAndRecordUsage({
       provider: active.provider,
       providerName: active.providerName,
       keyId: session.apiKeyId,
@@ -519,7 +575,7 @@ const runOneSearchQuery = async (
       return { results: [errorSnippet('Search error', searchFailedText(msg))] };
     }
 
-    const results: ResponsesWebSearchResult[] = result.results.map(r => ({
+    const results: OpenAIResponsesWebSearchResult[] = result.results.map(r => ({
       type: 'text_result' as const,
       url: r.source,
       title: r.title,
@@ -793,9 +849,9 @@ const runBackendFind = async (
 };
 
 // Execute one operation into its `web_search_call` IR. `search`/`open`/
-// `find` hit the backend (open/find read the pre-issued batch map);
-// `unsupported`/`wrong-type` encode a diagnostic search IR so a Responses
-// wire item still parses.
+// `find` hit the backend (open/find read the pre-issued batch map). An
+// unsupported OpenAI command is a capability error; malformed supported
+// commands remain model-visible diagnostic IR.
 export const executeOperationToIr = (
   op: WebSearchOperation,
   session: WebSearchExecutionSession,
@@ -809,11 +865,7 @@ export const executeOperationToIr = (
   case 'find':
     return runBackendFind(op, batch);
   case 'unsupported':
-    return Promise.resolve(schemaErrorIr(
-      `unsupported action: ${op.subProperty}[${op.arrayIndex}]`,
-      'Unsupported action',
-      unsupportedOperationText(op.subProperty),
-    ));
+    return Promise.reject(unsupportedOperationError(op.subProperty));
   case 'wrong-type':
     return Promise.resolve(schemaErrorIr(
       `wrong-type sub-property: ${op.subProperty}`,
@@ -824,9 +876,9 @@ export const executeOperationToIr = (
 };
 
 // Execute one operation and render its model-visible text directly. The
-// Codex `/alpha/search` endpoint consumes only text, so `unsupported` /
-// `wrong-type` render as their bare diagnostic rather than the IR-wrapped
-// "Search results for …" form the Responses wire item needs.
+// Codex `/alpha/search` endpoint consumes only text, so malformed supported
+// commands render as their bare diagnostic rather than the IR-wrapped
+// "Search results for …" form the OpenAI Responses wire item needs.
 export const executeOperationToText = async (
   op: WebSearchOperation,
   session: WebSearchExecutionSession,
@@ -834,7 +886,7 @@ export const executeOperationToText = async (
 ): Promise<string> => {
   switch (op.kind) {
   case 'unsupported':
-    return unsupportedOperationText(op.subProperty);
+    throw unsupportedOperationError(op.subProperty);
   case 'wrong-type':
     return wrongTypeOperationText(op.subProperty, op.actualType);
   default: {

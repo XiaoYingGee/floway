@@ -6,35 +6,48 @@ import type { ApiKey } from '../../repo/types.ts';
 import { CUSTOM_API_KEY_MAX_LENGTH, generateApiKeyToken, type KeySource } from '../../shared/api-key-tokens.ts';
 import { generateServerSecret } from '../../shared/server-secret.ts';
 import type { createKeyBody, rotateKeyBody, updateKeyBody } from '../schemas.ts';
-import { ownedKeyOr404 } from '../shared/owned-key.ts';
+import { ownedKeyForUser } from '../shared/owned-key.ts';
+import { loadKnownUpstreamIds, pruneUnreachableUpstreamIds, reachableUpstreamIds, unknownUpstreamIdsError } from '../shared/upstream-ids.ts';
 
 const GENERATED_KEY_RETRIES = 5;
 
-const apiKeyToJson = (key: ApiKey) => ({
+type KeyWriteError = {
+  ok: false;
+  status: 400 | 409 | 500;
+  error: string;
+};
+
+type KeyWriteResult = { ok: true; key: ApiKey } | KeyWriteError;
+
+const keyWriteError = (status: KeyWriteError['status'], error: string): KeyWriteError => ({ ok: false, status, error });
+
+// The set is what this key's owner can reach, not the whole catalog: a grant
+// their cap no longer covers routes nothing, so serving it would put a row in
+// the dashboard that resolves to no upstream.
+const apiKeyToJson = (key: ApiKey, reachable: ReadonlySet<string>) => ({
   id: key.id,
   name: key.name,
   key: key.key,
   created_at: key.createdAt,
   last_used_at: key.lastUsedAt ?? null,
-  upstream_ids: key.upstreamIds,
+  upstream_ids: pruneUnreachableUpstreamIds(key.upstreamIds, reachable),
   dump_retention_seconds: key.dumpRetentionSeconds,
-  responses_retention_seconds: key.responsesRetentionSeconds,
+  responses_retention_seconds: key.openaiResponsesRetentionSeconds,
 });
 
-const normalizeCustomKey = (value: unknown): string | Response => {
+const normalizeCustomKey = (value: unknown): { ok: true; key: string } | KeyWriteError => {
   if (typeof value !== 'string') {
-    return Response.json({ error: 'custom_key is required when key_source is custom' }, { status: 400 });
+    return keyWriteError(400, 'custom_key is required when key_source is custom');
   }
   const trimmed = value.trim();
-  if (!trimmed) return Response.json({ error: 'custom_key is required when key_source is custom' }, { status: 400 });
+  if (!trimmed) return keyWriteError(400, 'custom_key is required when key_source is custom');
   if (trimmed.length > CUSTOM_API_KEY_MAX_LENGTH) {
-    return Response.json({ error: `custom_key must be at most ${CUSTOM_API_KEY_MAX_LENGTH} characters` }, { status: 400 });
+    return keyWriteError(400, `custom_key must be at most ${CUSTOM_API_KEY_MAX_LENGTH} characters`);
   }
-  return trimmed;
+  return { ok: true, key: trimmed };
 };
 
-const duplicateKeyResponse = () =>
-  Response.json({ error: 'An API key with that raw key already exists.' }, { status: 409 });
+const duplicateKeyError = (): KeyWriteError => keyWriteError(409, 'An API key with that raw key already exists.');
 
 const isRawKeyUniqueConstraint = (error: unknown): boolean =>
   /UNIQUE constraint failed: api_keys\.key(?:\b|$)/i.test(error instanceof Error ? error.message : String(error));
@@ -42,30 +55,30 @@ const isRawKeyUniqueConstraint = (error: unknown): boolean =>
 const findAnyByRawKey = async (rawKey: string): Promise<ApiKey | null> =>
   (await getRepo().apiKeys.listIncludingDeleted()).find(key => key.key === rawKey) ?? null;
 
-const saveGeneratedKey = async (template: Omit<ApiKey, 'key'>): Promise<ApiKey | Response> => {
+const saveGeneratedKey = async (template: Omit<ApiKey, 'key'>): Promise<KeyWriteResult> => {
   for (let i = 0; i < GENERATED_KEY_RETRIES; i++) {
     const key: ApiKey = { ...template, key: generateApiKeyToken() };
     if (await findAnyByRawKey(key.key)) continue;
     try {
       await getRepo().apiKeys.save(key);
-      return key;
+      return { ok: true, key };
     } catch (error) {
       if (isRawKeyUniqueConstraint(error)) continue;
       throw error;
     }
   }
-  return Response.json({ error: 'Could not allocate a unique API key; retry the request.' }, { status: 500 });
+  return keyWriteError(500, 'Could not allocate a unique API key; retry the request.');
 };
 
-const saveCustomKey = async (template: Omit<ApiKey, 'key'>, rawKey: string): Promise<ApiKey | Response> => {
+const saveCustomKey = async (template: Omit<ApiKey, 'key'>, rawKey: string): Promise<KeyWriteResult> => {
   const existing = await findAnyByRawKey(rawKey);
-  if (existing && existing.id !== template.id) return duplicateKeyResponse();
+  if (existing && existing.id !== template.id) return duplicateKeyError();
   const key: ApiKey = { ...template, key: rawKey };
   try {
     await getRepo().apiKeys.save(key);
-    return key;
+    return { ok: true, key };
   } catch (error) {
-    if (isRawKeyUniqueConstraint(error)) return duplicateKeyResponse();
+    if (isRawKeyUniqueConstraint(error)) return duplicateKeyError();
     throw error;
   }
 };
@@ -75,28 +88,27 @@ const saveCustomKey = async (template: Omit<ApiKey, 'key'>, rawKey: string): Pro
 const writeKeyForRequest = async (
   template: Omit<ApiKey, 'key'>,
   body: { key_source?: KeySource; custom_key?: string },
-): Promise<ApiKey | Response> => {
+): Promise<KeyWriteResult> => {
   const source = body.key_source ?? 'generate';
   if (source !== 'custom' && body.custom_key !== undefined) {
-    return Response.json({ error: 'custom_key is only valid when key_source is custom' }, { status: 400 });
+    return keyWriteError(400, 'custom_key is only valid when key_source is custom');
   }
   if (source === 'custom') {
     const customKey = normalizeCustomKey(body.custom_key);
-    if (customKey instanceof Response) return customKey;
-    return await saveCustomKey(template, customKey);
+    if (!customKey.ok) return customKey;
+    return await saveCustomKey(template, customKey.key);
   }
   return await saveGeneratedKey(template);
 };
 
-const validateUpstreamIdsAgainstUserCap = async (
+const validateUpstreamIdsAgainstUserCap = (
   c: AuthedContext,
   proposed: readonly string[] | null,
-): Promise<string | null> => {
+  knownUpstreamIds: ReadonlySet<string>,
+): string | null => {
+  const unknownUpstreamError = unknownUpstreamIdsError(proposed, knownUpstreamIds);
+  if (unknownUpstreamError !== null) return unknownUpstreamError;
   if (proposed === null) return null;
-  const upstreams = await getRepo().upstreams.list();
-  const known = new Set(upstreams.map(u => u.id));
-  const unknown = proposed.filter(id => !known.has(id));
-  if (unknown.length) return `Unknown upstream(s): ${unknown.join(', ')}`;
 
   const userCap = userUpstreamIdsFromContext(c);
   if (userCap === null) return null;
@@ -109,15 +121,17 @@ const validateUpstreamIdsAgainstUserCap = async (
 
 export const listKeys = async (c: AuthedContext) => {
   const userId = userFromContext(c).id;
-  const keys = await getRepo().apiKeys.listByUserId(userId);
-  return c.json(keys.map(apiKeyToJson));
+  const [keys, knownUpstreamIds] = await Promise.all([getRepo().apiKeys.listByUserId(userId), loadKnownUpstreamIds()]);
+  const reachable = reachableUpstreamIds(knownUpstreamIds, userUpstreamIdsFromContext(c));
+  return c.json(keys.map(key => apiKeyToJson(key, reachable)));
 };
 
 export const createKey = async (c: CtxWithJson<typeof createKeyBody>) => {
   const userId = userFromContext(c).id;
   const body = c.req.valid('json');
 
-  const upstreamErr = await validateUpstreamIdsAgainstUserCap(c, body.upstream_ids ?? null);
+  const knownUpstreamIds = await loadKnownUpstreamIds();
+  const upstreamErr = validateUpstreamIdsAgainstUserCap(c, body.upstream_ids ?? null, knownUpstreamIds);
   if (upstreamErr) return c.json({ error: upstreamErr }, 400);
 
   const template = {
@@ -129,18 +143,18 @@ export const createKey = async (c: CtxWithJson<typeof createKeyBody>) => {
     upstreamIds: body.upstream_ids ?? null,
     deletedAt: null,
     dumpRetentionSeconds: body.dump_retention_seconds ?? null,
-    responsesRetentionSeconds: body.responses_retention_seconds ?? 0,
+    openaiResponsesRetentionSeconds: body.responses_retention_seconds ?? 0,
   } satisfies Omit<ApiKey, 'key'>;
 
-  const key = await writeKeyForRequest(template, body);
-  if (key instanceof Response) return key;
-  return c.json(apiKeyToJson(key), 201);
+  const result = await writeKeyForRequest(template, body);
+  if (!result.ok) return c.json({ error: result.error }, result.status);
+  return c.json(apiKeyToJson(result.key, reachableUpstreamIds(knownUpstreamIds, userUpstreamIdsFromContext(c))), 201);
 };
 
 export const deleteKey = async (c: AuthedContext) => {
   const id = c.req.param('id')!;
-  const owned = await ownedKeyOr404(c, id);
-  if (owned instanceof Response) return owned;
+  const owned = await ownedKeyForUser(c, id);
+  if (!owned) return c.json({ error: 'Key not found' }, 404);
   // Cut any live SSE subscribers so the dashboard sees a clean disconnect.
   // Broker availability shouldn't block the soft-delete — clients reconcile
   // on the next keys refetch regardless.
@@ -151,12 +165,12 @@ export const deleteKey = async (c: AuthedContext) => {
 
 export const rotateKey = async (c: CtxWithJson<typeof rotateKeyBody>) => {
   const id = c.req.param('id')!;
-  const owned = await ownedKeyOr404(c, id);
-  if (owned instanceof Response) return owned;
+  const owned = await ownedKeyForUser(c, id);
+  if (!owned) return c.json({ error: 'Key not found' }, 404);
 
-  const updated = await writeKeyForRequest(owned, c.req.valid('json'));
-  if (updated instanceof Response) return updated;
-  return c.json(apiKeyToJson(updated));
+  const result = await writeKeyForRequest(owned, c.req.valid('json'));
+  if (!result.ok) return c.json({ error: result.error }, result.status);
+  return c.json(apiKeyToJson(result.key, reachableUpstreamIds(await loadKnownUpstreamIds(), userUpstreamIdsFromContext(c))));
 };
 
 export const updateKey = async (c: CtxWithJson<typeof updateKeyBody>) => {
@@ -164,14 +178,15 @@ export const updateKey = async (c: CtxWithJson<typeof updateKeyBody>) => {
   const body = c.req.valid('json');
 
   if (body.name === undefined && body.upstream_ids === undefined && body.dump_retention_seconds === undefined && body.responses_retention_seconds === undefined) {
-    return c.json({ error: 'Provide a new name, upstream selection, dump retention, or Stateful Responses retention to update.' }, 400);
+    return c.json({ error: 'Provide a new name, upstream selection, dump retention, or Stateful OpenAI Responses retention to update.' }, 400);
   }
 
-  const owned = await ownedKeyOr404(c, id);
-  if (owned instanceof Response) return owned;
+  const owned = await ownedKeyForUser(c, id);
+  if (!owned) return c.json({ error: 'Key not found' }, 404);
 
+  const knownUpstreamIds = await loadKnownUpstreamIds();
   if (body.upstream_ids !== undefined) {
-    const err = await validateUpstreamIdsAgainstUserCap(c, body.upstream_ids);
+    const err = validateUpstreamIdsAgainstUserCap(c, body.upstream_ids, knownUpstreamIds);
     if (err) return c.json({ error: err }, 400);
   }
 
@@ -179,7 +194,7 @@ export const updateKey = async (c: CtxWithJson<typeof updateKeyBody>) => {
     ...(body.name !== undefined ? { name: body.name } : {}),
     ...(body.upstream_ids !== undefined ? { upstreamIds: body.upstream_ids } : {}),
     ...(body.dump_retention_seconds !== undefined ? { dumpRetentionSeconds: body.dump_retention_seconds } : {}),
-    ...(body.responses_retention_seconds !== undefined ? { responsesRetentionSeconds: body.responses_retention_seconds } : {}),
+    ...(body.responses_retention_seconds !== undefined ? { openaiResponsesRetentionSeconds: body.responses_retention_seconds } : {}),
   });
   if (updated === null) throw new Error(`API key disappeared during update: ${id}`);
 
@@ -189,5 +204,5 @@ export const updateKey = async (c: CtxWithJson<typeof updateKeyBody>) => {
     if (next === null && previous !== null) await notifyDisabledBestEffort(id, 'updateKey retention disable');
   }
 
-  return c.json(apiKeyToJson(updated));
+  return c.json(apiKeyToJson(updated, reachableUpstreamIds(knownUpstreamIds, userUpstreamIdsFromContext(c))));
 };

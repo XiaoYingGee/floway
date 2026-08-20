@@ -16,12 +16,12 @@ import type {
   PreparedDumpRequestBody,
   StoredDumpResponseBody,
 } from './types.ts';
-import type { RequestBody } from '../data-plane/chat/shared/request-body.ts';
+import type { RequestBody } from '../data-plane/shared/request-body.ts';
 import { getRepo } from '../repo/index.ts';
 import type { ApiKey, TokenUsage } from '../repo/types.ts';
 import { ulid } from '../shared/ulid.ts';
 import type { BackgroundScheduler } from '@floway-dev/platform';
-import type { ProtocolFrame } from '@floway-dev/protocols/common';
+import { isEventStreamMediaType, type ProtocolFrame } from '@floway-dev/protocols/common';
 import type { TelemetryModelIdentity } from '@floway-dev/provider';
 
 // Frozen at ctx construction so `finalize` never has to re-read a stream
@@ -68,9 +68,9 @@ interface ResponseSnapshot {
 // `requestedModel`-set model survives across both error variants so even an
 // outright-failed turn carries model attribution.
 
-// Anthropic-style disjoint per-dimension counts: input excludes cache reads
+// Anthropic-style disjoint per-category counts: input excludes cache reads
 // and cache writes; sum the present ones onto the dump's single inputTokens
-// column. Missing dimensions stay null (not measured) instead of zero so a
+// column. Missing categories stay null (not measured) instead of zero so a
 // recorded zero genuinely means "upstream said zero".
 const tokenUsageInput = (usage: TokenUsage | null): number | null => {
   if (!usage) return null;
@@ -94,7 +94,7 @@ const resolveUpstreamRef = async (id: string | null): Promise<DumpUpstreamRef | 
   if (!id) return null;
   const upstream = await getRepo().upstreams.getById(id);
   if (!upstream) return null;
-  return { id: upstream.id, name: upstream.name, kind: upstream.kind, color: upstream.color };
+  return { id: upstream.id, name: upstream.name, kind: upstream.kind, hue: upstream.hue };
 };
 
 export class DumpAccumulator {
@@ -161,7 +161,7 @@ export class DumpAccumulator {
   // shapes:
   //
   //   • `(status, headers)` — no HTTP Response object to tee. The WebSocket
-  //     Responses path uses this: its "response" is the stream of frames
+  //     OpenAI Responses path uses this: its "response" is the stream of frames
   //     already captured via `frame()`, while the send seam records their
   //     actual UTF-8 payload bytes via `recordSentPayloadBytes()`.
   //   • `(response)` — tees the response body so the client gets bytes
@@ -198,7 +198,7 @@ export class DumpAccumulator {
       return response;
     }
 
-    const isStream = (response.headers.get('content-type') ?? '').startsWith('text/event-stream');
+    const isStream = isEventStreamMediaType(response.headers.get('content-type'));
     const [forClient, forCapture] = response.body.tee();
     this.backgroundScheduler((async () => {
       const reader = forCapture.getReader();
@@ -303,7 +303,7 @@ export class DumpAccumulator {
 
 // Returns null when the api key opts out of dumps; callers then skip all
 // per-request dump work. `method` is passed explicitly rather than read
-// off the request so the WebSocket Responses path can record each turn
+// off the request so the WebSocket OpenAI Responses path can record each turn
 // as `WS /v1/responses` rather than the upgrade's `GET`.
 export const openDumpAccumulator = (
   c: Context,

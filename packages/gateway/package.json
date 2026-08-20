@@ -11,30 +11,28 @@
     "./app-type": {
       "types": "./src/app.ts"
     },
-    "./channel-broker": {
-      "import": "./src/runtime/channel-broker-contract.ts",
-      "types": "./src/runtime/channel-broker-contract.ts"
-    },
     "./control-plane/proxies/serialize": {
       "types": "./src/control-plane/proxies/serialize.ts"
     },
-    "./control-plane/pricing/types": {
-      "types": "./src/control-plane/pricing/types.ts"
+    "./control-plane/usage-types": {
+      "types": "./src/control-plane/usage-types.ts"
     },
-    "./control-plane/performance/aggregate": {
-      "types": "./src/control-plane/performance/aggregate.ts"
+    "./control-plane/upstreams/types": {
+      "types": "./src/control-plane/upstreams/types.ts"
     },
-    "./data-plane/tools/web-search/types": {
-      "import": "./src/data-plane/tools/web-search/types.ts",
-      "types": "./src/data-plane/tools/web-search/types.ts"
+    "./data-plane/models/shared": {
+      "types": "./src/data-plane/models/shared.ts"
     },
     "./dump-codec": {
       "import": "./src/dump/codec.ts",
       "types": "./src/dump/codec.ts"
     },
     "./dump-types": {
-      "import": "./src/dump/types.ts",
       "types": "./src/dump/types.ts"
+    },
+    "./migrations-dir": {
+      "import": "./src/migrations-dir.ts",
+      "types": "./src/migrations-dir.ts"
     }
   },
   "scripts": {
@@ -59,9 +57,15 @@
     "es-toolkit": "^1.49.0",
     "hono": "^4",
     "jsonrepair": "^3.14.0",
+    "klona": "2.0.6",
+    "nanoid": "^5.1.16",
+    "ulid": "^3.0.2",
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@floway-dev/test-utils": "workspace:*"
+    "@floway-dev/test-utils": "workspace:*",
+    "@types/culori": "^4.0.1",
+    "culori": "^4.0.2",
+    "sql.js": "^1.14.1"
   }
 }

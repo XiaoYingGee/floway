@@ -1,3 +1,6 @@
+import { timingSafeEqual } from '@floway-dev/platform';
+import { decodeForgivingBase64, encodeBase64 } from '@floway-dev/protocols/common';
+
 // Cloudflare Workers' Web Crypto refuses PBKDF2 with iterations above 100k as a
 // CPU-time DoS guard ("Pbkdf2 failed: iteration counts above 100000 are not
 // supported"). 100k is below OWASP's current 600k recommendation for
@@ -9,19 +12,6 @@ export const PASSWORD_HASH_SCHEME = 'pbkdf2-sha256';
 
 const utf8 = new TextEncoder();
 
-const toBase64 = (bytes: Uint8Array): string => {
-  let s = '';
-  for (const b of bytes) s += String.fromCharCode(b);
-  return btoa(s);
-};
-
-const fromBase64 = (b64: string): Uint8Array => {
-  const s = atob(b64);
-  const out = new Uint8Array(s.length);
-  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
-  return out;
-};
-
 const deriveBits = async (plaintext: string, salt: Uint8Array, iterations: number): Promise<Uint8Array> => {
   const key = await crypto.subtle.importKey('raw', utf8.encode(plaintext), 'PBKDF2', false, ['deriveBits']);
   // crypto.subtle rejects Uint8Array views over SharedArrayBuffer; copy into a fresh ArrayBuffer.
@@ -30,17 +20,10 @@ const deriveBits = async (plaintext: string, salt: Uint8Array, iterations: numbe
   return new Uint8Array(bits);
 };
 
-export const timingSafeEqual = (a: Uint8Array, b: Uint8Array): boolean => {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
-  return diff === 0;
-};
-
 export const hashPassword = async (plaintext: string): Promise<string> => {
   const salt = crypto.getRandomValues(new Uint8Array(SALT_BYTES));
   const bits = await deriveBits(plaintext, salt, ITERATIONS);
-  return `${PASSWORD_HASH_SCHEME}$${ITERATIONS}$${toBase64(salt)}$${toBase64(bits)}`;
+  return `${PASSWORD_HASH_SCHEME}$${ITERATIONS}$${encodeBase64(salt)}$${encodeBase64(bits)}`;
 };
 
 // Returns false on any structural failure of the encoded string. The caller
@@ -54,8 +37,8 @@ export const verifyPassword = async (plaintext: string, encoded: string): Promis
   let salt: Uint8Array;
   let expected: Uint8Array;
   try {
-    salt = fromBase64(parts[2]);
-    expected = fromBase64(parts[3]);
+    salt = decodeForgivingBase64(parts[2]);
+    expected = decodeForgivingBase64(parts[3]);
   } catch {
     return false;
   }

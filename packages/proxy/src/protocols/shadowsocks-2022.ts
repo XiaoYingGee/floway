@@ -14,10 +14,10 @@
 import { blake3 } from '@noble/hashes/blake3.js';
 
 import { base64DecodeBytes, concat, encodeAtypAddress, randomBytes, utf8Bytes } from '../bytes.ts';
+import { assertValidTargetHost, assertValidTargetPort, connectOrDialError } from '../dial-target.ts';
 import { ProxyDialError } from '../errors.ts';
 import { makeExactReader } from '../exact-reader.ts';
 import type { Shadowsocks2022ProxyConfig, Ss2022Method } from '../proxy-config.ts';
-import { assertValidTargetHost, assertValidTargetPort, connectOrDialError } from '../types.ts';
 import type { DialOptions, DialResult, DialTarget, DialedSocket } from '../types.ts';
 import { type Aead, leNonce, makeAead } from './shadowsocks-aead.ts';
 
@@ -133,7 +133,7 @@ const dialShadowsocks2022Inner = async (
           // outside the spec's 30-second window). Skipping the window
           // would weaken our SIP022 connection to AEAD-2018-like strength.
           //
-          // The window is symmetric — the spec says "Messages with over
+          // The window is symmetric — the spec says "Anthropic Messages with over
           // 30 seconds of time difference MUST be treated as replay" —
           // and shadowsocks-rust enforces it via `now.abs_diff(ts) > 30`
           // (crates/shadowsocks/src/relay/tcprelay/aead_2022.rs and

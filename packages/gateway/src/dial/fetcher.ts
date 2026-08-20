@@ -1,19 +1,11 @@
-import { DIRECT_CONNECT_ID, DIRECT_FETCH_ID, entryMatchesColo } from '../repo/proxy-fallback-list.ts';
+import type { ProxyEntry } from './proxy-catalog.ts';
+import { createReplayableRequest, type ReplayableRequest } from './replayable-request.ts';
+import { DIRECT_CONNECT_ID, DIRECT_FETCH_ID, entryMatchesColo, isDirectFallbackId } from '../repo/proxy-fallback-list.ts';
 import type { Repo } from '../repo/types.ts';
 import type { HttpRequest } from '@floway-dev/http';
-import { normalizeDialHost } from '@floway-dev/platform';
-import type { Fetcher, ProxyFallbackEntry } from '@floway-dev/provider';
+import type { Fetcher, FetchInit, ProxyFallbackEntry } from '@floway-dev/provider';
 import { isAbortError } from '@floway-dev/provider';
 import { ProxyDialError, type ProxyConfig, type ProxyRequestTarget, type RunDirectConnectRequestOptions, type RunProxiedRequestOptions, type SocketDial } from '@floway-dev/proxy';
-
-// Pairs the parsed wire config with an optional per-proxy dial deadline so
-// a slow but real proxy can be granted more time without raising the bar
-// for the whole gateway.
-export interface ProxyEntry {
-  config: ProxyConfig;
-  /** ms; null means "use the dialer's default". */
-  dialTimeoutMs: number | null;
-}
 
 interface CreateFetcherInput {
   repo: Pick<Repo, 'proxyBackoffs'>;
@@ -32,7 +24,7 @@ interface CreateFetcherInput {
     options: RunProxiedRequestOptions,
   ) => Promise<Response>;
   // Per-request indirection for the runtime-native fetch sentinel.
-  runDirectFetch: (url: string, init: RequestInit) => Promise<Response>;
+  runDirectFetch: Fetcher;
   // Runtime-agnostic raw TCP + userspace-TLS request runner.
   runDirectConnect: (
     target: ProxyRequestTarget,
@@ -40,29 +32,14 @@ interface CreateFetcherInput {
     options: RunDirectConnectRequestOptions,
   ) => Promise<Response>;
   /**
-   * Platform-injected raw TCP dial primitive, threaded into runProxied.
+   * Platform-injected byte-stream dial, threaded into runProxied. Each dialer
+   * asks through `SocketDialOptions` for either a raw connection or one
+   * wrapped in the runtime's native TLS.
    * Lazily evaluated — only invoked when a socket-backed fallback entry is
    * actually attempted, so direct-fetch-only call sites can run without an
    * installed SocketDial impl.
    */
   socketDial: () => SocketDial;
-}
-
-/**
- * Buffered request shape extracted from a Fetcher call. Splits the
- * transport target (host/port/tls/sni) from the HTTP-shaped request
- * (method/path/headers/body) so the dial layer and request-shaping layer
- * each receive only what they need.
- */
-interface MaterializedRequest {
-  target: ProxyRequestTarget;
-  request: HttpRequest;
-}
-
-interface ReplayableRequest {
-  readonly signal: AbortSignal | undefined;
-  fetchInit(): RequestInit;
-  materialized(): Promise<MaterializedRequest>;
 }
 
 // Two-pass dial strategy. First pass walks the fallback list skipping any
@@ -78,33 +55,51 @@ interface ReplayableRequest {
 // it; the direct-fetch-only fast path passes `init` straight to runtime `fetch`,
 // which is how non-buffered shapes like FormData stay supported.
 export const createFetcher = (input: CreateFetcherInput): Fetcher => {
-  // Colo filter precedes the implicit direct-fetch collapse so a fully-excluded
-  // list behaves like an empty list and gets the direct-fetch fallback, rather than
+  // An unset policy means direct egress, and direct egress defaults to raw TCP
+  // rather than the runtime's `fetch`, because both runtimes' `fetch` abandon a
+  // response whose body goes quiet for long enough. Cloudflare routes a Worker
+  // `fetch` body through its HTTP proxy path, whose Proxy Read Timeout bounds
+  // the gap between two consecutive reads of the upstream response at 120s;
+  // Node's `fetch` is undici, whose `bodyTimeout` "monitors time between
+  // receiving body data" and defaults to 300s. Either one kills a Copilot
+  // OpenAI Responses stream that has already returned HTTP 200 and then thinks —
+  // measured silences run past both bounds (120s and 300.113s observed on the
+  // same workload), and neither limit is reachable from here. A raw socket has
+  // no such bound: the same workload survived 233s of measured upstream silence
+  // and completed cleanly (https://github.com/Menci/Floway/pull/221).
+  // `direct_fetch` keeps the runtime connection pool and HTTP/2, so it stays
+  // selectable, but an operator has to ask for it.
+  //   https://developers.cloudflare.com/cache/how-to/cache-rules/settings/#proxy-read-timeout-enterprise-only
+  //   https://github.com/nodejs/undici/blob/7392d6f9f565e550e9047458c275ae77aeaefbb9/docs/docs/api/Client.md?plain=1#L20
+  //
+  // Colo filter precedes the implicit direct-connect collapse so a fully-excluded
+  // list behaves like an empty list and gets the direct-connect fallback, rather than
   // throwing because pass 1 had no candidates.
   const matched = input.fallbackList.filter(entry => entryMatchesColo(entry, input.runtimeLocation));
-  const list = matched.length > 0 ? matched.map(entry => entry.id) : [DIRECT_FETCH_ID];
-  // If direct-fetch precedes any materialized transport, runtime fetch may take
-  // ownership of `init.body` and consume its underlying stream/Blob.
-  // Buffer the body up-front so a runtime that re-streams a Blob can't
-  // strand a later proxy attempt with empty bytes. The fast path
+  const list = matched.length > 0 ? matched.map(entry => entry.id) : [DIRECT_CONNECT_ID];
+  // If direct-fetch precedes any dial transport, runtime fetch may take
+  // ownership of a native `init.body` and consume its underlying stream/Blob.
+  // Materialize native bodies up-front so a later proxy attempt cannot receive
+  // empty bytes. Replayable bodies remain factories and open afresh per attempt.
+  // The fast path
   // (direct-fetch-only list) keeps the runtime's native body handling intact —
   // FormData, Blob, etc. don't need to be buffered.
-  const hasMaterializedTransport = list.some(id => id !== DIRECT_FETCH_ID);
+  const hasDialTransport = list.some(id => id !== DIRECT_FETCH_ID);
   const hasDirectFetch = list.includes(DIRECT_FETCH_ID);
-  const directFetchBeforeMaterialized = hasMaterializedTransport
+  const directFetchBeforeDialTransport = hasDialTransport
     && hasDirectFetch
     && list.indexOf(DIRECT_FETCH_ID) < list.length - 1;
-  return (url, init) => {
-    // Reject streaming bodies upfront whenever any materialized entry is in
+  return (url, init: FetchInit) => {
+    // Reject streaming bodies upfront whenever any dial transport is in
     // play. The two-pass dial can replay a request and a stream is
     // single-shot; for a list like ['a','direct_fetch'] where 'a' is in active
     // backoff, pass 1 would consume the stream via the runtime fetch and
     // strand pass 2 with empty bytes.
-    if (hasMaterializedTransport && init.body instanceof ReadableStream) {
+    if (hasDialTransport && init.body instanceof ReadableStream) {
       return Promise.reject(new Error('streaming request bodies are not replayable through direct-connect or proxy transports'));
     }
 
-    return runFallbacks(input, list, url, createReplayableRequest(url, init), directFetchBeforeMaterialized);
+    return runFallbacks(input, list, url, createReplayableRequest(url, init), directFetchBeforeDialTransport);
   };
 };
 
@@ -113,17 +108,24 @@ const runFallbacks = async (
   list: readonly string[],
   url: string,
   request: ReplayableRequest,
-  directFetchBeforeMaterialized: boolean,
+  directFetchBeforeDialTransport: boolean,
 ): Promise<Response> => {
-  // A direct-fetch attempt before a materialized transport can consume
-  // Blob/FormData bodies. Build the replayable byte form first so every later
-  // attempt observes one body.
-  if (directFetchBeforeMaterialized) await request.materialized();
+  // A direct-fetch attempt before a dial transport can consume native
+  // Blob/FormData bodies. Prepare the dial request first so those bodies are
+  // buffered while replayable factories remain reusable by every attempt.
+  if (directFetchBeforeDialTransport) await request.prepared();
   const errors: unknown[] = [];
 
-  const active = await input.repo.proxyBackoffs.listForUpstream(input.upstreamId);
-  const now = Math.floor(Date.now() / 1000);
-  const skip = new Set(active.filter(b => b.expiresAt > now).map(b => b.proxyId));
+  // Backoff rows only ever exist for operator-managed proxies, so a list made
+  // entirely of built-in transports has nothing to look up. Skipping the read
+  // keeps the direct-only path — which is what an unset policy resolves to —
+  // free of a per-request store round-trip.
+  const skip = new Set<string>();
+  if (list.some(id => !isDirectFallbackId(id))) {
+    const active = await input.repo.proxyBackoffs.listForUpstream(input.upstreamId);
+    const now = Math.floor(Date.now() / 1000);
+    for (const b of active) if (b.expiresAt > now) skip.add(b.proxyId);
+  }
 
   // Track which entries have already been attempted in this call so the
   // second pass only retries the ones we actively skipped. Without this,
@@ -151,67 +153,6 @@ const runFallbacks = async (
   throw new AggregateError(errors, 'all proxies failed at the dial layer');
 };
 
-class ReplayableRequestOwner implements ReplayableRequest {
-  readonly signal: AbortSignal | undefined;
-  private fetch: RequestInit;
-  private materializedRequest: MaterializedRequest | undefined;
-  private rebuildFetchBody = false;
-
-  constructor(
-    private readonly url: string,
-    init: RequestInit,
-  ) {
-    this.signal = init.signal ?? undefined;
-    this.fetch = init;
-  }
-
-  fetchInit(): RequestInit {
-    if (this.rebuildFetchBody) {
-      this.fetch = rebuildInitFromMaterialized(this.fetch, this.materializedRequest!);
-      this.rebuildFetchBody = false;
-    }
-    return this.fetch;
-  }
-
-  async materialized(): Promise<MaterializedRequest> {
-    if (this.materializedRequest !== undefined) return this.materializedRequest;
-    this.materializedRequest = await buildMaterializedRequest(this.url, this.fetch);
-    // Once bytes exist, the original BodyInit must not remain captured for the
-    // duration of the upstream request. A later direct-fetch fallback rebuilds its
-    // owned byte body lazily, so a successful proxy does not retain a second
-    // full buffer merely because `direct_fetch` appears later in the list.
-    this.fetch = { ...this.fetch, body: null };
-    this.rebuildFetchBody = true;
-    return this.materializedRequest;
-  }
-}
-
-const createReplayableRequest = (url: string, init: RequestInit): ReplayableRequest =>
-  new ReplayableRequestOwner(url, init);
-
-const rebuildInitFromMaterialized = (original: RequestInit, materialized: MaterializedRequest): RequestInit => {
-  const headers = new Headers(original.headers);
-  const targetCt = materialized.request.headers['content-type'];
-  if (targetCt !== undefined && !headers.has('content-type')) {
-    headers.set('content-type', targetCt);
-  }
-  // Copy into a freshly-allocated ArrayBuffer-backed Uint8Array so the
-  // BodyInit slot accepts it under TypeScript's stricter typing — and so
-  // the buffer we hand to runtime fetch never aliases a backing buffer
-  // that's also referenced elsewhere.
-  let body: Uint8Array<ArrayBuffer> | null = null;
-  if (materialized.request.body) {
-    const owned = new Uint8Array(materialized.request.body.byteLength);
-    owned.set(materialized.request.body);
-    body = owned;
-  }
-  return {
-    ...original,
-    headers,
-    body,
-  };
-};
-
 const tryOne = async (
   id: string,
   input: CreateFetcherInput,
@@ -226,10 +167,10 @@ const tryOne = async (
       return await input.runDirectFetch(url, request.fetchInit());
     }
     if (id === DIRECT_CONNECT_ID) {
-      const materialized = await request.materialized();
+      const prepared = await request.prepared();
       return await input.runDirectConnect(
-        materialized.target,
-        materialized.request,
+        prepared.target,
+        prepared.request,
         { socketDial: input.socketDial(), signal: request.signal },
       );
     }
@@ -240,12 +181,11 @@ const tryOne = async (
       // dial-shaped failure for THIS entry so the fallback chain advances
       // instead of killing the whole call (and any healthy built-in or proxy
       // siblings further down the list). We don't write to backoff
-      // here — the row is gone, and the upstream's fallback_list will
-      // surface the dangling reference next time the dashboard renders it.
+      // here — the row is gone.
       errors.push(new ProxyDialError(`unknown proxy id in fallback list: ${id}`, 'config'));
       return null;
     }
-    const materialized = await request.materialized();
+    const prepared = await request.prepared();
     // Caller cancellation flows through init.signal into the dialer's
     // combined controller so a disconnected client tears down any
     // in-flight handshake instead of waiting for the per-proxy deadline.
@@ -256,8 +196,8 @@ const tryOne = async (
     if (config.dialTimeoutMs !== null) options.dialTimeoutMs = config.dialTimeoutMs;
     const response = await input.runProxied(
       config.config,
-      materialized.target,
-      materialized.request,
+      prepared.target,
+      prepared.request,
       options,
     );
     // A successful dial after a previous failure must clear the backoff so
@@ -313,80 +253,4 @@ const tryOne = async (
     }
     throw err;
   }
-};
-
-const buildMaterializedRequest = async (url: string, init: RequestInit): Promise<MaterializedRequest> => {
-  const u = new URL(url);
-  const collected = await collectBody(init.body);
-  const headers = extractHeaders(init.headers);
-  // FormData/URLSearchParams synthesize a Content-Type with the multipart
-  // boundary or the urlencoded marker. Adopt it only when the caller did not
-  // pre-set Content-Type itself, so explicit overrides keep winning.
-  if (collected?.contentType !== undefined && headers['content-type'] === undefined) {
-    headers['content-type'] = collected.contentType;
-  }
-  // `URL#hostname` keeps the `[…]` envelope on IPv6 literals; the
-  // `DialTarget.host` contract requires the bare address. Strip the
-  // brackets here at the URL→DialTarget seam so every dialer sees a
-  // canonical host.
-  const target: ProxyRequestTarget = {
-    host: normalizeDialHost(u.hostname),
-    port: u.port ? Number(u.port) : (u.protocol === 'https:' ? 443 : 80),
-    tls: u.protocol === 'https:',
-  };
-  const request: HttpRequest = {
-    method: init.method ?? 'GET',
-    path: `${u.pathname}${u.search}`,
-    headers,
-    body: collected?.body,
-  };
-  return { target, request };
-};
-
-// Lower-case keys here so the request is canonical at the seam; the http
-// package also lowercases internally, but normalizing at the boundary
-// keeps the contract simple.
-const extractHeaders = (input: HeadersInit | undefined): Record<string, string> => {
-  if (!input) return {};
-  if (input instanceof Headers) {
-    const out: Record<string, string> = {};
-    input.forEach((v, k) => { out[k.toLowerCase()] = v; });
-    return out;
-  }
-  if (Array.isArray(input)) {
-    const out: Record<string, string> = {};
-    for (const [k, v] of input) out[k.toLowerCase()] = v;
-    return out;
-  }
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(input)) out[k.toLowerCase()] = v;
-  return out;
-};
-
-interface CollectedBody {
-  body: Uint8Array;
-  /** Content-Type the runtime synthesizes for FormData/URLSearchParams (with
-   *  multipart boundary or urlencoded marker). undefined for shapes that
-   *  carry no implicit Content-Type. */
-  contentType?: string;
-}
-
-const collectBody = async (
-  body: BodyInit | null | undefined,
-): Promise<CollectedBody | undefined> => {
-  if (body == null) return undefined;
-  if (typeof body === 'string') return { body: new TextEncoder().encode(body) };
-  if (body instanceof Uint8Array) return { body };
-  if (body instanceof ArrayBuffer) return { body: new Uint8Array(body) };
-  if (body instanceof Blob) return { body: new Uint8Array(await body.arrayBuffer()) };
-  // FormData / URLSearchParams: round-trip through Request so the runtime
-  // produces a canonical multipart/url-encoded byte stream we can buffer
-  // alongside the synthesized Content-Type (with boundary or charset).
-  if (body instanceof FormData || body instanceof URLSearchParams) {
-    const req = new Request('https://internal/', { method: 'POST', body });
-    const buffer = new Uint8Array(await req.arrayBuffer());
-    const contentType = req.headers.get('content-type') ?? undefined;
-    return { body: buffer, contentType };
-  }
-  throw new Error('unsupported BodyInit shape for materialized request');
 };

@@ -2,12 +2,12 @@
 // bypass the chat source/target executor because they have no protocol
 // translation — the request body is forwarded to the chosen provider's
 // matching endpoint and the upstream response is passed through back to
-// the client. Embeddings and images run the `json` branch (single-shot
-// body, OpenAI-shape `usage` block); /v1/completions runs the `sse` branch
-// (frame-level transformFrame closure + settleUsage). Endpoint-owned response
-// strategies handle specialized media-type state machines. Usage and
-// request-performance writes are scheduled through the runtime's
-// background scheduler so transient repo failures cannot turn a
+// the client. OpenAI Embeddings and OpenAI Images run the `json` branch
+// (single-shot body, OpenAI-shape `usage` block); /v1/completions runs the
+// `sse` branch (frame-level transformFrame closure + settleUsage).
+// Endpoint-owned response strategies handle specialized media-type state
+// machines. Usage and request-performance writes are scheduled through the
+// runtime's background scheduler so transient repo failures cannot turn a
 // successful 200 from upstream into a 502.
 
 import type { Context } from 'hono';
@@ -16,25 +16,26 @@ import type { ContentfulStatusCode } from 'hono/utils/http-status';
 
 import type { PassthroughServeApiName } from './api-names.ts';
 import { appendFailedUpstreams } from './failed-upstreams.ts';
+import type { GatewayCtx } from './gateway-ctx.ts';
 import { iterateCandidates } from './iterate-candidates.ts';
 import { passthroughAttempt } from './passthrough-attempt.ts';
+import { type StreamCompletion, writeSSEFrames } from './sse.ts';
 import { recordFailedRequest } from './telemetry/performance.ts';
 import { settle } from './telemetry/settle.ts';
 import { forwardUpstreamHeaders, forwardUpstreamResponse } from './upstream-response.ts';
 import type { AuthedContext } from '../../middleware/auth.ts';
 import type { TokenUsage } from '../../repo/types.ts';
-import type { GatewayCtx } from '../chat/shared/gateway-ctx.ts';
-import { type StreamCompletion, writeSSEFrames } from '../chat/shared/stream/sse.ts';
-import { enumerateModelCandidates } from '../providers/registry.ts';
+import { enumerateModelCandidates } from '../providers/resolution.ts';
 import { doneFrame, eventFrame, type ModelKind, parseSSEStream, parseTargetStreamFrames, type ProtocolFrame, sseCommentFrame, sseFrame } from '@floway-dev/protocols/common';
 import { httpResponseToResponse, ProviderModelsUnavailableError, toInternalDebugError } from '@floway-dev/provider';
 import type { PerformanceOperation, PerformanceTelemetryContext, InternalModel, Provider, ProviderCallResult, ProviderModel, TelemetryModelIdentity, UpstreamCallOptions } from '@floway-dev/provider';
 
-// `json` (embeddings, images): single-shot body, `extractBilling` reads
-// usage / metadata off the parsed root. `sse` (/v1/completions): frame
-// stream, `transformFrame` mutates or drops frames (return null), then
-// `settleUsage` reports billing once the stream ends. `strategy` delegates
-// response handling after candidate selection to the owning endpoint.
+// `json` (OpenAI Embeddings, OpenAI Images): single-shot body,
+// `extractBilling` reads usage / metadata off the parsed root. `sse`
+// (/v1/completions): frame stream, `transformFrame` mutates or drops frames
+// (return null), then `settleUsage` reports billing once the stream ends.
+// `strategy` delegates response handling after candidate selection to the
+// owning endpoint.
 type PassthroughResponseHandling =
   | {
     readonly format: 'json';
@@ -104,9 +105,9 @@ export const passthroughServe = async (input: PassthroughServeContext): Promise<
     // Alias resolution is a top-of-chain step inside the resolver: an alias
     // id walks every target in `selection` order, tags each returned
     // candidate with that target's rule overlay, and dedups across the
-    // flattened list. Passthrough aliases carry empty rules, so the tag
-    // is a no-op in practice — the alias flow only changes which id the
-    // gateway addresses upstream.
+    // flattened list. Passthrough endpoints never consult that overlay, so
+    // whatever rules a target carries are inert here — the alias flow only
+    // changes which id the gateway addresses upstream.
     const { candidates, sawModel, failedUpstreams } = await enumerateModelCandidates({
       upstreamIds: ctx.upstreamIds,
       model,
@@ -127,7 +128,7 @@ export const passthroughServe = async (input: PassthroughServeContext): Promise<
 
     // Endpoint-level pre-filter: drop candidates whose upstream model
     // exists for the requested kind but doesn't expose this endpoint's
-    // specific capability (e.g. an embeddings-kind model on an upstream
+    // specific capability (e.g. an embedding-kind model on an upstream
     // that only exposes chat). An empty viable set is the same "model
     // exists but no upstream serves this endpoint" 400 the empty-candidate
     // branch above surfaces.

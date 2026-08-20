@@ -1,0 +1,570 @@
+import { test } from 'vitest';
+
+import { createAzureProvider } from '../src/provider.ts';
+import type { UpstreamRecord } from '@floway-dev/provider';
+import { directFetcher } from '@floway-dev/provider';
+import { assertEquals, noopUpstreamCallOptions, sseResponse, withMockedFetch } from '@floway-dev/test-utils';
+
+const azureRecord = (overrides: Partial<UpstreamRecord> = {}): UpstreamRecord => {
+  const config = {
+    endpoint: 'https://example.openai.azure.com',
+    apiKey: 'az-key',
+    models: [
+      {
+        upstreamModelId: 'gpt-prod',
+        publicModelId: 'gpt-public',
+        endpoints: { openaiChatCompletions: {}, openaiResponses: {}, openaiEmbeddings: {} },
+        display_name: 'GPT Public',
+        limits: { max_context_window_tokens: 128000 },
+      },
+      {
+        upstreamModelId: 'gpt-small',
+        publicModelId: ' ',
+        endpoints: { openaiChatCompletions: {} },
+      },
+    ],
+  };
+  const { config: overrideConfig, ...rest } = overrides;
+
+  return {
+    id: 'up_azure',
+    kind: 'azure',
+    name: 'Azure Resource',
+    enabled: true,
+    sortOrder: 0,
+    createdAt: '2026-05-21T00:00:00.000Z',
+    updatedAt: '2026-05-21T00:00:00.000Z',
+    state: null,
+    flagOverrides: {},
+    disabledPublicModelIds: [],
+    proxyFallbackList: [],
+    modelPrefix: null,
+    modelsCache: null,
+    hue: 210,
+    ...rest,
+    config: overrideConfig ?? config,
+  };
+};
+
+test('createAzureProvider projects configured models into upstream models', async () => {
+  const instance = createAzureProvider(azureRecord({ flagOverrides: { 'vendor-kimi': true } }));
+  const models = await instance.instance.getProvidedModels(directFetcher);
+
+  assertEquals(instance.upstreamId, 'up_azure');
+  assertEquals(instance.name, 'Azure Resource');
+  assertEquals(models[0]?.enabledFlags.has('vendor-kimi'), true);
+  assertEquals(
+    models.map(model => ({ id: model.id, displayName: model.display_name, endpoints: model.endpoints, providerData: model.providerData })),
+    [
+      {
+        id: 'gpt-public',
+        displayName: 'GPT Public',
+        endpoints: { openaiChatCompletions: {}, openaiResponses: {}, openaiEmbeddings: {} },
+        providerData: { upstreamModelId: 'gpt-prod' },
+      },
+      {
+        id: 'gpt-small',
+        displayName: undefined,
+        endpoints: { openaiChatCompletions: {} },
+        providerData: { upstreamModelId: 'gpt-small' },
+      },
+    ],
+  );
+  assertEquals(models[0].limits.max_context_window_tokens, 128000);
+});
+
+test('createAzureProvider sends upstream model ids in OpenAI-shaped request bodies and model keys', async () => {
+  const instance = createAzureProvider(azureRecord());
+  const [providerModel] = await instance.instance.getProvidedModels(directFetcher);
+  const seen: Array<{ url: string; body: Record<string, unknown> }> = [];
+
+  await withMockedFetch(
+    async request => {
+      seen.push({
+        url: request.url,
+        body: (await request.json()) as Record<string, unknown>,
+      });
+      return sseResponse();
+    },
+    async () => {
+      const chat = await instance.instance.callOpenAIChatCompletions(providerModel, { messages: [{ role: 'user', content: 'hello' }] }, undefined, noopUpstreamCallOptions());
+      const responses = await instance.instance.callOpenAIResponses(providerModel, {
+        input: [{
+          type: 'additional_tools',
+          role: 'developer',
+          tools: [{
+            type: 'namespace',
+            name: 'functions',
+            description: '',
+            tools: [{ type: 'function', name: 'lookup', description: 'Look up a record.', parameters: { type: 'object', properties: {} } }],
+          }],
+        }],
+      }, 'generate', undefined, noopUpstreamCallOptions());
+      const embeddings = await instance.instance.callOpenAIEmbeddings(providerModel, { input: 'hello' }, undefined, noopUpstreamCallOptions());
+
+      assertEquals(chat.modelKey, 'gpt-prod');
+      assertEquals(responses.modelKey, 'gpt-prod');
+      assertEquals(embeddings.modelKey, 'gpt-prod');
+    },
+  );
+
+  assertEquals(
+    seen.map(item => item.url),
+    [
+      'https://example.openai.azure.com/openai/v1/chat/completions',
+      'https://example.openai.azure.com/openai/v1/responses',
+      'https://example.openai.azure.com/openai/v1/embeddings',
+    ],
+  );
+  assertEquals(
+    seen.map(item => item.body.model),
+    ['gpt-prod', 'gpt-prod', 'gpt-prod'],
+  );
+  assertEquals(
+    ((seen[1]?.body.input as Array<{ tools: Array<{ description: string }> }>)[0]?.tools[0]?.description),
+    'Tools in the functions namespace.',
+  );
+});
+
+test('createAzureProvider runs the OpenAI Responses boundary on compact requests', async () => {
+  const instance = createAzureProvider(azureRecord());
+  const [providerModel] = await instance.instance.getProvidedModels(directFetcher);
+  let body: Record<string, unknown> | undefined;
+
+  await withMockedFetch(
+    async request => {
+      body = await request.json() as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        id: 'resp_compact',
+        object: 'response.compaction',
+        model: 'gpt-prod',
+        status: 'completed',
+        output: [{ id: 'cmp_x', type: 'compaction', encrypted_content: 'blob' }],
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    },
+    async () => {
+      const result = await instance.instance.callOpenAIResponses(providerModel, {
+        input: [{
+          type: 'additional_tools',
+          role: 'developer',
+          tools: [{
+            type: 'namespace',
+            name: 'functions',
+            description: '',
+            tools: [{ type: 'function', name: 'lookup', description: 'Look up a record.', parameters: { type: 'object', properties: {} } }],
+          }],
+        }],
+      }, 'compact', undefined, noopUpstreamCallOptions());
+      assertEquals(result.action, 'compact');
+      assertEquals(result.ok, true);
+    },
+  );
+
+  assertEquals(
+    ((body?.input as Array<{ tools: Array<{ description: string }> }>)[0]?.tools[0]?.description),
+    'Tools in the functions namespace.',
+  );
+  assertEquals(body?.model, 'gpt-prod');
+});
+
+test.each(['generate', 'compact'] as const)('createAzureProvider preserves %s upstream errors through the OpenAI Responses boundary', async action => {
+  const instance = createAzureProvider(azureRecord());
+  const [providerModel] = await instance.instance.getProvidedModels(directFetcher);
+  const upstreamResponse = new Response('{"error":"upstream rejected the request"}', {
+    status: 418,
+    headers: { 'content-type': 'application/json', 'x-upstream-error': action },
+  });
+
+  await withMockedFetch(
+    () => Promise.resolve(upstreamResponse),
+    async () => {
+      const result = await instance.instance.callOpenAIResponses(
+        providerModel,
+        { input: [{ type: 'message', role: 'user', content: 'hello' }] },
+        action,
+        undefined,
+        noopUpstreamCallOptions(),
+      );
+      assertEquals(result.action, action);
+      assertEquals(result.ok, false);
+      if (result.ok) throw new Error('expected upstream error');
+      assertEquals(result.modelKey, 'gpt-prod');
+      assertEquals(result.response, upstreamResponse);
+      assertEquals(result.response.status, 418);
+      assertEquals(result.response.headers.get('x-upstream-error'), action);
+      assertEquals(await result.response.text(), '{"error":"upstream rejected the request"}');
+    },
+  );
+});
+
+test('createAzureProvider supports Azure AI cross-provider models with explicit endpoint capabilities', async () => {
+  const instance = createAzureProvider(
+    azureRecord({
+      config: {
+        endpoint: 'https://example.openai.azure.com/openai/v1',
+        apiKey: 'az-key',
+        models: [
+          {
+            upstreamModelId: 'deepseek-v4-pro',
+            endpoints: { openaiChatCompletions: {} },
+          },
+          {
+            upstreamModelId: 'gpt-5.4-pro',
+            publicModelId: '',
+            endpoints: { openaiResponses: {} },
+          },
+        ],
+      },
+    }),
+  );
+  const [chatProviderModel, openaiResponsesProviderModel] = await instance.instance.getProvidedModels(directFetcher);
+  const chatOpts = noopUpstreamCallOptions();
+  const openaiResponsesOpts = noopUpstreamCallOptions();
+  const seen: Array<{ url: string; apiKey: string | null; body: Record<string, unknown> }> = [];
+
+  assertEquals(chatProviderModel.id, 'deepseek-v4-pro');
+  assertEquals(chatProviderModel.endpoints, { openaiChatCompletions: {} });
+  assertEquals(openaiResponsesProviderModel.id, 'gpt-5.4-pro');
+  assertEquals(openaiResponsesProviderModel.endpoints, { openaiResponses: {} });
+
+  await withMockedFetch(
+    async request => {
+      seen.push({
+        url: request.url,
+        apiKey: request.headers.get('api-key'),
+        body: (await request.json()) as Record<string, unknown>,
+      });
+      return sseResponse();
+    },
+    async () => {
+      const chat = await instance.instance.callOpenAIChatCompletions(chatProviderModel, { messages: [{ role: 'user', content: 'hello' }] }, undefined, chatOpts);
+      const responses = await instance.instance.callOpenAIResponses(openaiResponsesProviderModel, { input: [{ type: 'message', role: 'user', content: 'hello' }] }, 'generate', undefined, openaiResponsesOpts);
+      assertEquals(chat.modelKey, 'deepseek-v4-pro');
+      assertEquals(responses.modelKey, 'gpt-5.4-pro');
+    },
+  );
+
+  assertEquals(seen, [
+    {
+      url: 'https://example.openai.azure.com/openai/v1/chat/completions',
+      apiKey: 'az-key',
+      body: {
+        messages: [{ role: 'user', content: 'hello' }],
+        stream: true,
+        model: 'deepseek-v4-pro',
+      },
+    },
+    {
+      url: 'https://example.openai.azure.com/openai/v1/responses',
+      apiKey: 'az-key',
+      body: {
+        input: [{ type: 'message', role: 'user', content: 'hello' }],
+        stream: true,
+        model: 'gpt-5.4-pro',
+      },
+    },
+  ]);
+});
+
+test('createAzureProvider supports native Azure Anthropic Messages models', async () => {
+  const instance = createAzureProvider(
+    azureRecord({
+      config: {
+        endpoint: 'https://example.services.ai.azure.com/anthropic/v1',
+        apiKey: 'az-key',
+        models: [
+          {
+            upstreamModelId: 'claude-prod',
+            publicModelId: 'claude-public',
+            endpoints: { anthropicMessages: {} },
+          },
+        ],
+      },
+    }),
+  );
+  const [providerModel] = await instance.instance.getProvidedModels(directFetcher);
+  const seen: Array<{ url: string; xApiKey: string | null; body: Record<string, unknown>; beta: string | null }> = [];
+
+  assertEquals(providerModel.id, 'claude-public');
+  assertEquals(providerModel.endpoints, { anthropicMessages: {} });
+
+  await withMockedFetch(
+    async request => {
+      seen.push({
+        url: request.url,
+        xApiKey: request.headers.get('x-api-key'),
+        body: (await request.json()) as Record<string, unknown>,
+        beta: request.headers.get('anthropic-beta'),
+      });
+      return sseResponse();
+    },
+    async () => {
+      const messages = await instance.instance.callAnthropicMessages(providerModel, { max_tokens: 16, messages: [{ role: 'user', content: 'hello' }] }, undefined, { ...noopUpstreamCallOptions(), anthropicBeta: ['context-1m'] });
+      const count = await instance.instance.callAnthropicMessagesCountTokens(providerModel, { max_tokens: 16, messages: [{ role: 'user', content: 'hello' }] }, undefined, { ...noopUpstreamCallOptions(), anthropicBeta: ['context-1m', 'advanced-tool-use'] });
+      assertEquals(messages.modelKey, 'claude-prod');
+      assertEquals(count.modelKey, 'claude-prod');
+    },
+  );
+
+  assertEquals(seen, [
+    {
+      url: 'https://example.services.ai.azure.com/anthropic/v1/messages',
+      xApiKey: 'az-key',
+      body: { max_tokens: 16, messages: [{ role: 'user', content: 'hello' }], stream: true, model: 'claude-prod' },
+      beta: 'context-1m',
+    },
+    {
+      url: 'https://example.services.ai.azure.com/anthropic/v1/messages/count_tokens',
+      xApiKey: 'az-key',
+      body: { max_tokens: 16, messages: [{ role: 'user', content: 'hello' }], model: 'claude-prod' },
+      beta: 'context-1m,advanced-tool-use',
+    },
+  ]);
+});
+
+test('createAzureProvider applies per-model flag overrides on top of the upstream layer', async () => {
+  const instance = createAzureProvider(
+    azureRecord({
+      flagOverrides: { 'vendor-deepseek': true },
+      disabledPublicModelIds: [],
+      config: {
+        endpoint: 'https://example.openai.azure.com/openai/v1',
+        apiKey: 'az-key',
+        models: [
+          { upstreamModelId: 'd1', endpoints: { openaiChatCompletions: {} } },
+          {
+            upstreamModelId: 'd2',
+            endpoints: { openaiChatCompletions: {} },
+            flagOverrides: { 'vendor-deepseek': false, 'vendor-kimi': true },
+          },
+        ],
+      },
+    }),
+  );
+  const models = await instance.instance.getProvidedModels(directFetcher);
+  const d1 = models.find(model => (model.providerData as { upstreamModelId: string }).upstreamModelId === 'd1');
+  const d2 = models.find(model => (model.providerData as { upstreamModelId: string }).upstreamModelId === 'd2');
+  if (!d1 || !d2) throw new Error('expected both models');
+
+  assertEquals(d1.enabledFlags.has('vendor-deepseek'), true);
+  assertEquals(d1.enabledFlags.has('vendor-kimi'), false);
+  assertEquals(d2.enabledFlags.has('vendor-deepseek'), false);
+  assertEquals(d2.enabledFlags.has('vendor-kimi'), true);
+});
+
+test('createAzureProvider respects upstream override when per-model flagOverrides is empty', async () => {
+  const instance = createAzureProvider(
+    azureRecord({
+      flagOverrides: { 'vendor-deepseek': true },
+      disabledPublicModelIds: [],
+      config: {
+        endpoint: 'https://example.openai.azure.com/openai/v1',
+        apiKey: 'az-key',
+        models: [
+          {
+            upstreamModelId: 'd1',
+            endpoints: { openaiChatCompletions: {} },
+            flagOverrides: {},
+          },
+        ],
+      },
+    }),
+  );
+  const [model] = await instance.instance.getProvidedModels(directFetcher);
+
+  assertEquals(model.enabledFlags.has('vendor-deepseek'), true);
+});
+
+test('createAzureProvider attaches pricing field from model config', async () => {
+  const instance = createAzureProvider(
+    azureRecord({
+      config: {
+        endpoint: 'https://example.openai.azure.com',
+        apiKey: 'az-key',
+        models: [
+          {
+            upstreamModelId: 'gpt-prod',
+            publicModelId: 'gpt-public',
+            endpoints: { openaiChatCompletions: {} },
+            pricing: { entries: [{ rates: { input_tokens: '2.5', output_tokens: '15', input_cache_read_tokens: '0.25' } }] },
+          },
+          {
+            upstreamModelId: 'gpt-small',
+            endpoints: { openaiChatCompletions: {} },
+          },
+        ],
+      },
+    }),
+  );
+  const models = await instance.instance.getProvidedModels(directFetcher);
+  assertEquals(models[0].pricing, { entries: [{ rates: { input_tokens: '2.5', output_tokens: '15', input_cache_read_tokens: '0.25' } }] });
+  assertEquals(models[1].pricing, undefined);
+});
+
+test('createAzureProvider exposes image models and routes generations with api-version=preview', async () => {
+  const record: UpstreamRecord = {
+    id: 'az-image',
+    kind: 'azure',
+    name: 'azure-images',
+    enabled: true,
+    sortOrder: 0,
+    createdAt: '2026-05-25T00:00:00Z',
+    updatedAt: '2026-05-25T00:00:00Z',
+    flagOverrides: {},
+    disabledPublicModelIds: [],
+    proxyFallbackList: [],
+    modelPrefix: null,
+    modelsCache: null,
+    hue: 210,
+    config: {
+      endpoint: 'https://example.openai.azure.com/openai/v1',
+      apiKey: 'azkey',
+      models: [{
+        upstreamModelId: 'gpt-image-2',
+        endpoints: { openaiImagesGenerations: {}, openaiImagesEdits: {} },
+      }],
+    },
+    state: null,
+  };
+
+  let observedUrl: string | undefined;
+  let observedBody: { model?: unknown; prompt?: unknown } | undefined;
+  await withMockedFetch(
+    async request => {
+      observedUrl = request.url;
+      observedBody = await request.json() as Record<string, unknown>;
+      return new Response(JSON.stringify({ data: [{ b64_json: 'x' }], usage: { input_tokens: 1, output_tokens: 2 } }), { status: 200, headers: new Headers({ 'content-type': 'application/json' }) });
+    },
+    async () => {
+      const provider = createAzureProvider(record);
+      const models = await provider.instance.getProvidedModels(directFetcher);
+      assertEquals(models[0].kind, 'image');
+      assertEquals(models[0].endpoints, { openaiImagesGenerations: {}, openaiImagesEdits: {} });
+      const result = await provider.instance.callOpenAIImagesGenerations(models[0], { prompt: 'hello' }, undefined, noopUpstreamCallOptions());
+      assertEquals(result.modelKey, 'gpt-image-2');
+      assertEquals(result.response.status, 200);
+    },
+  );
+  assertEquals(observedUrl, 'https://example.openai.azure.com/openai/v1/images/generations?api-version=preview');
+  assertEquals(observedBody?.model, 'gpt-image-2');
+  assertEquals(observedBody?.prompt, 'hello');
+});
+
+test('createAzureProvider callOpenAIImagesEdits posts multipart with model replaced by upstream model id and api-version=preview', async () => {
+  const record: UpstreamRecord = {
+    id: 'az-image',
+    kind: 'azure',
+    name: 'azure-images',
+    enabled: true,
+    sortOrder: 0,
+    createdAt: '2026-05-25T00:00:00Z',
+    updatedAt: '2026-05-25T00:00:00Z',
+    flagOverrides: {},
+    disabledPublicModelIds: [],
+    proxyFallbackList: [],
+    modelPrefix: null,
+    modelsCache: null,
+    hue: 210,
+    config: {
+      endpoint: 'https://example.openai.azure.com/openai/v1',
+      apiKey: 'azkey',
+      models: [{
+        upstreamModelId: 'gpt-image-2',
+        endpoints: { openaiImagesEdits: {} },
+      }],
+    },
+    state: null,
+  };
+
+  let observedUrl: string | undefined;
+  let observedForm: FormData | undefined;
+  await withMockedFetch(
+    async request => {
+      observedUrl = request.url;
+      observedForm = await request.formData();
+      return new Response(JSON.stringify({ data: [{ b64_json: 'x' }], usage: { input_tokens: 3, output_tokens: 4 } }), { status: 200, headers: new Headers({ 'content-type': 'application/json' }) });
+    },
+    async () => {
+      const provider = createAzureProvider(record);
+      const models = await provider.instance.getProvidedModels(directFetcher);
+      const result = await provider.instance.callOpenAIImagesEdits(models[0], {
+        parameters: { prompt: 'replace sky' },
+        images: [{
+          type: 'upload',
+          file: new File([new Uint8Array([1, 2, 3])], 'photo.png', { type: 'image/png' }),
+        }],
+      }, undefined, noopUpstreamCallOptions());
+      assertEquals(result.modelKey, 'gpt-image-2');
+      assertEquals(result.response.status, 200);
+    },
+  );
+  assertEquals(observedUrl, 'https://example.openai.azure.com/openai/v1/images/edits?api-version=preview');
+  assertEquals(observedForm?.get('model'), 'gpt-image-2');
+  assertEquals(observedForm?.get('prompt'), 'replace sky');
+});
+
+test('createAzureProvider callOpenAIAudioTranscriptions selects the deployment in the URL', async () => {
+  const record = azureRecord({
+    config: {
+      endpoint: 'https://example.openai.azure.com',
+      apiKey: 'azkey',
+      models: [{ upstreamModelId: 'transcribe-deployment', kind: 'transcription', endpoints: { openaiAudioTranscriptions: {} } }],
+    },
+  });
+  let observedUrl: string | undefined;
+  let observedForm: FormData | undefined;
+  await withMockedFetch(
+    async request => {
+      observedUrl = request.url;
+      observedForm = await request.formData();
+      return new Response('WEBVTT', { headers: { 'content-type': 'text/vtt' } });
+    },
+    async () => {
+      const provider = createAzureProvider(record);
+      const [model] = await provider.instance.getProvidedModels(directFetcher);
+      const result = await provider.instance.callOpenAIAudioTranscriptions(model, {
+        entries: [
+          { name: 'file', value: new File(['audio'], 'clip.mp3', { type: 'audio/mpeg' }) },
+          { name: 'model', value: 'public-model' },
+          { name: 'response_format', value: 'vtt' },
+        ],
+      }, undefined, noopUpstreamCallOptions());
+      assertEquals(result.modelKey, 'transcribe-deployment');
+    },
+  );
+  assertEquals(observedUrl, 'https://example.openai.azure.com/openai/deployments/transcribe-deployment/audio/transcriptions?api-version=2025-04-01-preview');
+  assertEquals(observedForm?.get('model'), null);
+  assertEquals(observedForm?.get('response_format'), 'vtt');
+});
+
+test('createAzureProvider callOpenAIAudioTranscriptions reduces a Foundry endpoint to the deployment route', async () => {
+  const record = azureRecord({
+    config: {
+      endpoint: 'https://example.services.ai.azure.com/api/projects/prod',
+      apiKey: 'azkey',
+      models: [{ upstreamModelId: 'gpt-4o-transcribe', kind: 'transcription', endpoints: { openaiAudioTranscriptions: {} } }],
+    },
+  });
+  let observedUrl: string | undefined;
+  let observedForm: FormData | undefined;
+  await withMockedFetch(
+    async request => {
+      observedUrl = request.url;
+      observedForm = await request.formData();
+      return Response.json({ text: 'hello' });
+    },
+    async () => {
+      const provider = createAzureProvider(record);
+      const [model] = await provider.instance.getProvidedModels(directFetcher);
+      await provider.instance.callOpenAIAudioTranscriptions(model, {
+        entries: [
+          { name: 'model', value: 'public-model' },
+          { name: 'file', value: new File(['audio'], 'clip.wav', { type: 'audio/wav' }) },
+        ],
+      }, undefined, noopUpstreamCallOptions());
+    },
+  );
+  assertEquals(observedUrl, 'https://example.services.ai.azure.com/openai/deployments/gpt-4o-transcribe/audio/transcriptions?api-version=2025-04-01-preview');
+  assertEquals(observedForm?.get('model'), null);
+});

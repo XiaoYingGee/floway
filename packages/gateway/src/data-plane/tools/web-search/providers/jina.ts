@@ -1,7 +1,6 @@
-import { extractWebSearchProviderErrorMessage, toWebSearchTextBlocks, validateWebSearchQuery } from './shared.ts';
+import { extractWebSearchProviderErrorMessage, fetchWithRetry, httpStatusToErrorCode, toWebSearchTextBlocks, validateWebSearchQuery } from './shared.ts';
 import { truncateUtf8 } from './truncate.ts';
 import { isJsonObject } from '../../../../shared/json-helpers.ts';
-import { sleep } from '../../../../shared/sleep.ts';
 import { normalizeDomainList } from '../domain-normalize.ts';
 import {
   DEFAULT_WEB_SEARCH_RESULT_COUNT,
@@ -9,7 +8,6 @@ import {
   type WebSearchFetchPageRequest,
   type WebSearchFetchPageResult,
   type WebSearchProvider,
-  type WebSearchProviderErrorCode,
   type WebSearchProviderRequest,
   type WebSearchProviderResult,
 } from '../types.ts';
@@ -21,7 +19,7 @@ const JINA_READER_URL = 'https://r.jina.ai/';
 // `X-Max-Tokens` on s.jina.ai. Jina's default scrapes the full readability
 // markdown of each result page, which can run into double-digit KB; capping
 // to 500 tokens (~2 KB markdown) keeps each Jina result in the same size
-// ballpark as Microsoft Grounding's `passage` mode (~300-400 tokens) and
+// ballpark as Microsoft Web IQ's `passage` mode (~300-400 tokens) and
 // Tavily's `basic` mode (~100 tokens / ~400 chars). 500 is also Jina's
 // documented minimum — values below trigger `Rejected by validator (v) =>
 // v >= 500`. Verified against jina-ai/reader's `tokenTrim` call sites in
@@ -31,14 +29,6 @@ const JINA_SEARCH_MAX_TOKENS_PER_RESULT = 500;
 
 // Hard cap on Jina's `count` query param (validated server-side as 0..20).
 const JINA_SEARCH_MAX_COUNT = 20;
-
-// Per-URL retry policy for the Reader endpoint. Matches the Microsoft
-// Grounding browse retry shape because the failure modes are the same —
-// 429 / 5xx are transient, everything else is structural. Each URL retries
-// independently, so the worst-case wall clock for a 5-URL batch is still
-// `sum(delays)` ≈ 15s, not 5× that.
-const RETRY_DELAYS_MS = [1000, 2000, 4000, 8000] as const;
-const RETRYABLE_HTTP_STATUS: ReadonlySet<number> = new Set([429, 500, 502, 503, 504]);
 
 interface JinaEnvelope {
   code: number;
@@ -73,24 +63,6 @@ const isAssertionEmptyResults = (envelope: JinaEnvelope): boolean =>
   && typeof envelope.message === 'string'
   && /no search results/i.test(envelope.message);
 
-const httpStatusToErrorCode = (status: number): WebSearchProviderErrorCode => {
-  if (status === 429) return 'too_many_requests';
-  if (status === 413) return 'request_too_large';
-  if (status === 400) return 'invalid_tool_input';
-  return 'unavailable';
-};
-
-const fetchWithRetry = async (doFetch: () => Promise<Response>, signal?: AbortSignal): Promise<Response> => {
-  let attempt = 0;
-  while (true) {
-    const response = await doFetch();
-    if (!RETRYABLE_HTTP_STATUS.has(response.status)) return response;
-    if (attempt >= RETRY_DELAYS_MS.length) return response;
-    await sleep(RETRY_DELAYS_MS[attempt], signal);
-    attempt += 1;
-  }
-};
-
 // Jina accepts a single hostname per `X-Site` header, or multiple via the
 // literal `", "` separator (comma + space). Anything else collapses to a
 // single bogus hostname server-side; see `serper-search.ts:209` in
@@ -108,7 +80,7 @@ const normalizeSearchResult = (value: unknown): Extract<WebSearchProviderResult,
   // `content` is the readability-extracted markdown (when present, capped to
   // JINA_SEARCH_MAX_TOKENS_PER_RESULT by `X-Max-Tokens`); `description` is
   // the SERP-level snippet that Jina always returns. Prefer the former, fall
-  // back to the latter — matches what Tavily and Microsoft Grounding hand
+  // back to the latter — matches what Tavily and Microsoft Web IQ hand
   // back as result-level `content`.
   const text = entry.content ?? entry.description ?? '';
   return {
@@ -228,7 +200,7 @@ export const createJinaWebSearchProvider = (apiKey: string, deps?: { fetch?: typ
       if (!response.ok) {
         // Jina returns "no results" as an HTTP 4xx with
         // `AssertionFailureError`. Surface that as an empty result list
-        // instead of a hard error, matching how Tavily and Grounding
+        // instead of a hard error, matching how Tavily and Microsoft Web IQ
         // hand back an empty `results` array on no hits.
         if (envelope !== null && isAssertionEmptyResults(envelope)) {
           return { type: 'ok', results: [] };
@@ -271,7 +243,7 @@ export const createJinaWebSearchProvider = (apiKey: string, deps?: { fetch?: typ
     const outcomes = await Promise.all(request.urls.map(url => readOneUrl(httpFetch, apiKey, url, request.signal)));
 
     // Whole-batch transport / 5xx failure collapses into one envelope —
-    // mirrors Microsoft Grounding's policy. Per-URL 4xx stays granular so
+    // mirrors Microsoft Web IQ's policy. Per-URL 4xx stays granular so
     // a single bad target doesn't poison the rest of the batch.
     const allHardFail = outcomes.every(outcome => outcome.kind === 'fail' && (outcome.httpStatus === 0 || outcome.httpStatus >= 500));
     if (allHardFail) {

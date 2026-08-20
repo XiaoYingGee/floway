@@ -14,41 +14,37 @@
 // or an actually absent Codex at every known global location. The harness never
 // touches the user's real config or credentials.
 //
-// Run the whole suite with `pnpm run test:agent-setup-installers`, or scope it
-// with `--agent claude` / `--agent codex`.
+// Run the whole suite with `pnpm run test:installers`, or scope it with
+// `--agent claude` / `--agent codex`.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { stripVTControlCharacters } from 'node:util';
 
 import type { AgentSetupConfiguration } from '../src/configuration.ts';
 import { renderPowerShellPrefix, renderShellPrefix } from '../src/render.ts';
+import {
+  SETUP_BASH_CLAUDE,
+  SETUP_BASH_CODEX,
+  SETUP_BASH_COMMON,
+  SETUP_POWERSHELL_CLAUDE,
+  SETUP_POWERSHELL_CODEX,
+  SETUP_POWERSHELL_COMMON,
+} from '../src/script-assets.generated.ts';
+import { type ScriptAgent, SETUP_SCRIPT_BODIES } from '../src/script-assets.ts';
 
 const powerShellLiteral = (value: string): string => `'${value.replace(/'/g, "''")}'`;
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const INSTALLERS_DIR = join(HERE, '..', 'installers');
-const BASH_COMMON = ['output.sh', 'helpers.sh', 'main.sh']
-  .map(file => readFileSync(join(INSTALLERS_DIR, 'bash/common', file), 'utf8'))
-  .join('');
-const BASH_CLAUDE = readFileSync(join(INSTALLERS_DIR, 'bash/claude.sh'), 'utf8');
-const BASH_CODEX = readFileSync(join(INSTALLERS_DIR, 'bash/codex.sh'), 'utf8');
-const POWERSHELL_COMMON = ['output.ps1', 'helpers.ps1', 'main.ps1']
-  .map(file => readFileSync(join(INSTALLERS_DIR, 'powershell/common', file), 'utf8'))
-  .join('');
-const POWERSHELL_CLAUDE = readFileSync(join(INSTALLERS_DIR, 'powershell/claude.ps1'), 'utf8');
-const POWERSHELL_CODEX = readFileSync(join(INSTALLERS_DIR, 'powershell/codex.ps1'), 'utf8');
-type SetupAgent = 'claude' | 'codex';
-const AGENT_NAMES: Record<SetupAgent, string> = { claude: 'Claude Code', codex: 'Codex' };
-const shellEntry = (agent: SetupAgent): string => `main '${AGENT_NAMES[agent]}' "$@"`;
-const powerShellEntry = (agent: SetupAgent): string => `$global:LASTEXITCODE = Main '${AGENT_NAMES[agent]}'`;
-const shellBody = (agent: SetupAgent): string => BASH_COMMON + (agent === 'claude' ? BASH_CLAUDE : BASH_CODEX);
-const powerShellBody = (agent: SetupAgent): string => POWERSHELL_COMMON + (agent === 'claude' ? POWERSHELL_CLAUDE : POWERSHELL_CODEX);
-const ALL_BASH_FRAGMENTS = BASH_COMMON + BASH_CLAUDE + BASH_CODEX;
-const ALL_POWERSHELL_FRAGMENTS = POWERSHELL_COMMON + POWERSHELL_CLAUDE + POWERSHELL_CODEX;
+const AGENT_NAMES: Record<ScriptAgent, string> = { claude: 'Claude Code', codex: 'Codex' };
+const shellEntry = (agent: ScriptAgent): string => `main '${AGENT_NAMES[agent]}' "$@"`;
+const powerShellEntry = (agent: ScriptAgent): string => `$global:LASTEXITCODE = Main '${AGENT_NAMES[agent]}'`;
+const shellBody = (agent: ScriptAgent): string => SETUP_SCRIPT_BODIES[agent].sh;
+const powerShellBody = (agent: ScriptAgent): string => SETUP_SCRIPT_BODIES[agent].ps1;
+const ALL_BASH_FRAGMENTS = SETUP_BASH_COMMON + SETUP_BASH_CLAUDE + SETUP_BASH_CODEX;
+const ALL_POWERSHELL_FRAGMENTS = SETUP_POWERSHELL_COMMON + SETUP_POWERSHELL_CLAUDE + SETUP_POWERSHELL_CODEX;
 
 // A fixed, highly greppable fake credential. Every test asserts this string
 // never reaches the installer's stdout/stderr, so a real leak is unmistakable.
@@ -57,7 +53,7 @@ const SENTINEL_KEY = 'sk-floway-SENTINEL-Do-Not-Log-9f3c1a7b2e4d6058';
 // --- tiny test runner -------------------------------------------------------
 
 class SkipError extends Error {}
-const skip = (reason: string): never => { throw new SkipError(reason); };
+const skip: (reason: string) => never = reason => { throw new SkipError(reason); };
 
 interface Assert {
   ok(cond: boolean, message: string): void;
@@ -80,9 +76,9 @@ const makeAssert = (): Assert => ({
 });
 
 type TestFn = (t: Assert) => void | Promise<void>;
-interface Case { agent: SetupAgent; name: string; fn: TestFn; }
+interface Case { agent: ScriptAgent; name: string; fn: TestFn }
 const cases: Case[] = [];
-const test = (agent: SetupAgent, name: string, fn: TestFn): void => { cases.push({ agent, name, fn }); };
+const test = (agent: ScriptAgent, name: string, fn: TestFn): void => { cases.push({ agent, name, fn }); };
 
 // --- shared fixtures --------------------------------------------------------
 
@@ -429,7 +425,7 @@ const startModelServer = async (): Promise<ModelServer> => {
 
 // --- workspace + runner -----------------------------------------------------
 
-interface Workspace { root: string; home: string; binDir: string; }
+interface Workspace { root: string; home: string; binDir: string }
 const makeWorkspace = (): Workspace => {
   const root = mkdtempSync(join(HARNESS_ROOT, 'ws.'));
   const home = join(root, 'home');
@@ -472,14 +468,14 @@ esac
 `, { mode: 0o755 });
 };
 
-type InstallerTestConfiguration = AgentSetupConfiguration & { readonly testAgent: 'claude' | 'codex' };
+type InstallerTestConfiguration = AgentSetupConfiguration & { readonly testAgent: ScriptAgent };
 
 const claudeConfig = (overrides: Partial<AgentSetupConfiguration['claudeCode']> = {}): InstallerTestConfiguration => ({
   testAgent: 'claude',
   apiKeyId: 'key-a',
   claudeCode: {
-    model: null, defaultOpusModel: null, defaultSonnetModel: null,
-    defaultHaikuModel: null, effortLevel: null, cleanupPeriodDays: null, optOutAiAttribution: false, modelDiscovery: false, ...overrides,
+    model: null, defaultFableModel: null, defaultOpusModel: null, defaultSonnetModel: null,
+    defaultHaikuModel: null, effortLevel: null, cleanupPeriodDays: null, optOutAiAttribution: false, disableAutoMemory: false, disableAgentView: false, modelDiscovery: false, ...overrides,
   },
   codex: { model: null, reasoningEffort: null },
 });
@@ -488,8 +484,8 @@ const codexConfig = (overrides: Partial<AgentSetupConfiguration['codex']> = {}):
   testAgent: 'codex',
   apiKeyId: 'key-a',
   claudeCode: {
-    model: null, defaultOpusModel: null, defaultSonnetModel: null,
-    defaultHaikuModel: null, effortLevel: null, cleanupPeriodDays: null, optOutAiAttribution: false, modelDiscovery: false,
+    model: null, defaultFableModel: null, defaultOpusModel: null, defaultSonnetModel: null,
+    defaultHaikuModel: null, effortLevel: null, cleanupPeriodDays: null, optOutAiAttribution: false, disableAutoMemory: false, disableAgentView: false, modelDiscovery: false,
   },
   codex: { model: null, reasoningEffort: null, ...overrides },
 });
@@ -501,8 +497,8 @@ const bothConfig = (
   testAgent: 'claude',
   apiKeyId: 'key-a',
   claudeCode: {
-    model: null, defaultOpusModel: null, defaultSonnetModel: null,
-    defaultHaikuModel: null, effortLevel: null, cleanupPeriodDays: null, optOutAiAttribution: false, modelDiscovery: false, ...claude,
+    model: null, defaultFableModel: null, defaultOpusModel: null, defaultSonnetModel: null,
+    defaultHaikuModel: null, effortLevel: null, cleanupPeriodDays: null, optOutAiAttribution: false, disableAutoMemory: false, disableAgentView: false, modelDiscovery: false, ...claude,
   },
   codex: { model: null, reasoningEffort: null, ...codex },
 });
@@ -510,7 +506,7 @@ const bothConfig = (
 interface RunOptions {
   workspace: Workspace;
   configuration: InstallerTestConfiguration;
-  agent?: 'claude' | 'codex';
+  agent?: ScriptAgent;
   baseUrl: string;
   // The wrapping one-line command injects the gateway origin into the executing
   // shell (Bash exports SETUP_ENDPOINT; PowerShell assigns $SetupEndpoint in the
@@ -561,9 +557,9 @@ interface RunOptions {
   failRestore?: boolean;
 }
 
-const targetAgent = (configuration: InstallerTestConfiguration, agent?: 'claude' | 'codex'): 'claude' | 'codex' =>
+const targetAgent = (configuration: InstallerTestConfiguration, agent?: ScriptAgent): ScriptAgent =>
   agent ?? configuration.testAgent;
-interface RunResult { code: number; stdout: string; stderr: string; combined: string; }
+interface RunResult { code: number; stdout: string; stderr: string; combined: string }
 
 // Environment shared by the shell run helpers: Codex fake-binary knobs, the
 // install hook, and CODEX_HOME. Callers merge this over the Claude environment
@@ -654,7 +650,7 @@ const runShellInstaller = (options: RunOptions): Promise<RunResult> => {
   }
 
   const signal = options.signalDuringInstall;
-  return new Promise<RunResult>((resolve) => {
+  return new Promise<RunResult>(resolve => {
     const child = spawn('/bin/bash', [scriptPath], { env, detached: signal !== undefined });
     let stdout = '';
     let stderr = '';
@@ -698,7 +694,7 @@ const runShellInstallerWithAmbientKey = (options: RunOptions): Promise<RunResult
     FAKE_NPM_RECORD: join(workspace.root, 'npm-record.txt'),
     AGENT_SETUP_TEST_INSTALL_CLAUDE_SCRIPT: FAKE_INSTALLER_SCRIPT,
   };
-  return new Promise<RunResult>((resolve) => {
+  return new Promise<RunResult>(resolve => {
     const child = spawn('/bin/bash', [scriptPath], { env });
     let stdout = '';
     let stderr = '';
@@ -807,7 +803,7 @@ const runPowerShellInstaller = (options: RunOptions): Promise<RunResult> => {
   if (options.noColor) env.NO_COLOR = '1';
   if (options.failRestore) env.AGENT_SETUP_TEST_FAIL_RESTORE = '1';
 
-  return new Promise<RunResult>((resolve) => {
+  return new Promise<RunResult>(resolve => {
     const child = spawn(hostPwsh!, ['-NoProfile', '-File', invocationPath], { env });
     let stdout = '';
     let stderr = '';
@@ -866,19 +862,22 @@ test('claude', 'unrelated settings and env keys are preserved', async t => {
   }));
   const run = await runShellInstaller({
     workspace: ws, baseUrl: modelServer.url,
-    configuration: claudeConfig({ model: 'claude-opus-x[1m]', defaultOpusModel: 'opus-x', defaultSonnetModel: 'sonnet-x', defaultHaikuModel: 'haiku-x', effortLevel: 'high', cleanupPeriodDays: 365, optOutAiAttribution: true, modelDiscovery: true }),
+    configuration: claudeConfig({ model: 'claude-opus-x[1m]', defaultFableModel: 'fable-x', defaultOpusModel: 'opus-x', defaultSonnetModel: 'sonnet-x', defaultHaikuModel: 'haiku-x', effortLevel: 'high', cleanupPeriodDays: 365, optOutAiAttribution: true, disableAutoMemory: true, disableAgentView: true, modelDiscovery: true }),
   });
   t.equal(run.code, 0, `should succeed:\n${run.combined}`);
-  const settings = readSettings(settingsPathFor(ws)) as { theme: string; permissions: unknown; effortLevel: string; cleanupPeriodDays: number; attribution: Record<string, unknown>; env: Record<string, string> };
+  const settings = readSettings(settingsPathFor(ws)) as { theme: string; permissions: unknown; effortLevel: string; cleanupPeriodDays: number; autoMemoryEnabled: boolean; disableAgentView: boolean; attribution: Record<string, unknown>; env: Record<string, string> };
   t.equal(settings.theme, 'dark', 'unrelated top-level key preserved');
   t.equal(JSON.stringify(settings.permissions), JSON.stringify({ allow: ['Bash(ls:*)'] }), 'unrelated nested object preserved');
   t.equal(settings.env.OTHER_TOOL, 'keep-me', 'unrelated env key preserved');
   t.equal(settings.env.USE_BUILTIN_RIPGREP, '0', 'unrelated env key preserved');
   t.equal(settings.env.ANTHROPIC_MODEL, 'claude-opus-x[1m]', 'managed model written verbatim');
+  t.equal(settings.env.ANTHROPIC_DEFAULT_FABLE_MODEL, 'fable-x', 'managed fable default written');
   t.equal(settings.env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'opus-x', 'managed opus default written');
   t.equal(settings.env.ANTHROPIC_DEFAULT_SONNET_MODEL, 'sonnet-x', 'managed sonnet default written');
   t.equal(settings.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'haiku-x', 'managed haiku default written');
   t.equal(settings.cleanupPeriodDays, 365, 'cleanupPeriodDays maps to the top-level numeric setting');
+  t.equal(settings.autoMemoryEnabled, false, 'the auto-memory opt-out maps to autoMemoryEnabled: false');
+  t.equal(settings.disableAgentView, true, 'the agent-view opt-out maps to disableAgentView: true');
   t.equal(JSON.stringify(settings.attribution), JSON.stringify({ keep: 'yes', commit: '', pr: '', sessionUrl: false }), 'attribution opt-out values are written without replacing unrelated keys');
 });
 
@@ -890,9 +889,12 @@ test('claude', 'optional keys are removed when unset', async t => {
   writeFileSync(settingsPathFor(ws), JSON.stringify({
     effortLevel: 'high',
     cleanupPeriodDays: 180,
+    autoMemoryEnabled: false,
+    disableAgentView: true,
     attribution: { commit: 'stale-commit', pr: 'stale-pr', sessionUrl: true, keep: 'yes' },
     env: {
       ANTHROPIC_MODEL: 'stale-model',
+      ANTHROPIC_DEFAULT_FABLE_MODEL: 'stale-fable',
       ANTHROPIC_DEFAULT_OPUS_MODEL: 'stale-opus',
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'stale-sonnet',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'stale-haiku',
@@ -904,12 +906,15 @@ test('claude', 'optional keys are removed when unset', async t => {
   t.equal(run.code, 0, `should succeed:\n${run.combined}`);
   const settings = readSettings(settingsPathFor(ws)) as { effortLevel?: string; cleanupPeriodDays?: number; attribution: Record<string, unknown>; env: Record<string, string> };
   t.ok(!('ANTHROPIC_MODEL' in settings.env), 'stale model removed');
+  t.ok(!('ANTHROPIC_DEFAULT_FABLE_MODEL' in settings.env), 'stale fable removed');
   t.ok(!('ANTHROPIC_DEFAULT_OPUS_MODEL' in settings.env), 'stale opus removed');
   t.ok(!('ANTHROPIC_DEFAULT_SONNET_MODEL' in settings.env), 'stale sonnet removed');
   t.ok(!('ANTHROPIC_DEFAULT_HAIKU_MODEL' in settings.env), 'stale haiku removed');
   t.ok(!('CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY' in settings.env), 'discovery removed when off');
   t.ok(!('effortLevel' in settings), 'effortLevel removed when unset');
   t.ok(!('cleanupPeriodDays' in settings), 'cleanupPeriodDays removed when unset');
+  t.ok(!('autoMemoryEnabled' in settings), 'autoMemoryEnabled removed when the opt-out is off');
+  t.ok(!('disableAgentView' in settings), 'disableAgentView removed when the opt-out is off');
   t.equal(JSON.stringify(settings.attribution), JSON.stringify({ keep: 'yes' }), 'managed attribution keys removed while unrelated keys survive');
   t.equal(settings.env.KEEP, 'yes', 'unrelated env key preserved through removal');
 });
@@ -1128,21 +1133,24 @@ test('claude', 'PowerShell: existing CLI configures and preserves unrelated keys
   writeFileSync(settingsPathFor(ws), JSON.stringify({ theme: 'dark', attribution: { keep: 'yes' }, env: { OTHER_TOOL: 'keep-me' } }));
   const run = await runPowerShellInstaller({
     workspace: ws, baseUrl: modelServer.url,
-    configuration: claudeConfig({ model: 'claude-opus-x[1m]', defaultOpusModel: 'opus-x', defaultSonnetModel: 'sonnet-x', effortLevel: 'high', cleanupPeriodDays: 180, optOutAiAttribution: true, modelDiscovery: true }),
+    configuration: claudeConfig({ model: 'claude-opus-x[1m]', defaultFableModel: 'fable-x', defaultOpusModel: 'opus-x', defaultSonnetModel: 'sonnet-x', effortLevel: 'high', cleanupPeriodDays: 180, optOutAiAttribution: true, disableAutoMemory: true, disableAgentView: true, modelDiscovery: true }),
   });
   t.equal(run.code, 0, `should succeed:\n${run.combined}`);
   t.ok(existsSync(powerShellCallerSurvivalPath(ws)), 'the IEX caller survives a successful setup');
   t.ok(!existsSync(installerMarker(ws)), 'installer must not run when claude is present');
-  const settings = readSettings(settingsPathFor(ws)) as { theme: string; effortLevel: string; cleanupPeriodDays: number; attribution: Record<string, unknown>; env: Record<string, string> };
+  const settings = readSettings(settingsPathFor(ws)) as { theme: string; effortLevel: string; cleanupPeriodDays: number; autoMemoryEnabled: boolean; disableAgentView: boolean; attribution: Record<string, unknown>; env: Record<string, string> };
   t.equal(settings.theme, 'dark', 'unrelated top-level key preserved');
   t.equal(settings.env.OTHER_TOOL, 'keep-me', 'unrelated env key preserved');
   t.equal(settings.env.ANTHROPIC_BASE_URL, modelServer.url, 'base URL written');
   t.equal(settings.env.ANTHROPIC_AUTH_TOKEN, SENTINEL_KEY, 'auth token written');
   t.equal(settings.env.ANTHROPIC_MODEL, 'claude-opus-x[1m]', 'model written verbatim');
+  t.equal(settings.env.ANTHROPIC_DEFAULT_FABLE_MODEL, 'fable-x', 'fable default written');
   t.equal(settings.env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'opus-x', 'opus default written');
   t.equal(settings.env.ANTHROPIC_DEFAULT_SONNET_MODEL, 'sonnet-x', 'sonnet default written');
   t.equal(settings.effortLevel, 'high', 'effortLevel maps to the top-level key');
   t.equal(settings.cleanupPeriodDays, 180, 'cleanupPeriodDays maps to the top-level numeric setting');
+  t.equal(settings.autoMemoryEnabled, false, 'the auto-memory opt-out maps to autoMemoryEnabled: false');
+  t.equal(settings.disableAgentView, true, 'the agent-view opt-out maps to disableAgentView: true');
   t.equal(JSON.stringify(settings.attribution), JSON.stringify({ keep: 'yes', commit: '', pr: '', sessionUrl: false }), 'attribution opt-out maps to the documented values');
   t.equal(settings.env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY, '1', 'discovery maps to the documented env key');
 });
@@ -1156,6 +1164,8 @@ test('claude', 'PowerShell: optional keys are removed when unset', async t => {
   writeFileSync(settingsPathFor(ws), JSON.stringify({
     effortLevel: 'high',
     cleanupPeriodDays: 365,
+    autoMemoryEnabled: false,
+    disableAgentView: true,
     attribution: { commit: 'stale', pr: 'stale', sessionUrl: true, keep: 'yes' },
     env: { ANTHROPIC_MODEL: 'stale', CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: '1', KEEP: 'yes' },
   }));
@@ -1166,6 +1176,8 @@ test('claude', 'PowerShell: optional keys are removed when unset', async t => {
   t.ok(!('CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY' in settings.env), 'discovery removed when off');
   t.ok(!('effortLevel' in settings), 'effortLevel removed when unset');
   t.ok(!('cleanupPeriodDays' in settings), 'cleanupPeriodDays removed when unset');
+  t.ok(!('autoMemoryEnabled' in settings), 'autoMemoryEnabled removed when the opt-out is off');
+  t.ok(!('disableAgentView' in settings), 'disableAgentView removed when the opt-out is off');
   t.equal(JSON.stringify(settings.attribution), JSON.stringify({ keep: 'yes' }), 'managed attribution keys removed while unrelated keys survive');
   t.equal(settings.env.KEEP, 'yes', 'unrelated env key preserved');
 });
@@ -1300,9 +1312,11 @@ test('claude', 'PowerShell stages secret data only after protection and hardens 
 });
 
 test('claude', 'PowerShell Windows file protection writes only an owner DACL', t => {
-  const helperStart = POWERSHELL_COMMON.indexOf('function Protect-SetupFile');
-  const helperEnd = POWERSHELL_COMMON.indexOf('function Stop-SetupProcessTree', helperStart);
-  const helper = POWERSHELL_COMMON.slice(helperStart, helperEnd);
+  const helperStart = SETUP_POWERSHELL_COMMON.indexOf('function Protect-SetupFile');
+  const helperEnd = SETUP_POWERSHELL_COMMON.indexOf('\nfunction ', helperStart);
+  t.ok(helperStart >= 0, 'Protect-SetupFile function marker exists');
+  t.ok(helperEnd >= 0, 'the next function marker exists after Protect-SetupFile');
+  const helper = SETUP_POWERSHELL_COMMON.slice(helperStart, helperEnd);
   t.includes(helper, 'New-Object System.Security.AccessControl.FileSecurity', 'a fresh descriptor carries no prior access rules');
   t.includes(helper, "FileSystemAccessRule($identity, 'FullControl', 'Allow')", 'the current user receives the sole allow rule');
   t.includes(helper, '[System.IO.File]::SetAccessControl($Path, $acl)', 'Windows PowerShell 5.1 writes the descriptor directly');
@@ -1429,7 +1443,6 @@ test('claude', 'PowerShell claude --version is bounded', async t => {
   t.ok(!existsSync(settingsPathFor(ws)), 'configuration does not begin after a version timeout');
 });
 
-
 test('claude', 'PowerShell removes an ambient exported API key before installer and CLI subprocesses', async t => {
   if (!hostPwsh) skip('no PowerShell interpreter on this host');
   const ws = makeWorkspace();
@@ -1457,23 +1470,23 @@ test('claude', 'PowerShell keeps the API key out of output and performs no gatew
 
 test('claude', 'platform installers prefer Homebrew then npm on macOS and npm then direct scripts elsewhere', t => {
   t.includes(ALL_BASH_FRAGMENTS, 'brew install --cask', 'the Bash installer uses Homebrew on macOS');
-  t.includes(ALL_BASH_FRAGMENTS, "npm install --global \"$_inp_package\"", 'the Bash installer can install global npm packages');
-  t.includes(BASH_CLAUDE, "'@anthropic-ai/claude-code'", 'the Claude fragment names its official npm package');
-  t.excludes(BASH_CLAUDE, '@openai/codex', 'the Claude fragment excludes Codex');
-  t.includes(BASH_CODEX, "'@openai/codex'", 'the Codex fragment names its official npm package');
-  t.excludes(BASH_CODEX, '@anthropic-ai/claude-code', 'the Codex fragment excludes Claude Code');
-  t.includes(BASH_CLAUDE, 'https://downloads.claude.ai/claude-code-releases/bootstrap.sh', 'Claude Linux uses the direct release bootstrap');
-  t.includes(BASH_CODEX, 'https://raw.githubusercontent.com/openai/codex/refs/heads/main/scripts/install/install.sh', 'Codex Linux uses the GitHub source installer');
-  const shClaude = BASH_CLAUDE.slice(BASH_CLAUDE.indexOf('claude_ensure_installed()'), BASH_CLAUDE.indexOf('claude_write_settings()'));
+  t.includes(ALL_BASH_FRAGMENTS, 'npm install --global "$_inp_package"', 'the Bash installer can install global npm packages');
+  t.includes(SETUP_BASH_CLAUDE, "'@anthropic-ai/claude-code'", 'the Claude fragment names its official npm package');
+  t.excludes(SETUP_BASH_CLAUDE, '@openai/codex', 'the Claude fragment excludes Codex');
+  t.includes(SETUP_BASH_CODEX, "'@openai/codex'", 'the Codex fragment names its official npm package');
+  t.excludes(SETUP_BASH_CODEX, '@anthropic-ai/claude-code', 'the Codex fragment excludes Claude Code');
+  t.includes(SETUP_BASH_CLAUDE, 'https://downloads.claude.ai/claude-code-releases/bootstrap.sh', 'Claude Linux uses the direct release bootstrap');
+  t.includes(SETUP_BASH_CODEX, 'https://raw.githubusercontent.com/openai/codex/refs/heads/main/scripts/install/install.sh', 'Codex Linux uses the GitHub source installer');
+  const shClaude = SETUP_BASH_CLAUDE.slice(SETUP_BASH_CLAUDE.indexOf('claude_ensure_installed()'), SETUP_BASH_CLAUDE.indexOf('claude_write_settings()'));
   t.ok(shClaude.indexOf('command -v brew') < shClaude.indexOf('command -v npm'), 'Claude on macOS checks Homebrew before npm');
   t.ok(shClaude.indexOf('command -v npm') < shClaude.indexOf('bootstrap.sh'), 'Claude checks npm before the direct script');
-  const shCodex = BASH_CODEX.slice(BASH_CODEX.indexOf('codex_ensure_installed()'), BASH_CODEX.indexOf('codex_backup_files()'));
+  const shCodex = SETUP_BASH_CODEX.slice(SETUP_BASH_CODEX.indexOf('codex_ensure_installed()'), SETUP_BASH_CODEX.indexOf('codex_backup_files()'));
   t.ok(shCodex.indexOf('command -v brew') < shCodex.indexOf('command -v npm'), 'Codex on macOS checks Homebrew before npm');
   t.ok(shCodex.indexOf('command -v npm') < shCodex.indexOf('install.sh'), 'Codex checks npm before the direct script');
-  t.includes(POWERSHELL_CLAUDE, "Install-SetupNpmPackage -Package '@anthropic-ai/claude-code'", 'PowerShell can install Claude Code with npm');
-  t.includes(POWERSHELL_CODEX, "Install-SetupNpmPackage -Package '@openai/codex'", 'PowerShell can install Codex with npm');
-  t.includes(POWERSHELL_CLAUDE, 'https://downloads.claude.ai/claude-code-releases/bootstrap.ps1', 'Claude Windows uses the direct release bootstrap');
-  t.includes(POWERSHELL_CODEX, 'https://raw.githubusercontent.com/openai/codex/refs/heads/main/scripts/install/install.ps1', 'Codex Windows uses the GitHub source installer');
+  t.includes(SETUP_POWERSHELL_CLAUDE, "Install-SetupNpmPackage -Package '@anthropic-ai/claude-code'", 'PowerShell can install Claude Code with npm');
+  t.includes(SETUP_POWERSHELL_CODEX, "Install-SetupNpmPackage -Package '@openai/codex'", 'PowerShell can install Codex with npm');
+  t.includes(SETUP_POWERSHELL_CLAUDE, 'https://downloads.claude.ai/claude-code-releases/bootstrap.ps1', 'Claude Windows uses the direct release bootstrap');
+  t.includes(SETUP_POWERSHELL_CODEX, 'https://raw.githubusercontent.com/openai/codex/refs/heads/main/scripts/install/install.ps1', 'Codex Windows uses the GitHub source installer');
   t.includes(ALL_POWERSHELL_FRAGMENTS, 'Get-Command pwsh', 'downloaded PowerShell scripts prefer pwsh when it is installed');
 });
 
@@ -1514,7 +1527,7 @@ test('claude', 'a download that ends before the final main call performs no setu
 // `export SETUP_ENDPOINT` / `$SetupEndpoint` injection and the `| bash` / `| iex`
 // pipeline scoping are verified end to end rather than assumed.
 const runCommandLine = (exe: string, args: string[], command: string): Promise<RunResult> =>
-  new Promise<RunResult>((resolve) => {
+  new Promise<RunResult>(resolve => {
     const child = spawn(exe, [...args, command], { env: { PATH: `${SHIM_BIN}:${process.env.PATH ?? ''}` } });
     let stdout = '';
     let stderr = '';
@@ -2100,11 +2113,10 @@ test('codex', 'PowerShell: okOverridden counts as success and reports non-secret
   t.excludes(run.combined, 'shadow-model', 'the overridden effective value is not echoed');
 });
 
-
 test('codex', 'PowerShell: Windows provider-token replacement and rollback preserve owner-only ACL ordering', async t => {
-  const tokenFnStart = POWERSHELL_CODEX.indexOf('function Write-SetupCodexToken');
-  const tokenFnEnd = POWERSHELL_CODEX.indexOf('function Write-SetupCodexVersion', tokenFnStart);
-  const tokenBody = POWERSHELL_CODEX.slice(tokenFnStart, tokenFnEnd);
+  const tokenFnStart = SETUP_POWERSHELL_CODEX.indexOf('function Write-SetupCodexToken');
+  const tokenFnEnd = SETUP_POWERSHELL_CODEX.indexOf('function Write-SetupCodexVersion', tokenFnStart);
+  const tokenBody = SETUP_POWERSHELL_CODEX.slice(tokenFnStart, tokenFnEnd);
   const createStage = tokenBody.indexOf('[System.IO.File]::Create($stage).Dispose()');
   const protectStage = tokenBody.indexOf('Protect-SetupFile $stage', createStage);
   const writeSecret = tokenBody.indexOf('[System.IO.File]::WriteAllText($stage, $SetupApiKey', protectStage);
@@ -2121,17 +2133,17 @@ test('codex', 'PowerShell: Windows provider-token replacement and rollback prese
   t.ok(protectStage < writeSecret, 'Codex provider-token stage is protected before the secret is written');
   t.ok(protectTarget < replaceTarget, 'existing Windows provider-token target is hardened before File.Replace');
 
-  const restoreHelperStart = POWERSHELL_COMMON.indexOf('function Restore-SetupManagedFile');
-  const restoreHelperEnd = POWERSHELL_COMMON.indexOf('# --- run', restoreHelperStart);
-  const restoreHelperBody = POWERSHELL_COMMON.slice(restoreHelperStart, restoreHelperEnd);
+  const restoreHelperStart = SETUP_POWERSHELL_COMMON.indexOf('function Restore-SetupManagedFile');
+  const restoreHelperEnd = SETUP_POWERSHELL_COMMON.indexOf('# --- run', restoreHelperStart);
+  const restoreHelperBody = SETUP_POWERSHELL_COMMON.slice(restoreHelperStart, restoreHelperEnd);
   const restoreMove = restoreHelperBody.indexOf('Move-Item -LiteralPath $Backup -Destination $Path -Force');
   t.ok(restoreHelperStart >= 0, 'Restore-SetupManagedFile marker exists');
   t.ok(restoreHelperEnd >= 0, 'common run marker exists after restore helper');
   t.ok(restoreMove >= 0, 'managed rollback move marker exists');
   t.excludes(restoreHelperBody, 'Protect-SetupFile $Path', 'rollback keeps the already-protected backup inode instead of adding a fallible post-move step');
 
-  const restoreStart = POWERSHELL_CODEX.indexOf('function Restore-SetupCodexFiles');
-  const restoreEnd = POWERSHELL_CODEX.indexOf('function Invoke-SetupCodexAppServerBatchWrite', restoreStart);
+  const restoreStart = SETUP_POWERSHELL_CODEX.indexOf('function Restore-SetupCodexFiles');
+  const restoreEnd = SETUP_POWERSHELL_CODEX.indexOf('function Invoke-SetupCodexAppServerBatchWrite', restoreStart);
   t.ok(restoreStart >= 0, 'Restore-SetupCodexFiles marker exists');
   t.ok(restoreEnd >= 0, 'app-server function marker exists after restore function');
 });
@@ -2326,16 +2338,28 @@ test('codex', 'end-to-end against the real pinned Codex 0.144.5 app-server write
 
 // --- output contract --------------------------------------------------------
 
-// Escape sequences are stripped and CRLF normalized; each line is right-trimmed
+// VT control sequences are stripped and CRLF normalized; each line is right-trimmed
 // and trailing blank lines dropped. Interior blank lines remain part of the
 // heading/status output contract.
-const ANSI_PATTERN = /\[[0-9;]*m/g;
-const stripAnsi = (text: string): string => text.replace(ANSI_PATTERN, '');
 const normalizeLines = (text: string): string =>
-  stripAnsi(text).replace(/\r\n/g, '\n').replace(/[ \t]+$/gm, '').replace(/\n+$/, '');
+  stripVTControlCharacters(text).replace(/\r\n/g, '\n').replace(/[ \t]+$/gm, '').replace(/\n+$/, '');
 const normalizeWorkspace = (text: string, workspace: Workspace): string =>
   normalizeLines(text).replaceAll(workspace.root, '<workspace>');
-const hasAnsi = (text: string): boolean => new RegExp('\\x1b\\[[0-9;]*m').test(text);
+const hasVTControlCharacters = (text: string): boolean => stripVTControlCharacters(text) !== text;
+
+test('claude', 'output normalization strips VT controls and preserves control-like text', t => {
+  const decorated = [
+    '\u001B[31mred\u001B[0m',
+    '\u001B[2A\u001B[3Ccursor',
+    '\u001B]8;;https://floway.dev\u0007link\u001B]8;;\u0007',
+  ].join(' ');
+  t.equal(normalizeLines(decorated), 'red cursor link', 'SGR, cursor CSI, and OSC hyperlink sequences are stripped');
+  t.ok(hasVTControlCharacters(decorated), 'VT detection agrees with native stripping');
+
+  const plain = 'literal [31m, [2A, and ]8;;https://floway.dev text';
+  t.equal(normalizeLines(plain), plain, 'control-like ordinary text is unchanged');
+  t.ok(!hasVTControlCharacters(plain), 'control-like ordinary text is not reported as VT control data');
+});
 
 // A hermetic single-agent run needs the harness to fully control discovery. The
 // Codex CLI is discovered at absolute paths the sandbox cannot hide, so a host
@@ -2380,7 +2404,7 @@ test('claude', 'a fully successful run keeps stderr empty and emits no escape co
   const bash = await runShellInstaller({ workspace: bashWs, baseUrl: modelServer.url, configuration: claudeConfig() });
   t.equal(bash.code, 0, `should succeed:\n${bash.combined}`);
   t.equal(bash.stderr.trim(), '', 'a clean Bash run writes nothing to stderr');
-  t.ok(!hasAnsi(bash.combined), 'captured Bash output carries no escape sequences');
+  t.ok(!hasVTControlCharacters(bash.combined), 'captured Bash output carries no VT control sequences');
 
   if (!hostPwsh) skip('no PowerShell interpreter on this host');
   modelServer.reset();
@@ -2389,7 +2413,7 @@ test('claude', 'a fully successful run keeps stderr empty and emits no escape co
   const ps = await runPowerShellInstaller({ workspace: psWs, baseUrl: modelServer.url, configuration: claudeConfig() });
   t.equal(ps.code, 0, `should succeed:\n${ps.combined}`);
   t.equal(ps.stderr.trim(), '', 'a clean PowerShell run writes nothing to stderr');
-  t.ok(!hasAnsi(ps.combined), 'captured PowerShell output carries no escape sequences');
+  t.ok(!hasVTControlCharacters(ps.combined), 'captured PowerShell output carries no VT control sequences');
 });
 
 test('claude', 'Bash styles agent notices while leaving metadata plain', async t => {
@@ -2406,13 +2430,13 @@ test('claude', 'Bash styles agent notices while leaving metadata plain', async t
   t.includes(forced.stdout, '[34m==>[0m [1mConfiguring: Claude Code[0m', 'the configuration section uses the notice style');
   t.includes(forced.stdout, '[34m==>[0m [1mCompleted Agent Setup: Claude Code[0m', 'the successful result uses the notice style');
   t.excludes(forced.stdout, '[92m', 'success does not use green ANSI styling');
-  t.ok(!hasAnsi(forced.stderr), 'a successful run leaves stderr escape-free even under forced color');
+  t.ok(!hasVTControlCharacters(forced.stderr), 'a successful run leaves stderr free of VT controls even under forced color');
 
   const suppressed = makeWorkspace();
   placeFakeClaude(suppressed.binDir);
   const noColor = await runShellInstaller({ workspace: suppressed, baseUrl: modelServer.url, configuration: claudeConfig(), forceColor: true, noColor: true });
   t.equal(noColor.code, 0, `NO_COLOR run should succeed:\n${noColor.combined}`);
-  t.ok(!hasAnsi(noColor.combined), 'NO_COLOR wins over forced color on both streams');
+  t.ok(!hasVTControlCharacters(noColor.combined), 'NO_COLOR wins over forced color on both streams');
   t.includes(noColor.stdout, 'Claude Code', 'the plain heading is still present without color');
 });
 
@@ -2444,7 +2468,7 @@ test('claude', 'PowerShell colors stderr under forced color, keeps stdout escape
     forceColor: true,
   });
   t.ok(forced.code !== 0, 'invalid settings must fail the agent');
-  t.ok(!hasAnsi(forced.stdout), 'host-colored stdout never carries escape codes even under forced color');
+  t.ok(!hasVTControlCharacters(forced.stdout), 'host-colored stdout never carries VT controls even under forced color');
   t.includes(forced.stderr, '[91mError:[0m ', 'stderr colors the primary error label');
 
   const suppressed = makeWorkspace();
@@ -2456,7 +2480,7 @@ test('claude', 'PowerShell colors stderr under forced color, keeps stdout escape
     forceColor: true, noColor: true,
   });
   t.ok(noColor.code !== 0, 'the failure still occurs');
-  t.ok(!hasAnsi(noColor.combined), 'NO_COLOR wins over forced color on stderr too');
+  t.ok(!hasVTControlCharacters(noColor.combined), 'NO_COLOR wins over forced color on stderr too');
   t.includes(noColor.stderr, 'Error: ', 'the plain error is still on stderr');
 });
 
@@ -2494,7 +2518,6 @@ test('claude', 'PowerShell surfaces one primary error without a double wrapper',
   t.excludes(run.stdout, 'is not valid JSON', 'the error stays off stdout');
 });
 
-
 test('codex', 'PowerShell rollback restore failure preserves the Codex provider-token backup', async t => {
   if (!hostPwsh) skip('no PowerShell interpreter on this host');
   const ws = makeWorkspace();
@@ -2516,7 +2539,7 @@ test('codex', 'PowerShell rollback restore failure preserves the Codex provider-
 
 // --- run --------------------------------------------------------------------
 
-const parseAgentFilter = (): 'claude' | 'codex' | 'all' => {
+const parseAgentFilter = (): ScriptAgent | 'all' => {
   const index = process.argv.indexOf('--agent');
   if (index === -1) return 'all';
   const value = process.argv[index + 1];

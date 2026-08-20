@@ -1,14 +1,14 @@
 import { assertCustomUpstreamRecord, type CustomUpstreamConfig } from './config.ts';
 import { CUSTOM_DEFAULT_FLAGS } from './defaults.ts';
 import { fetchCustomModels, type CustomModelsResponse, type CustomRawModel } from './fetch-models.ts';
-import { customFetchAlphaSearch, customFetchAudioTranscriptions, customFetchChatCompletions, customFetchCompletions, customFetchEmbeddings, customFetchImagesEdits, customFetchImagesGenerations, customFetchMessages, customFetchMessagesCountTokens, customFetchRerank, customFetchResponses, customFetchResponsesCompact } from './fetch.ts';
+import { customFetchAlphaSearch, customFetchOpenAIAudioTranscriptions, customFetchOpenAIChatCompletions, customFetchOpenAICompletions, customFetchOpenAIEmbeddings, customFetchOpenAIImagesEdits, customFetchOpenAIImagesGenerations, customFetchAnthropicMessages, customFetchAnthropicMessagesCountTokens, customFetchRerank, customFetchOpenAIResponses, customFetchOpenAIResponsesCompact } from './fetch.ts';
 import { inferEndpointsFromModelId } from './infer-endpoints.ts';
-import { parseChatCompletionsStream } from '@floway-dev/protocols/chat-completions';
+import { parseAnthropicMessagesStream } from '@floway-dev/protocols/anthropic-messages';
 import { type ModelEndpoints, kindForEndpoints } from '@floway-dev/protocols/common';
-import { parseMessagesStream } from '@floway-dev/protocols/messages';
+import { parseOpenAIChatCompletionsStream } from '@floway-dev/protocols/openai-chat-completions';
+import { parseOpenAIResponsesStream, type OpenAIResponsesCompactionResult, toCompactPayloadShape } from '@floway-dev/protocols/openai-responses';
 import { DEFAULT_RERANK_PATHS, serializeRerankRequest } from '@floway-dev/protocols/rerank';
-import { parseResponsesStream, type ResponsesResult, toCompactPayloadShape } from '@floway-dev/protocols/responses';
-import { serializeOpenAIAudioTranscriptionRequest, serializeOpenAIImagesEditsRequest, publicModelId, resolveEffectiveFlags, streamingProviderCall, type FlagId, type ProviderInstance, type Provider, type ProviderCallResult, type ProviderModel, type ProviderStreamParser, type UpstreamCallOptions, type UpstreamFetchOptions, type UpstreamRecord } from '@floway-dev/provider';
+import { headersForAnthropicMessagesCall, jsonRequestBody, serializeModelFieldOpenAIAudioTranscriptionRequest, serializeOpenAIImagesEditsRequest, publicModelId, resolveEffectiveFlags, streamingProviderCall, type FetchInit, type FlagId, type HttpHeaderLines, type ProviderInstance, type Provider, type ProviderCallResult, type ProviderModel, type ProviderStreamParser, type UpstreamCallOptions, type UpstreamFetchOptions, type UpstreamRecord } from '@floway-dev/provider';
 
 const rawModelIdOf = (model: ProviderModel): string => model.providerData as string;
 
@@ -40,9 +40,9 @@ const customRawToProviderModel = (model: CustomRawModel): Omit<ProviderModel, 'k
 // because a kind alone cannot select their target wire. Unknown kinds use the
 // id heuristic, then fall back to the configured endpoints.
 const autoModelEndpoints = (model: CustomRawModel, configured: ModelEndpoints): ModelEndpoints => {
-  if (model.kind === 'embedding') return { embeddings: {} };
-  if (model.kind === 'image') return { imagesGenerations: {}, imagesEdits: {} };
-  if (model.kind === 'transcription') return { audioTranscriptions: {} };
+  if (model.kind === 'embedding') return { openaiEmbeddings: {} };
+  if (model.kind === 'image') return { openaiImagesGenerations: {}, openaiImagesEdits: {} };
+  if (model.kind === 'transcription') return { openaiAudioTranscriptions: {} };
   if (model.kind === 'chat') return configured;
   return inferEndpointsFromModelId(model.id) ?? configured;
 };
@@ -71,12 +71,14 @@ const finalizeCustomModels = (
   return models;
 };
 
-export const createCustomProvider = (record: UpstreamRecord): Provider => {
+export const projectCustomModels = (
+  record: UpstreamRecord,
+  response?: CustomModelsResponse,
+): ProviderModel[] => {
   const { config } = assertCustomUpstreamRecord(record);
   const configuredEndpoints = config.endpoints;
-  // Computed once for the auto-fetch layer: only the upstream layer applies to
-  // auto models (no per-model override layer). Manual models layer their own
-  // flag overrides on top, resolved per-model below.
+  // Only the upstream layer applies to auto models (no per-model override
+  // layer). Manual models layer their own flag overrides on top.
   const upstreamFlags = resolveEffectiveFlags([CUSTOM_DEFAULT_FLAGS, record.flagOverrides]);
 
   // Manual models always emit.
@@ -98,16 +100,60 @@ export const createCustomProvider = (record: UpstreamRecord): Provider => {
     if (model.chat) internal.chat = model.chat;
     return internal;
   });
+  if (!config.modelsFetch.enabled || response === undefined) return manualModels;
+
+  const fetchedPricing = new Map(
+    response.data.flatMap(model => model.pricing ? [[model.id, model.pricing] as const] : []),
+  );
+  const effectiveManualModels = manualModels.map(model => {
+    if (model.pricing !== undefined) return model;
+    const pricing = fetchedPricing.get(rawModelIdOf(model));
+    return pricing === undefined ? model : { ...model, pricing };
+  });
+  // Drop any auto-fetched model whose id is pinned by a manual override so
+  // the manual copy is the only one emitted for that id.
+  const filtered: CustomModelsResponse = { data: response.data.filter(raw => !overriddenIds.has(raw.id)) };
+  return [...effectiveManualModels, ...finalizeCustomModels(filtered, configuredEndpoints, upstreamFlags)];
+};
+
+export const createCustomProvider = (record: UpstreamRecord): Provider => {
+  const { config } = assertCustomUpstreamRecord(record);
+
+  // Each name is resolved as a whole: the admitted client values are dropped
+  // and its rules rebuild the name's value list in rule order, so a
+  // passthrough rule reinstates what the client sent and every configured
+  // rule contributes its own value beside it.
+  const valuesByKey = config.ingressHeadersRules.reduce<Map<string, (string | null)[]>>((byKey, rule) => {
+    const values = byKey.get(rule.key);
+    if (values) values.push(rule.value);
+    else byKey.set(rule.key, [rule.value]);
+    return byKey;
+  }, new Map());
+
+  const headersForCall = (headers: Headers): HttpHeaderLines => {
+    const resolved: [string, string][] = [];
+    for (const [name, value] of headers) {
+      if (!valuesByKey.has(name.toLowerCase())) resolved.push([name, value]);
+    }
+    for (const [key, values] of valuesByKey) {
+      const admitted = headers.get(key);
+      for (const value of values) {
+        if (value !== null) resolved.push([key, value]);
+        else if (admitted !== null) resolved.push([key, admitted]);
+      }
+    }
+    return resolved;
+  };
   const call = (
-    transport: (config: CustomUpstreamConfig, init: RequestInit, options: UpstreamFetchOptions) => Promise<Response>,
+    transport: (config: CustomUpstreamConfig, init: FetchInit, options: UpstreamFetchOptions) => Promise<Response>,
     model: ProviderModel,
     body: Record<string, unknown>,
     signal: AbortSignal | undefined,
-    headers: Headers,
+    headers: HttpHeaderLines,
     opts: UpstreamCallOptions,
   ): Promise<ProviderCallResult> => {
     const rawModelId = rawModelIdOf(model);
-    return transport(config, { method: 'POST', body: JSON.stringify({ ...body, model: rawModelId }), signal }, { extraHeaders: headers, fetcher: opts.fetcher, wrapUpstreamCall: opts.wrapUpstreamCall })
+    return transport(config, { method: 'POST', body: jsonRequestBody({ ...body, model: rawModelId }), signal }, { extraHeaders: headers, fetcher: opts.fetcher, wrapUpstreamCall: opts.wrapUpstreamCall })
       .then(response => ({
         response,
         modelKey: rawModelId,
@@ -115,11 +161,11 @@ export const createCustomProvider = (record: UpstreamRecord): Provider => {
   };
 
   const callStreaming = <TEvent>(
-    transport: (config: CustomUpstreamConfig, init: RequestInit, options: UpstreamFetchOptions) => Promise<Response>,
+    transport: (config: CustomUpstreamConfig, init: FetchInit, options: UpstreamFetchOptions) => Promise<Response>,
     model: ProviderModel,
     body: Record<string, unknown>,
     signal: AbortSignal | undefined,
-    headers: Headers,
+    headers: HttpHeaderLines,
     parser: ProviderStreamParser<TEvent>,
     opts: UpstreamCallOptions,
   ) => {
@@ -127,7 +173,7 @@ export const createCustomProvider = (record: UpstreamRecord): Provider => {
     return streamingProviderCall(
       transport(
         config,
-        { method: 'POST', body: JSON.stringify({ ...body, stream: true, model: rawModelId }), signal },
+        { method: 'POST', body: jsonRequestBody({ ...body, stream: true, model: rawModelId }), signal },
         { extraHeaders: headers, fetcher: opts.fetcher, wrapUpstreamCall: opts.wrapUpstreamCall },
       ),
       parser,
@@ -138,62 +184,51 @@ export const createCustomProvider = (record: UpstreamRecord): Provider => {
 
   const instance: ProviderInstance = {
     getProvidedModels: async fetcher => {
-      if (!config.modelsFetch.enabled) return manualModels;
+      if (!config.modelsFetch.enabled) return projectCustomModels(record);
       const response = await fetchCustomModels(config, fetcher);
-      const fetchedPricing = new Map(
-        response.data.flatMap(model => model.pricing ? [[model.id, model.pricing] as const] : []),
-      );
-      const effectiveManualModels = manualModels.map(model => {
-        if (model.pricing !== undefined) return model;
-        const pricing = fetchedPricing.get(rawModelIdOf(model));
-        return pricing === undefined ? model : { ...model, pricing };
-      });
-      // Drop any auto-fetched model whose id is pinned by a manual
-      // override so the manual copy is the only one emitted for that id.
-      const filtered: CustomModelsResponse = { data: response.data.filter(raw => !overriddenIds.has(raw.id)) };
-      return [...effectiveManualModels, ...finalizeCustomModels(filtered, configuredEndpoints, upstreamFlags)];
+      return projectCustomModels(record, response);
     },
-    callAlphaSearch: (model, body, signal, opts) => call(customFetchAlphaSearch, model, body, signal, opts.headers, opts),
-    callCompletions: (model, body, signal, opts) => call(customFetchCompletions, model, body, signal, opts.headers, opts),
-    callChatCompletions: (model, body, signal, opts) => callStreaming(customFetchChatCompletions, model, body, signal, opts.headers, parseChatCompletionsStream, opts),
-    callResponses: async (model, body, action, signal, opts) => {
+    callAlphaSearch: (model, body, signal, opts) => call(customFetchAlphaSearch, model, body, signal, headersForCall(opts.headers), opts),
+    callOpenAICompletions: (model, body, signal, opts) => call(customFetchOpenAICompletions, model, body, signal, headersForCall(opts.headers), opts),
+    callOpenAIChatCompletions: (model, body, signal, opts) => callStreaming(customFetchOpenAIChatCompletions, model, body, signal, headersForCall(opts.headers), parseOpenAIChatCompletionsStream, opts),
+    callOpenAIResponses: async (model, body, action, signal, opts) => {
       switch (action) {
       case 'generate': {
-        const stream = await callStreaming(customFetchResponses, model, body, signal, opts.headers, parseResponsesStream, opts);
+        const stream = await callStreaming(customFetchOpenAIResponses, model, body, signal, headersForCall(opts.headers), parseOpenAIResponsesStream, opts);
         return stream.ok
           ? { action: 'generate', ok: true, events: stream.events, modelKey: stream.modelKey, ...(stream.headers ? { headers: stream.headers } : {}) }
           : { action: 'generate', ok: false, response: stream.response, modelKey: stream.modelKey };
       }
       case 'compact': {
         const rawModelId = rawModelIdOf(model);
-        const response = await customFetchResponsesCompact(
+        const response = await customFetchOpenAIResponsesCompact(
           config,
-          { method: 'POST', body: JSON.stringify({ ...toCompactPayloadShape(body), model: rawModelId }), signal },
-          { extraHeaders: opts.headers, fetcher: opts.fetcher, wrapUpstreamCall: opts.wrapUpstreamCall },
+          { method: 'POST', body: jsonRequestBody({ ...toCompactPayloadShape(body), model: rawModelId }), signal },
+          { extraHeaders: headersForCall(opts.headers), fetcher: opts.fetcher, wrapUpstreamCall: opts.wrapUpstreamCall },
         );
         return response.ok
-          ? { action: 'compact', ok: true, result: (await response.json()) as ResponsesResult, modelKey: rawModelId }
+          ? { action: 'compact', ok: true, result: (await response.json()) as OpenAIResponsesCompactionResult, modelKey: rawModelId }
           : { action: 'compact', ok: false, response, modelKey: rawModelId };
       }
       default:
         action satisfies never;
-        throw new Error(`Unhandled ResponsesAction: ${action as string}`);
+        throw new Error(`Unhandled OpenAIResponsesAction: ${action as string}`);
       }
     },
-    callMessages: (model, body, signal, opts) => callStreaming(customFetchMessages, model, body, signal, opts.headers, parseMessagesStream, opts),
-    callMessagesCountTokens: (model, body, signal, opts) => call(customFetchMessagesCountTokens, model, body, signal, opts.headers, opts),
-    callEmbeddings: (model, body, signal, opts) => call(customFetchEmbeddings, model, body, signal, opts.headers, opts),
-    callImagesGenerations: (model, body, signal, opts) => call(customFetchImagesGenerations, model, body, signal, opts.headers, opts),
-    callImagesEdits: async (model, request, signal, opts) => {
+    callAnthropicMessages: (model, body, signal, opts) => callStreaming(customFetchAnthropicMessages, model, body, signal, headersForAnthropicMessagesCall(headersForCall(opts.headers), opts.anthropicBeta), parseAnthropicMessagesStream, opts),
+    callAnthropicMessagesCountTokens: (model, body, signal, opts) => call(customFetchAnthropicMessagesCountTokens, model, body, signal, headersForAnthropicMessagesCall(headersForCall(opts.headers), opts.anthropicBeta), opts),
+    callOpenAIEmbeddings: (model, body, signal, opts) => call(customFetchOpenAIEmbeddings, model, body, signal, headersForCall(opts.headers), opts),
+    callOpenAIImagesGenerations: (model, body, signal, opts) => call(customFetchOpenAIImagesGenerations, model, body, signal, headersForCall(opts.headers), opts),
+    callOpenAIImagesEdits: async (model, request, signal, opts) => {
       const rawModelId = rawModelIdOf(model);
       const body = await serializeOpenAIImagesEditsRequest(request, rawModelId);
-      const response = await customFetchImagesEdits(config, { method: 'POST', body, signal }, { extraHeaders: opts.headers, fetcher: opts.fetcher, wrapUpstreamCall: opts.wrapUpstreamCall });
+      const response = await customFetchOpenAIImagesEdits(config, { method: 'POST', body, signal }, { extraHeaders: headersForCall(opts.headers), fetcher: opts.fetcher, wrapUpstreamCall: opts.wrapUpstreamCall });
       return { response, modelKey: rawModelId };
     },
-    callAudioTranscriptions: async (model, request, signal, opts) => {
+    callOpenAIAudioTranscriptions: async (model, request, signal, opts) => {
       const rawModelId = rawModelIdOf(model);
-      const body = serializeOpenAIAudioTranscriptionRequest(request, rawModelId);
-      const response = await customFetchAudioTranscriptions(config, { method: 'POST', body, signal }, { extraHeaders: opts.headers, fetcher: opts.fetcher, wrapUpstreamCall: opts.wrapUpstreamCall });
+      const body = serializeModelFieldOpenAIAudioTranscriptionRequest(request, rawModelId);
+      const response = await customFetchOpenAIAudioTranscriptions(config, { method: 'POST', body, signal }, { extraHeaders: headersForCall(opts.headers), fetcher: opts.fetcher, wrapUpstreamCall: opts.wrapUpstreamCall });
       return { response, modelKey: rawModelId };
     },
     callRerank: async (model, request, signal, opts) => {
@@ -204,19 +239,24 @@ export const createCustomProvider = (record: UpstreamRecord): Provider => {
       const response = await customFetchRerank(
         config,
         target.path ?? DEFAULT_RERANK_PATHS[target.protocol],
-        { method: 'POST', body: JSON.stringify(body), signal },
-        { extraHeaders: opts.headers, fetcher: opts.fetcher, wrapUpstreamCall: opts.wrapUpstreamCall },
+        { method: 'POST', body: jsonRequestBody(body), signal },
+        { extraHeaders: headersForCall(opts.headers), fetcher: opts.fetcher, wrapUpstreamCall: opts.wrapUpstreamCall },
       );
       return { response, modelKey: rawModelId, target };
     },
   };
 
   return {
-    upstream: record.id,
+    upstreamId: record.id,
     kind: 'custom',
     name: record.name,
+    // Admission only has to carry the headers whose value comes from the
+    // client. A rule with a configured value supplies its own value inside
+    // this provider, so the client's copy is neither needed nor forwarded.
+    inboundHeaderAllowlist: config.ingressHeadersRules.flatMap(rule => rule.value === null ? [rule.key] : []),
     disabledPublicModelIds: record.disabledPublicModelIds,
     modelPrefix: record.modelPrefix,
+    modelsCache: record.modelsCache,
     instance,
   };
 };

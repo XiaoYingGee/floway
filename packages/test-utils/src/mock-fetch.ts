@@ -1,5 +1,19 @@
+import { isReplayableBody, type Fetcher } from '@floway-dev/provider';
+
 type FetchInput = Parameters<typeof fetch>[0];
 type FetchInit = Parameters<typeof fetch>[1];
+
+export const testFetcher: Fetcher = (url, init) => {
+  const body = init.body;
+  if (!isReplayableBody(body)) return fetch(url, { ...init, body });
+  const headers = new Headers(init.headers);
+  headers.set('content-length', String(body.contentLength));
+  const request: RequestInit & { duplex: 'half' } = { ...init, body: body.open(), headers, duplex: 'half' };
+  return fetch(url, request);
+};
+
+export const readJsonRequest = async (init: RequestInit): Promise<unknown> =>
+  await new Response(init.body).json();
 
 // Tests share a single globalThis.fetch slot; the lock serializes overlapping
 // withMockedFetch calls in the same process so each handler sees only its own
@@ -39,10 +53,12 @@ export function jsonResponse(body: unknown, status = 200): Response {
 // default body is the OpenAI-style `[DONE]` sentinel; pass arbitrary SSE
 // text when a test cares about the upstream's emitted frames. The provider
 // rejects 200 responses that are not text/event-stream as a contract
-// violation, so streaming-endpoint stubs must use this helper.
-export function sseResponse(body = 'data: [DONE]\n\n', status = 200): Response {
+// violation, so streaming-endpoint stubs must use this helper. `extraHeaders`
+// carries the response metadata a provider reads alongside the stream, such as
+// Copilot's `x-quota-snapshot-*`.
+export function sseResponse(body = 'data: [DONE]\n\n', status = 200, extraHeaders: Record<string, string> = {}): Response {
   return new Response(body, {
     status,
-    headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    headers: { 'content-type': 'text/event-stream; charset=utf-8', ...extraHeaders },
   });
 }

@@ -7,9 +7,10 @@
 // the executing shell, and the fixed installer body reads it from there.
 
 import type { AgentSetupConfiguration } from './configuration.ts';
+import type { ScriptAgent } from './script-assets.ts';
 
 export interface RenderPrefixInput {
-  agent: 'claude' | 'codex';
+  agent: ScriptAgent;
   apiKey: string;
   apiKeyName: string;
   configuration: AgentSetupConfiguration;
@@ -53,12 +54,15 @@ export const renderShellPrefix = (input: RenderPrefixInput): string => {
     const { claudeCode } = configuration;
     assignments.push(
       ['SETUP_CLAUDE_MODEL', shellOptional(claudeCode.model)],
+      ['SETUP_CLAUDE_DEFAULT_FABLE_MODEL', shellOptional(claudeCode.defaultFableModel)],
       ['SETUP_CLAUDE_DEFAULT_OPUS_MODEL', shellOptional(claudeCode.defaultOpusModel)],
       ['SETUP_CLAUDE_DEFAULT_SONNET_MODEL', shellOptional(claudeCode.defaultSonnetModel)],
       ['SETUP_CLAUDE_DEFAULT_HAIKU_MODEL', shellOptional(claudeCode.defaultHaikuModel)],
       ['SETUP_CLAUDE_EFFORT_LEVEL', shellOptional(claudeCode.effortLevel)],
       ['SETUP_CLAUDE_CLEANUP_PERIOD_DAYS', shellOptionalNumber(claudeCode.cleanupPeriodDays)],
       ['SETUP_CLAUDE_OPT_OUT_AI_ATTRIBUTION', shellFlag(claudeCode.optOutAiAttribution)],
+      ['SETUP_CLAUDE_DISABLE_AUTO_MEMORY', shellFlag(claudeCode.disableAutoMemory)],
+      ['SETUP_CLAUDE_DISABLE_AGENT_VIEW', shellFlag(claudeCode.disableAgentView)],
       ['SETUP_CLAUDE_MODEL_DISCOVERY', shellFlag(claudeCode.modelDiscovery)],
     );
   } else {
@@ -96,12 +100,15 @@ export const renderPowerShellPrefix = (input: RenderPrefixInput): string => {
     const { claudeCode } = configuration;
     assignments.push(
       ['$SetupClaudeModel', powerShellOptional(claudeCode.model)],
+      ['$SetupClaudeDefaultFableModel', powerShellOptional(claudeCode.defaultFableModel)],
       ['$SetupClaudeDefaultOpusModel', powerShellOptional(claudeCode.defaultOpusModel)],
       ['$SetupClaudeDefaultSonnetModel', powerShellOptional(claudeCode.defaultSonnetModel)],
       ['$SetupClaudeDefaultHaikuModel', powerShellOptional(claudeCode.defaultHaikuModel)],
       ['$SetupClaudeEffortLevel', powerShellOptional(claudeCode.effortLevel)],
       ['$SetupClaudeCleanupPeriodDays', powerShellOptionalNumber(claudeCode.cleanupPeriodDays)],
       ['$SetupClaudeOptOutAiAttribution', powerShellBool(claudeCode.optOutAiAttribution)],
+      ['$SetupClaudeDisableAutoMemory', powerShellBool(claudeCode.disableAutoMemory)],
+      ['$SetupClaudeDisableAgentView', powerShellBool(claudeCode.disableAgentView)],
       ['$SetupClaudeModelDiscovery', powerShellBool(claudeCode.modelDiscovery)],
     );
   } else {

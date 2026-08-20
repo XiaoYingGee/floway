@@ -6,12 +6,12 @@ then routes each model through the API shape the client already speaks.
 
 ## Highlights
 
-- Use GitHub Copilot, ChatGPT subscriptions, Claude.ai subscriptions, Azure
-  OpenAI, custom OpenAI- or Anthropic-compatible providers, and Ollama from one
-  deployment.
+- Use GitHub Copilot, ChatGPT subscriptions, Claude.ai subscriptions, Azure AI,
+  configurable multi-protocol HTTP providers, and Ollama from one deployment.
 - Serve OpenAI, Anthropic, Gemini-compatible, audio transcription, and rerank
-  APIs with
-  cross-protocol translation where needed.
+  APIs with cross-protocol translation where needed.
+- Discover vendor model catalogs live while retaining manual model configuration
+  for providers that require or permit it.
 - Manage upstreams, routing order, model aliases, API keys, and web search from
   a dashboard.
 - Generate one-command Claude Code and Codex configurations from an API key.
@@ -31,13 +31,19 @@ ADMIN_KEY='replace-with-a-secret' docker compose -f docker/docker-compose.yml up
 Open <http://localhost:18088>, leave the username blank, and use `ADMIN_KEY` as
 the password. Then:
 
-1. Add at least one provider under **Settings → Upstreams**.
-2. Create a key under **API Keys**.
+1. Add at least one provider under **Providers → Upstreams**.
+2. Create a key under **Services → API Keys**.
 3. Give that key to a client as a bearer token or `x-api-key`, or use **Agent
    Setup** to configure Claude Code or Codex.
 
-The gateway API is also exposed directly at <http://localhost:8788>. SQLite and
-uploaded files persist in the `floway-data` volume.
+The data-plane and control-plane APIs are also exposed directly at
+<http://localhost:8788>. SQLite, file-backed dump bodies, and oversized
+Stateful OpenAI Responses item payloads persist in the `floway-data` volume.
+
+The dashboard uses Floway's control plane to manage users, keys, upstreams,
+routing, and telemetry. Coding agents and API clients call the data plane,
+which performs model resolution, upstream dispatch, and any required protocol
+translation. Both planes are served by the same gateway process.
 
 ## Compatibility
 
@@ -51,13 +57,17 @@ uploaded files persist in the `floway-data` volume.
 | OpenAI Embeddings | `POST /v1/embeddings` |
 | OpenAI Images | `POST /v1/images/generations`, `POST /v1/images/edits` |
 | OpenAI Audio Transcriptions | `POST /v1/audio/transcriptions` |
-| OpenAI Models | `GET /v1/models` |
+| OpenAI Models | `GET /v1/models`, `GET /models` |
 | Anthropic Messages | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
-| Google Gemini | `POST /v1beta/models/...` |
+| Google Gemini | `GET /v1beta/models`, `GET /v1beta/models/{model}`, `POST /v1beta/models/{model}:generateContent`, `POST /v1beta/models/{model}:streamGenerateContent`, `POST /v1beta/models/{model}:countTokens` |
 | Cohere Rerank v1 | `POST /v1/rerank` |
 | Cohere Rerank v2 | `POST /v2/rerank` |
 | Jina Rerank | `POST /jina/v1/rerank` |
 | Voyage Rerank | `POST /voyage/v1/rerank` |
+
+`/v1/models` and `/models` return Floway's public model superset to ordinary
+callers and select the Codex or Claude Code discovery shape for those clients'
+User-Agent.
 
 Rerank models are manual Custom models. Each model selects its outbound Cohere,
 Jina, Voyage, DashScope-compatible, or DashScope-native protocol and may
@@ -69,14 +79,14 @@ responses retain their upstream wire shape.
 
 ### Upstreams
 
-| Provider | Authentication |
-| --- | --- |
-| GitHub Copilot | GitHub device OAuth |
-| Codex | ChatGPT subscription through the Codex CLI OAuth client |
-| Claude Code | Claude.ai Pro or Max subscription through the Claude Code CLI OAuth client |
-| Custom | OpenAI- or Anthropic-compatible endpoint and credential |
-| Azure | Azure OpenAI endpoint, API key, and deployments |
-| Ollama | ollama.com or a self-hosted Ollama-compatible server |
+| Provider | Connection | Model catalog |
+| --- | --- | --- |
+| GitHub Copilot | GitHub device OAuth on `github.com` or a `*.ghe.com` tenant | Fetched live from Copilot |
+| Codex | ChatGPT subscription through the Codex CLI OAuth client | Live inference catalog plus the account's built-in GPT Image capability |
+| Claude Code | Claude.ai Pro, Max, Team, or Enterprise subscription through the Claude Code CLI OAuth client | Fetched live from Anthropic |
+| Custom | Configurable multi-protocol HTTP endpoint, credential, and per-header ingress passthrough/overwrite rules | Live `/models` (OpenAI, Anthropic, or superset shapes), manual models, or both |
+| Azure | Azure AI resource or Foundry project endpoint and API key | Configured models |
+| Ollama | ollama.com or a self-hosted Ollama-compatible server | Fetched live from Ollama, with optional manual overrides |
 
 ## Other Deployment Options
 
@@ -95,8 +105,14 @@ pnpm run db:migrate
 pnpm run dev
 ```
 
-The local dashboard runs at <http://localhost:5174>. For production, configure
-the admin secret, apply the remote migrations, and deploy:
+The local dashboard runs at <http://localhost:5174>. For an agent-assisted
+production deployment, invoke `$deploy-to-cloudflare`. It uses the established
+update and rollback flow by default. A deployment named as new first runs an
+isolated binding-probe bootstrap and requires its `Hello World` response before
+publishing Floway.
+
+For a manual production update, configure the admin secret, apply the remote
+migrations, and deploy:
 
 ```bash
 pnpm wrangler secret put ADMIN_KEY
@@ -114,8 +130,8 @@ pnpm install
 ADMIN_KEY='replace-with-a-secret' pnpm run dev:node
 ```
 
-It serves the gateway and control-plane APIs but not the dashboard. Use Docker
-Compose for the complete self-hosted UI, or serve the web app separately.
+It serves the data-plane and control-plane APIs but not the dashboard. Use
+Docker Compose for the complete self-hosted UI, or serve the web app separately.
 Production Node.js deployments must set both `NODE_ENV=production` and a
 non-empty `ADMIN_KEY`.
 
@@ -127,13 +143,20 @@ Podman users can instead follow the
 ```bash
 pnpm install
 pnpm run dev
-pnpm run test
-pnpm run lint
-pnpm run typecheck
+pnpm run verify
 ```
 
-More detail lives in [AGENTS.md](./AGENTS.md) — architecture, workspace
-layout, verification, and contributor rules.
+`verify` chains every check `.github/workflows/verify.yaml` runs, so a green run
+locally is a green run on a pull request. Each link is also a script of its own,
+in the order the chain runs them: `typegen`, `lint`, `typecheck`, `test`,
+`test:installers`, `check:agents-md`, `check:generated-assets`,
+`check:verify-parity`, and `build:web`, which carries the assertions about the
+emitted bundle. `typegen` comes first because the generated route types are not
+checked in and the lint configuration is type-aware, so a fresh clone has to
+produce them before anything else can read the dashboard's sources.
+
+[AGENTS.md](./AGENTS.md) defines the repository-wide agent requirements and
+indexes its CI workflows, skills, workspace packages, and their responsibilities.
 
 ## License
 

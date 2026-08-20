@@ -1,5 +1,6 @@
 import { formatHostForUri } from './bytes.ts';
 import { DEFAULT_DIAL_DEADLINE_MS } from './constants.ts';
+import { connectOrDialError } from './dial-target.ts';
 import { ProxyDialError } from './errors.ts';
 import { dialHttpConnect } from './protocols/http-connect.ts';
 import { dialReality } from './protocols/reality.ts';
@@ -9,7 +10,7 @@ import { dialSocks5 } from './protocols/socks5.ts';
 import { dialTrojan } from './protocols/trojan.ts';
 import { dialVlessTcpTls, dialVlessWsTls } from './protocols/vless.ts';
 import type { ProxyConfig } from './proxy-config.ts';
-import { connectOrDialError, type DialedSocket, type DialOptions, type DialResult, type DialTarget, type ProxyRequestTarget } from './types.ts';
+import type { DialedSocket, DialOptions, DialResult, DialTarget, ProxyRequestTarget } from './types.ts';
 import { fetchOnStream, signalAbortReason, userspaceTls, type DuplexStream, type HttpRequest, type TlsStream } from '@floway-dev/http';
 
 /**
@@ -149,7 +150,7 @@ export const runDirectConnectRequest = async (
 
   try {
     const response = await runRequestOnStream(socket, target, request, options);
-    return closeSocketWithResponse(response, socket);
+    return closeSocketWithResponse(response, socket, options.signal);
   } catch (error) {
     await socket.close().catch(() => {});
     throw error;
@@ -189,10 +190,7 @@ const runRequestOnStream = async (
     } else {
       fetchPrefix = dialed.prefix;
     }
-    let hasHost = false;
-    for (const k of Object.keys(request.headers)) {
-      if (k.toLowerCase() === 'host') { hasHost = true; break; }
-    }
+    const hasHost = request.headers.some(([name]) => name.toLowerCase() === 'host');
     let headers = request.headers;
     if (!hasHost) {
       // RFC 9110 §7.2: Host = uri-host [ ":" port ]. Omit the port only when
@@ -202,7 +200,7 @@ const runRequestOnStream = async (
       const hostUriPart = formatHostForUri(target.host);
       const defaultPort = target.tls ? 443 : 80;
       const hostValue = target.port === defaultPort ? hostUriPart : `${hostUriPart}:${target.port}`;
-      headers = { ...headers, Host: hostValue };
+      headers = [['Host', hostValue], ...headers];
     }
     return await fetchOnStream(stream, { ...request, headers }, fetchPrefix);
   } catch (err) {
@@ -218,12 +216,27 @@ const runRequestOnStream = async (
   }
 };
 
-const closeSocketWithResponse = (response: Response, socket: DialedSocket): Response => {
+const closeSocketWithResponse = (response: Response, socket: DialedSocket, signal?: AbortSignal): Response => {
   let closePromise: Promise<void> | null = null;
   const close = (): Promise<void> => {
     closePromise ??= socket.close().catch(() => {});
+    if (signal !== undefined) signal.removeEventListener('abort', onAbort);
     return closePromise;
   };
+  const onAbort = (): void => { void close(); };
+
+  // Reading the body to its end and cancelling it are the ordinary teardown
+  // paths, and both of them require someone to still be holding the body. An
+  // abort raised after the dial resolved has no other way to reach this
+  // socket: the dial-stage listener is detached once `withDialDeadline`
+  // returns, and the runtime's own `signal` support on connect() covers the
+  // handshake only.
+  if (signal !== undefined) {
+    signal.addEventListener('abort', onAbort, { once: true });
+    // addEventListener on an already-aborted signal never fires, so an abort
+    // that landed while the request was in flight would otherwise be lost.
+    if (signal.aborted) void close();
+  }
 
   if (response.body === null) {
     void close();

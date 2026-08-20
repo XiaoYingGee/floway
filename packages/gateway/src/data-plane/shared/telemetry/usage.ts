@@ -2,13 +2,11 @@ import { currentHour } from './hour.ts';
 import { getRepo } from '../../../repo/index.ts';
 import type { TokenUsage, UsageQuantities } from '../../../repo/types.ts';
 import { tokenUsageQuantities, usageMetrics } from '../../../repo/usage-metrics.ts';
-import { canonicalDecimalString, priceRequest, type PricingRuntimeFacts } from '@floway-dev/protocols/common';
+import { priceRequest, type BillableUsage, type PricingRuntimeFacts } from '@floway-dev/protocols/common';
 import type { TelemetryModelIdentity } from '@floway-dev/provider';
 
 const TOKEN_USAGE_KEYS = ['input', 'input_cache_read', 'input_cache_write', 'input_cache_write_1h', 'input_image', 'output', 'output_image'] as const satisfies readonly Exclude<keyof TokenUsage, 'tier'>[];
 const INPUT_TOKEN_USAGE_KEYS = ['input', 'input_cache_read', 'input_cache_write', 'input_cache_write_1h', 'input_image'] as const satisfies readonly Exclude<keyof TokenUsage, 'tier'>[];
-
-export const hasTokenUsage = (usage: TokenUsage): boolean => TOKEN_USAGE_KEYS.some(key => (usage[key] ?? 0) > 0);
 
 // Drop zero / undefined token categories so a usage map only carries the metrics
 // actually billed. `tier` (a non-numeric service-tier marker) survives the
@@ -25,7 +23,7 @@ export const tokenUsage = (counts: TokenUsage): TokenUsage => {
 
 // Cache-read / cache-write token counts pulled from an OpenAI-shaped `usage`
 // block. The field name and nesting depth vary by upstream; this helper
-// hides the variants so the per-API extractors (chat-completions, completions)
+// hides the variants so the per-API extractors (openai-chat-completions, openai-completions)
 // see a single normalized pair regardless of which provider answered.
 //
 // Cache-read candidates, in order of preference:
@@ -39,7 +37,7 @@ export const tokenUsage = (counts: TokenUsage): TokenUsage => {
 //
 // Cache-write candidates, in order of preference:
 //   - `prompt_tokens_details.cache_creation_input_tokens` — the Anthropic
-//     messages → chat-completions translation pair forwards the native
+//     messages → openai-chat-completions translation pair forwards the native
 //     Anthropic field name under OpenAI's wrapper.
 //   - `prompt_tokens_details.cache_write_tokens`           — OpenRouter
 //     (Anthropic / Gemini-explicit / Alibaba-routed).
@@ -80,12 +78,91 @@ const firstNumber = (candidates: readonly unknown[]): number => {
   return 0;
 };
 
-export const tokenUsageFromEmbeddingsBody = (body: unknown): TokenUsage | null => {
-  if (!body || typeof body !== 'object') return null;
-  const { usage } = body as { usage?: unknown };
-  if (!usage || typeof usage !== 'object') return null;
-  const promptTokens = (usage as { prompt_tokens?: unknown }).prompt_tokens;
-  return typeof promptTokens === 'number' ? tokenUsage({ input: promptTokens }) : null;
+// Which convention the upstream's own `total_tokens` corroborates, or null
+// when the totals cannot separate the two.
+//
+// OpenAI counts the cache buckets inside the input total; Anthropic counts
+// them alongside it, and a gateway projecting an Anthropic-shaped upstream
+// onto an OpenAI-shaped wire can carry that convention across. `total_tokens`
+// is the one field that witnesses which one the rest of the payload was
+// computed under, because only one of the two sums can reach it: with a
+// non-zero cache count the inclusive sum and the exclusive sum differ by
+// exactly that count, so at most one matches. With no cache count the two
+// conventions coincide and there is nothing to decide.
+//
+// This is a statement about one response, not a classification of the
+// upstream. That is enough, because the two conventions agree on every
+// response where the verdict is unavailable.
+export type CachedTokenConvention = 'inclusive' | 'exclusive';
+
+export const cachedTokenConventionFromTotals = (counts: {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly totalTokens: number | undefined;
+  readonly cacheRead: number;
+  readonly cacheWrite: number;
+}): CachedTokenConvention | null => {
+  const { inputTokens, outputTokens, totalTokens, cacheRead, cacheWrite } = counts;
+  const cached = cacheRead + cacheWrite;
+  if (totalTokens === undefined || cached === 0) return null;
+  const inclusive = inputTokens + outputTokens === totalTokens;
+  const exclusive = inputTokens + cached + outputTokens === totalTokens;
+  // Neither sum reaching the total means the upstream computes it on some
+  // third basis and witnesses nothing.
+  if (inclusive === exclusive) return null;
+  return inclusive ? 'inclusive' : 'exclusive';
+};
+
+export interface CachedTokenCounts {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly totalTokens: number | undefined;
+  readonly cacheRead: number;
+  readonly cacheWrite: number;
+}
+
+// Decides whether to fold the cache buckets back into the input total.
+//
+// Positive evidence folds on its own: a response whose totals witness the
+// exclusive convention is repaired whether or not anyone flagged the upstream,
+// because the alternative is either a torn stream or an input count silently
+// short by the cached prefix. The flag is what settles the responses whose
+// totals witness nothing — an upstream that omits `total_tokens` or computes
+// it on some third basis.
+//
+// The two remaining states are both errors, and neither may pass silently.
+// Evidence that contradicts the declaration means the flag is set on an
+// upstream that does not want it, and folding there over-charges the operator
+// for cached input at the full input rate. A cache count larger than the input
+// total with nothing to explain it underflows the split downstream regardless;
+// raising it here names the flag, which the underflow at the split cannot do
+// without the gateway's flag vocabulary leaking into `protocols`.
+//
+// An upstream that reported the input total exclusively AND recomputed
+// `total_tokens` to match it would read as inclusive here and raise even
+// though the flag is right for it. No such upstream has been observed: the two
+// producers of the exclusive shape both leave a total that witnesses it —
+// Portkey sums all four buckets
+// (https://github.com/Portkey-AI/gateway/blob/669825cbe89ee51569918b8f78a9db486fd69dd4/src/providers/anthropic/chatComplete.ts#L612-L627),
+// and Charm Hyper passes the upstream's own total through untouched. Should
+// one appear, it announces itself as this error rather than as a wrong bill.
+export const foldsExclusiveCacheTokens = (
+  declaredExclusive: boolean,
+  counts: CachedTokenCounts,
+  identity: string,
+): boolean => {
+  const verdict = cachedTokenConventionFromTotals(counts);
+  const cached = counts.cacheRead + counts.cacheWrite;
+  const figures = `${identity}: input=${counts.inputTokens} cached=${cached} output=${counts.outputTokens} total=${counts.totalTokens ?? 'absent'}`;
+
+  if (declaredExclusive && verdict === 'inclusive') {
+    throw new RangeError(`usage-exclusive-cached-tokens is enabled, but total_tokens says this upstream already counts the cache buckets inside the input total; folding would over-charge input by ${cached} tokens — turn the flag off for ${figures}`);
+  }
+  if (declaredExclusive || verdict === 'exclusive') return true;
+  if (cached > counts.inputTokens) {
+    throw new RangeError(`cache counts exceed the input total and total_tokens does not say the cache buckets are reported outside it; if they are, enable usage-exclusive-cached-tokens for ${figures}`);
+  }
+  return false;
 };
 
 export interface UsageMeasurement {
@@ -112,91 +189,6 @@ export const tokenUsageMeasurement = (usage: TokenUsage | null): UsageMeasuremen
   };
 };
 
-// OpenAI transcription responses discriminate usage by `type`. Token-based
-// models split input_token_details into text and audio metrics; without that
-// optional split, the aggregate stays on the general input metric. Duration-
-// based usage exposes seconds, while Whisper verbose JSON reports the same
-// quantity as a top-level `duration`. Unknown breakdowns record the request
-// only, while malformed fields under a known discriminator remain observable.
-// https://github.com/openai/openai-openapi/blob/db3e53198a66732cfe161339ea63bf36fc0137ad/openapi.yaml#L36378-L36562
-const audioDurationMeasurement = (seconds: unknown, label: string): UsageMeasurement => {
-  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) {
-    throw new Error(`Audio transcription ${label} must be a finite non-negative number`);
-  }
-  return {
-    quantities: { input_audio_seconds: canonicalDecimalString(String(seconds)) },
-    pricingFacts: {},
-    dumpTokenUsage: null,
-  };
-};
-
-export const audioTranscriptionUsageMeasurement = (body: unknown): UsageMeasurement => {
-  if (!body || typeof body !== 'object') return requestOnlyUsageMeasurement();
-  if (!Object.hasOwn(body, 'usage')) {
-    if (!Object.hasOwn(body, 'duration')) return requestOnlyUsageMeasurement();
-    return audioDurationMeasurement((body as { duration: unknown }).duration, 'duration');
-  }
-  const usage = (body as { usage: unknown }).usage;
-  if (!usage || typeof usage !== 'object' || Array.isArray(usage)) {
-    throw new Error('Audio transcription usage must be an object');
-  }
-  const metric = usage as { type?: unknown; seconds?: unknown; input_tokens?: unknown; input_token_details?: unknown; output_tokens?: unknown; total_tokens?: unknown };
-
-  if (metric.type === 'duration') {
-    return audioDurationMeasurement(metric.seconds, 'duration usage.seconds');
-  }
-
-  if (metric.type !== 'tokens') return requestOnlyUsageMeasurement();
-  for (const [field, value] of [
-    ['input_tokens', metric.input_tokens],
-    ['output_tokens', metric.output_tokens],
-    ['total_tokens', metric.total_tokens],
-  ] as const) {
-    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
-      throw new Error(`Audio transcription token usage.${field} must be a non-negative safe integer`);
-    }
-  }
-  const inputTokens = metric.input_tokens as number;
-  const outputTokens = metric.output_tokens as number;
-  const totalTokens = metric.total_tokens as number;
-  if (totalTokens !== inputTokens + outputTokens) {
-    throw new Error('Audio transcription token usage.total_tokens must equal input_tokens plus output_tokens');
-  }
-
-  let inputQuantities: UsageQuantities = { input_tokens: canonicalDecimalString(String(inputTokens)) };
-  if (metric.input_token_details !== undefined) {
-    if (!metric.input_token_details || typeof metric.input_token_details !== 'object' || Array.isArray(metric.input_token_details)) {
-      throw new Error('Audio transcription token usage.input_token_details must be an object');
-    }
-    const details = metric.input_token_details as { text_tokens?: unknown; audio_tokens?: unknown };
-    for (const [field, value] of [
-      ['text_tokens', details.text_tokens],
-      ['audio_tokens', details.audio_tokens],
-    ] as const) {
-      if (value !== undefined && (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0)) {
-        throw new Error(`Audio transcription token usage.input_token_details.${field} must be a non-negative safe integer`);
-      }
-    }
-    const textTokens = details.text_tokens as number | undefined;
-    const audioTokens = details.audio_tokens as number | undefined;
-    if ((textTokens ?? 0) + (audioTokens ?? 0) > inputTokens) {
-      throw new Error('Audio transcription token usage.input_token_details must not exceed input_tokens');
-    }
-    inputQuantities = {
-      input_tokens: canonicalDecimalString(String(inputTokens - (audioTokens ?? 0))),
-      ...(audioTokens === undefined ? {} : { input_audio_tokens: canonicalDecimalString(String(audioTokens)) }),
-    };
-  }
-  return {
-    quantities: {
-      ...inputQuantities,
-      output_tokens: canonicalDecimalString(String(outputTokens)),
-    },
-    pricingFacts: { inputTokens },
-    dumpTokenUsage: tokenUsage({ input: inputTokens, output: outputTokens }),
-  };
-};
-
 // OpenAI Images responses report usage as
 // `{input_tokens, output_tokens, total_tokens, input_tokens_details, output_tokens_details}`,
 // where the details objects split each total into `text_tokens` and
@@ -208,7 +200,7 @@ export const audioTranscriptionUsageMeasurement = (body: unknown): UsageMeasurem
 // charged on the bare metric rather than inventing a split. A present field
 // that is a non-number is treated as a malformed upstream payload (return
 // null) rather than silently coerced.
-export const tokenUsageFromImagesBody = (body: unknown): TokenUsage | null => {
+export const tokenUsageFromOpenAIImagesBody = (body: unknown): TokenUsage | null => {
   if (!body || typeof body !== 'object') return null;
   const { usage } = body as { usage?: unknown };
   if (!usage || typeof usage !== 'object') return null;
@@ -234,20 +226,20 @@ interface ImagesUsageShape {
 }
 
 const splitModalityCounts = (
-  textDimension: Exclude<keyof TokenUsage, 'tier'>,
-  imageDimension: Exclude<keyof TokenUsage, 'tier'>,
+  textUsageKey: Exclude<keyof TokenUsage, 'tier'>,
+  imageUsageKey: Exclude<keyof TokenUsage, 'tier'>,
   total: number | undefined,
   details: unknown,
 ): TokenUsage | null => {
   if (total === undefined) return {};
-  if (details === undefined) return { [textDimension]: total };
+  if (details === undefined) return { [textUsageKey]: total };
   if (!details || typeof details !== 'object') return null;
   const { text_tokens: text, image_tokens: image } = details as { text_tokens?: unknown; image_tokens?: unknown };
   if (text !== undefined && typeof text !== 'number') return null;
   if (image !== undefined && typeof image !== 'number') return null;
   // A details object that carries neither split is as good as absent.
-  if (text === undefined && image === undefined) return { [textDimension]: total };
-  return { [textDimension]: text ?? 0, [imageDimension]: image ?? 0 };
+  if (text === undefined && image === undefined) return { [textUsageKey]: total };
+  return { [textUsageKey]: text ?? 0, [imageUsageKey]: image ?? 0 };
 };
 
 export const recordUsage = async (
@@ -277,3 +269,16 @@ export const recordTokenUsage = async (keyId: string, modelIdentity: TelemetryMo
   const measurement = tokenUsageMeasurement(usage);
   await recordUsage(keyId, modelIdentity, measurement.quantities, measurement.pricingFacts);
 };
+
+// `BillableUsage` is already the canonical exclusive/split shape, so pricing is
+// a rename rather than a computation. It is the sole input: the usage Floway
+// sends the client is a wire projection and is never read here.
+export const tokenUsageFromBillableUsage = (billable: BillableUsage | undefined): TokenUsage | null =>
+  billable === undefined ? null : tokenUsage({
+    input: billable.input,
+    input_cache_read: billable.cacheRead,
+    input_cache_write: billable.cacheWrite,
+    input_cache_write_1h: billable.cacheWrite1h,
+    output: billable.output,
+    ...(billable.tier !== undefined ? { tier: billable.tier } : {}),
+  });

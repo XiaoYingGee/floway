@@ -20,8 +20,8 @@ import { z } from 'zod';
 import { normalizeDisabledPublicModelIds } from '../repo/disabled-public-models.ts';
 import { CUSTOM_API_KEY_MAX_LENGTH, KEY_SOURCES } from '../shared/api-key-tokens.ts';
 import { RETENTION_MAX_SECONDS, SECONDS_PER_DAY } from '../shared/retention.ts';
-import { kindForEndpoints, MODEL_KINDS, parseNonNegativeDecimalString, RERANK_PROTOCOLS } from '@floway-dev/protocols/common';
-import { type FlagOverrides, MODEL_PREFIX_MAX_LENGTH, MODEL_PREFIX_REGEX, normalizeUpstreamColor, parseFlagOverridesWire } from '@floway-dev/provider';
+import { kindForEndpoints, MODEL_KINDS, parseNonNegativeDecimalString, RERANK_PROTOCOLS, tokenUsageUnattributedUserId } from '@floway-dev/protocols/common';
+import { type FlagOverrides, MODEL_PREFIX_MAX_LENGTH, MODEL_PREFIX_REGEX, parseFlagOverridesWire, UPSTREAM_HUE_DEGREES } from '@floway-dev/provider';
 
 // --- shared atoms ---
 
@@ -48,14 +48,14 @@ const disabledPublicModelIdsSchema = z.array(z.string()).transform(normalizeDisa
 // One concept, all endpoints — the runtime validators enforce presence/emptiness
 // rules.
 const modelEndpointsSchema = z.object({
-  completions: z.object({}).optional(),
-  chatCompletions: z.object({}).optional(),
-  responses: z.object({}).optional(),
-  messages: z.object({}).optional(),
-  embeddings: z.object({}).optional(),
-  imagesGenerations: z.object({}).optional(),
-  imagesEdits: z.object({}).optional(),
-  audioTranscriptions: z.object({}).optional(),
+  openaiCompletions: z.object({}).optional(),
+  openaiChatCompletions: z.object({}).optional(),
+  openaiResponses: z.object({}).optional(),
+  anthropicMessages: z.object({}).optional(),
+  openaiEmbeddings: z.object({}).optional(),
+  openaiImagesGenerations: z.object({}).optional(),
+  openaiImagesEdits: z.object({}).optional(),
+  openaiAudioTranscriptions: z.object({}).optional(),
   rerank: z.object({}).optional(),
 });
 
@@ -138,8 +138,8 @@ const limitsSchema = z.object({
 });
 
 // Mirrors the runtime UpstreamModelConfig in @floway-dev/provider.
-// Azure and custom upstreams share this per-model entry; the canonical
-// per-model endpoint validation lives in the runtime validator.
+// Azure, custom, and ollama upstreams share this per-model entry; the
+// canonical per-model endpoint validation lives in the runtime validator.
 const upstreamModelSchema = z.object({
   upstreamModelId: z.string().min(1),
   publicModelId: z.string().optional(),
@@ -182,6 +182,10 @@ const customConfigSchema = z.object({
   // PATCH passes `null` to explicitly clear pathOverrides; nullable() keeps
   // that escape hatch.
   pathOverrides: z.record(z.string(), z.string()).nullable().optional(),
+  ingressHeadersRules: z.array(z.object({
+    key: z.string(),
+    value: z.string().nullable(),
+  }).strict()),
   // Live upstream /models fetch. `endpoint` parsing happens in the runtime.
   modelsFetch: z.object({ enabled: z.boolean(), endpoint: z.string().optional() }).optional(),
   // Statically configured per-model overrides merged with the live fetch.
@@ -202,6 +206,9 @@ const ollamaConfigSchema = z.object({
   // Optional: required against ollama.com, typically absent for a private
   // daemon. PATCH passes `null` to explicitly clear it.
   apiKey: z.string().nullable().optional(),
+  // Whether this upstream is an Ollama Cloud account whose usage windows the
+  // gateway reads; see the provider config for why a base URL cannot answer it.
+  cloudUsage: z.boolean().optional(),
   models: z.array(upstreamModelSchema).optional(),
 }).refine(config => config.models?.every(model => model.kind !== 'rerank') !== false, {
   message: 'rerank models require a custom upstream',
@@ -265,8 +272,8 @@ export const changeOwnPasswordBody = z.object({
 // rather than letting them through as de-facto "never expire".
 const dumpRetentionSecondsSchema = z.number().int().positive().max(RETENTION_MAX_SECONDS).nullable();
 // Keep the wire/storage unit aligned with dump retention while requiring the
-// dashboard's whole-day Responses contract at every control-plane boundary.
-const responsesRetentionSecondsSchema = z.union([
+// dashboard's whole-day OpenAI Responses contract at every control-plane boundary.
+const openaiResponsesRetentionSecondsSchema = z.union([
   z.literal(0),
   z.number().int().min(SECONDS_PER_DAY).max(RETENTION_MAX_SECONDS).multipleOf(SECONDS_PER_DAY),
 ]);
@@ -285,7 +292,7 @@ export const createKeyBody = z.object({
   name: z.string().min(1),
   upstream_ids: upstreamIdsValueSchema.optional(),
   dump_retention_seconds: dumpRetentionSecondsSchema.optional(),
-  responses_retention_seconds: responsesRetentionSecondsSchema.optional(),
+  responses_retention_seconds: openaiResponsesRetentionSecondsSchema.optional(),
   ...keySourceShape,
 });
 
@@ -295,7 +302,7 @@ export const updateKeyBody = z.object({
   name: z.string().min(1).optional(),
   upstream_ids: upstreamIdsValueSchema.optional(),
   dump_retention_seconds: dumpRetentionSecondsSchema.optional(),
-  responses_retention_seconds: responsesRetentionSecondsSchema.optional(),
+  responses_retention_seconds: openaiResponsesRetentionSecondsSchema.optional(),
 });
 
 // --- upstreams ---
@@ -326,21 +333,10 @@ const modelPrefixSchema = z.object({
   listed: z.array(addressableFormSchema),
 }).nullable();
 
-// Per-upstream badge color override. `null` inherits the frontend's kind
-// default. Delegates parsing entirely to `normalizeUpstreamColor` so the
-// wire accept-rules stay in one place (`@floway-dev/provider/model`);
-// widening / narrowing the accepted forms — new preset, alpha hex, etc.
-// — is a one-file change. The transform surfaces the normalizer's throw
-// as a Zod issue so the client-side error shape stays consistent with
-// the sibling flagOverridesSchema.
-const upstreamColorSchema = z.unknown().transform((value, ctx) => {
-  try {
-    return normalizeUpstreamColor(value);
-  } catch (e) {
-    ctx.issues.push({ code: 'custom', message: e instanceof Error ? e.message : String(e), input: value });
-    return z.NEVER;
-  }
-});
+// The badge hue, an OKLCH hue angle. Half-open at the top because 360° and 0°
+// are the same angle and storing both would let two rows carry one hue under
+// two names.
+const upstreamHueSchema = z.number().int().min(0).max(UPSTREAM_HUE_DEGREES - 1);
 
 const upstreamBaseFields = {
   name: z.string().min(1),
@@ -350,7 +346,7 @@ const upstreamBaseFields = {
   disabled_public_model_ids: disabledPublicModelIdsSchema.optional(),
   proxy_fallback_list: proxyFallbackListSchema.optional(),
   model_prefix: modelPrefixSchema.optional(),
-  color: upstreamColorSchema.optional(),
+  hue: upstreamHueSchema,
 };
 
 // Create accepts a discriminated union on `kind` for per-provider config
@@ -389,7 +385,7 @@ export const updateUpstreamBody = z.object({
   disabled_public_model_ids: disabledPublicModelIdsSchema.optional(),
   proxy_fallback_list: proxyFallbackListSchema.optional(),
   model_prefix: modelPrefixSchema.optional(),
-  color: upstreamColorSchema.optional(),
+  hue: upstreamHueSchema.optional(),
   // Patches only carry field diffs, not per-kind shape validation — the
   // handler dispatches on the existing row's kind and enforces the shape
   // there (Copilot/Codex/Claude Code reject a config patch outright, since
@@ -418,7 +414,9 @@ export const upstreamRecordEnvelope = z.object({
 // beyond `record` (refresh, probe, quota, list-models) shares this shape.
 const recordOnlyBody = z.object({ record: upstreamRecordEnvelope });
 
-export const copilotOauthDeviceLoginPollBody = z.object({
+export const copilotOAuthDeviceLoginStartBody = recordOnlyBody;
+
+export const copilotOAuthDeviceLoginPollBody = z.object({
   record: upstreamRecordEnvelope,
   deviceCode: z.string().min(1),
 });
@@ -433,13 +431,13 @@ export const copilotQuotaBody = recordOnlyBody;
 // them into the upstream's authorize URL. The server never sees the
 // verifier until the callback comes back as `{code, verifier}` on exchange.
 
-export const codexOauthAuthorizeUrlBody = z.object({
+export const codexOAuthAuthorizeUrlBody = z.object({
   record: upstreamRecordEnvelope,
   challenge: z.string().min(1),
   state: z.string().min(1),
 });
 
-export const codexOauthExchangeBody = z.object({
+export const codexOAuthExchangeBody = z.object({
   record: upstreamRecordEnvelope,
   auth_json: z.string().min(1).optional(),
   callback: z.object({
@@ -451,7 +449,7 @@ export const codexOauthExchangeBody = z.object({
   { message: 'Provide exactly one of auth_json or callback' },
 );
 
-export const codexOauthRefreshBody = recordOnlyBody;
+export const codexOAuthRefreshBody = recordOnlyBody;
 
 // --- claude-code OAuth + setup-token + probe (record-body contract) ---
 
@@ -462,13 +460,13 @@ const oauthCallbackSchema = z.object({
   state: z.string().min(1),
 });
 
-export const claudeCodeOauthAuthorizeUrlBody = z.object({
+export const claudeCodeOAuthAuthorizeUrlBody = z.object({
   record: upstreamRecordEnvelope,
   challenge: z.string().min(1),
   state: z.string().min(1),
 });
 
-export const claudeCodeOauthExchangeBody = z.object({
+export const claudeCodeOAuthExchangeBody = z.object({
   record: upstreamRecordEnvelope,
   credentials_json: z.string().min(1).optional(),
   callback: oauthCallbackSchema.optional(),
@@ -477,7 +475,7 @@ export const claudeCodeOauthExchangeBody = z.object({
   { message: 'Provide exactly one of credentials_json or callback' },
 );
 
-export const claudeCodeOauthRefreshBody = recordOnlyBody;
+export const claudeCodeOAuthRefreshBody = recordOnlyBody;
 
 export const claudeCodeSetupTokenAuthorizeUrlBody = z.object({
   record: upstreamRecordEnvelope,
@@ -491,6 +489,10 @@ export const claudeCodeSetupTokenExchangeBody = z.object({
 });
 
 export const claudeCodeProbeBody = recordOnlyBody;
+
+// --- ollama ---
+
+export const ollamaUsageBody = recordOnlyBody;
 
 // Unified live-model listing for both create-time preview and edit-time
 // refresh. Custom returns the raw upstream row (dashboard translates
@@ -557,10 +559,10 @@ export const resetBackoffBody = z.object({
 
 // --- search config ---
 
-export const searchConfigSchema = z.object({
-  provider: z.enum(['disabled', 'tavily', 'microsoft-grounding', 'jina']),
+export const webSearchConfigSchema = z.object({
+  provider: z.enum(['disabled', 'tavily', 'microsoft-web-iq', 'jina']),
   tavily: z.object({ apiKey: z.string() }),
-  microsoftGrounding: z.object({ apiKey: z.string() }),
+  microsoftWebIq: z.object({ apiKey: z.string() }),
   jina: z.object({ apiKey: z.string() }),
   passthroughOpenAiSearch: z.object({
     enabled: z.boolean(),
@@ -593,7 +595,7 @@ const chatAliasReasoningSchema = z.object({
   summary: z.string().min(1).optional(),
 }).strict().refine(
   // `adaptive` and a pinned `budget_tokens` are mutually exclusive on the
-  // Messages wire — `thinking.type` is one of `adaptive` or `enabled`, and
+  // Anthropic Messages wire — `thinking.type` is one of `adaptive` or `enabled`, and
   // only the `enabled` branch carries a `budget_tokens`. Storing both on the
   // same rule would silently discard the budget at overlay time.
   r => !(r.adaptive === true && r.budget_tokens !== undefined),
@@ -699,7 +701,7 @@ export const updateAliasBody = aliasBodyCore.superRefine(aliasBodyRulesRefinemen
 // --- data transfer ---
 
 export const importBody = z.object({
-  version: z.literal(17, { error: 'version must be 17 — older export formats are not supported; re-export from the current deployment' }),
+  version: z.literal(20, { error: 'version must be 20 — older export formats are not supported; re-export from the current deployment' }),
   mode: z.enum(['merge', 'replace'], { error: "mode must be 'merge' or 'replace'" }),
   data: z.unknown().optional(),
 });
@@ -710,11 +712,11 @@ export const exportQuery = z.object({
 
 // --- query strings (token-usage, search-usage, performance) ---
 //
-// `view` is required on the usage endpoints. The two views return different
-// payload shapes, so deriving one from the caller's capability would make the
-// same URL answer differently per user — and silently widen as soon as
-// someone's role changes. Declaring it required in the schema also makes the
-// RPC client demand it at compile time.
+// `view` is required on the record-oriented token and search Usage endpoints.
+// Their two views return different payload shapes, so deriving one from the
+// caller's capability would make the same URL silently widen after a role
+// change. The single-shape token Usage overview follows the Performance
+// contract and derives its authorized dimensions without accepting `view`.
 //
 // start/end stay optional in the schema (rather than `.min(1)`) so the
 // handler can return the canonical "start and end query parameters are
@@ -736,35 +738,63 @@ export const tokenUsageQuery = z.object(usageBaseQuery);
 // Dashboard `/api/models` accepts two query knobs. `aliases=false` skips the
 // alias-merge pass — the alias edit dialog and shadow detection need the
 // raw real-model set. `include_unlisted=true` extends the payload with the
-// addressable-but-not-listed surface (prefix-form alternates, Copilot
-// variant ids, provider-side redirects), so the alias dialog combobox sees
-// every id the data-plane resolver would accept.
+// addressable-but-not-listed surface (prefix-form alternates), so the alias
+// dialog combobox sees every id the data-plane resolver would accept.
 export const modelsQuery = z.object({
   aliases: z.enum(['true', 'false']).optional(),
   include_unlisted: z.enum(['true', 'false']).optional(),
 });
 
-export const searchUsageQuery = z.object({
+export const webSearchUsageQuery = z.object({
   ...usageBaseQuery,
   provider: z.string().optional(),
 });
 
-export const performanceQuery = z.object({
+// A multi-select filter travels as a repeated query parameter. Hono hands one
+// occurrence through as a bare string and several as an array, so each filter
+// reads through this single coercion into the list shape the handler wants.
+// Empty occurrences represent an unset filter and are discarded before item
+// validation.
+const filterValues = (item: z.ZodType<string, string>) =>
+  z.union([z.string(), z.array(z.string())])
+    .transform(value => (typeof value === 'string' ? [value] : value).filter(Boolean))
+    .pipe(z.array(item))
+    .optional();
+
+// User ids are auto-increment starting at 1, so zero and leading-zero forms
+// can never resolve and are rejected up front rather than silently returning
+// an empty result.
+const filterUserId = z.string().regex(/^[1-9]\d*$/, 'filter_user_id must be a positive integer');
+const filterTokenUsageOverviewUserId = z.union([
+  z.literal(String(tokenUsageUnattributedUserId)),
+  filterUserId,
+]);
+
+const telemetryOverviewQuery = {
   start: z.string().optional(),
   end: z.string().optional(),
-  group_by: z.enum(['keyId', 'userId', 'model', 'upstream', 'operation', 'runtimeLocation']).optional(),
   bucket: z.enum(['hour', '4h', '8h', 'day', 'all']).optional(),
+  timezone: z.string().optional(),
   timezone_offset_minutes: z.string().optional(),
-  // Cross-cutting filters applied to raw records before aggregation. Each is
-  // a single value (dashboard dropdown is single-select); combining filters
-  // is AND.
-  filter_model: z.string().optional(),
-  filter_upstream: z.string().optional(),
-  filter_operation: z.string().optional(),
-  filter_runtime_location: z.string().optional(),
-  // User ids are auto-increment starting at 1, so zero and leading-zero forms
-  // can never resolve and are rejected up front rather than silently returning
-  // an empty result.
-  filter_user_id: z.union([z.literal(''), z.string().regex(/^[1-9]\d*$/, 'filter_user_id must be a positive integer')]).optional(),
-  filter_key_id: z.string().optional(),
+  // Cross-cutting filters applied to raw records before aggregation. Values
+  // within one filter are OR'd, and the filters themselves AND together.
+  filter_model: filterValues(z.string()),
+  filter_upstream: filterValues(z.string()),
+  filter_user_id: filterValues(filterUserId),
+  filter_key_id: filterValues(z.string()),
+};
+
+export const tokenUsageOverviewQuery = z.object({
+  ...telemetryOverviewQuery,
+  // Token Usage overview exposes unattributed hard-deleted-key records through
+  // the synthetic user bucket.
+  filter_user_id: filterValues(filterTokenUsageOverviewUserId),
+  group_by: z.enum(['keyId', 'userId', 'model', 'upstream']).optional(),
+});
+
+export const performanceQuery = z.object({
+  ...telemetryOverviewQuery,
+  group_by: z.enum(['keyId', 'userId', 'model', 'upstream', 'operation', 'runtimeLocation']).optional(),
+  filter_operation: filterValues(z.string()),
+  filter_runtime_location: filterValues(z.string()),
 });

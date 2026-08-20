@@ -17,12 +17,15 @@ CLAUDE_MERGE_PROGRAM='
   | .env.ANTHROPIC_BASE_URL = $baseUrl
   | .env.ANTHROPIC_AUTH_TOKEN = env.SETUP_API_KEY
   | (if $model == "" then del(.env.ANTHROPIC_MODEL) else .env.ANTHROPIC_MODEL = $model end)
+  | (if $fable == "" then del(.env.ANTHROPIC_DEFAULT_FABLE_MODEL) else .env.ANTHROPIC_DEFAULT_FABLE_MODEL = $fable end)
   | (if $opus == "" then del(.env.ANTHROPIC_DEFAULT_OPUS_MODEL) else .env.ANTHROPIC_DEFAULT_OPUS_MODEL = $opus end)
   | (if $sonnet == "" then del(.env.ANTHROPIC_DEFAULT_SONNET_MODEL) else .env.ANTHROPIC_DEFAULT_SONNET_MODEL = $sonnet end)
   | (if $haiku == "" then del(.env.ANTHROPIC_DEFAULT_HAIKU_MODEL) else .env.ANTHROPIC_DEFAULT_HAIKU_MODEL = $haiku end)
   | (if $discovery == "1" then .env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1" else del(.env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY) end)
   | (if $effort == "" then del(.effortLevel) else .effortLevel = $effort end)
   | (if $cleanup == "" then del(.cleanupPeriodDays) else .cleanupPeriodDays = ($cleanup | tonumber) end)
+  | (if $disableAutoMemory == "1" then .autoMemoryEnabled = false else del(.autoMemoryEnabled) end)
+  | (if $disableAgentView == "1" then .disableAgentView = true else del(.disableAgentView) end)
   | (if $optOutAttribution == "1" then
       .attribution = ((.attribution // {}) + { "commit": "", "pr": "", "sessionUrl": false })
     else
@@ -140,6 +143,7 @@ claude_write_settings() {
   if ! printf '%s' "$_cw_base" | SETUP_API_KEY="$SETUP_API_KEY" "$JQ" \
       --arg baseUrl "$SETUP_ENDPOINT" \
       --arg model "$SETUP_CLAUDE_MODEL" \
+      --arg fable "$SETUP_CLAUDE_DEFAULT_FABLE_MODEL" \
       --arg opus "$SETUP_CLAUDE_DEFAULT_OPUS_MODEL" \
       --arg sonnet "$SETUP_CLAUDE_DEFAULT_SONNET_MODEL" \
       --arg haiku "$SETUP_CLAUDE_DEFAULT_HAIKU_MODEL" \
@@ -147,6 +151,8 @@ claude_write_settings() {
       --arg effort "$SETUP_CLAUDE_EFFORT_LEVEL" \
       --arg cleanup "$SETUP_CLAUDE_CLEANUP_PERIOD_DAYS" \
       --arg optOutAttribution "$SETUP_CLAUDE_OPT_OUT_AI_ATTRIBUTION" \
+      --arg disableAutoMemory "$SETUP_CLAUDE_DISABLE_AUTO_MEMORY" \
+      --arg disableAgentView "$SETUP_CLAUDE_DISABLE_AGENT_VIEW" \
       "$CLAUDE_MERGE_PROGRAM" > "$_cw_stage"; then
     out_error 'failed to construct updated Claude settings.'
     rm -f "$_cw_stage"
