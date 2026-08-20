@@ -1,14 +1,15 @@
 import { chatFromCopilotRaw } from './chat-from-raw.ts';
+import { COMPACTION_TRIGGER, compactionResponse } from './compaction.ts';
 import { assertCopilotUpstreamRecord } from './config.ts';
 import { COPILOT_DEFAULT_FLAGS, defaultFlagsForCopilotModel } from './defaults.ts';
 import { fetchCopilotModels } from './fetch-models.ts';
-import { copilotFetchChatCompletions, copilotFetchEmbeddings, copilotFetchMessages, copilotFetchMessagesCountTokens, copilotFetchResponses } from './fetch.ts';
-import { COPILOT_CHATCOMPLETIONS_BOUNDARY } from './interceptors/chat-completions/index.ts';
-import type { ChatCompletionsBoundaryCtx } from './interceptors/chat-completions/types.ts';
-import { COPILOT_MESSAGES_BOUNDARY, COPILOT_MESSAGES_COUNT_TOKENS_BOUNDARY } from './interceptors/messages/index.ts';
-import type { MessagesBoundaryCtx, MessagesCountTokensBoundaryCtx } from './interceptors/messages/types.ts';
-import { COPILOT_RESPONSES_BOUNDARY } from './interceptors/responses/index.ts';
-import type { ResponsesBoundaryCtx } from './interceptors/responses/types.ts';
+import { copilotFetchOpenAIChatCompletions, copilotFetchOpenAIEmbeddings, copilotFetchAnthropicMessages, copilotFetchAnthropicMessagesCountTokens, copilotFetchOpenAIResponses, type CopilotDataPlaneFetchOptions } from './fetch.ts';
+import { COPILOT_ANTHROPIC_MESSAGES_BOUNDARY, COPILOT_ANTHROPIC_MESSAGES_COUNT_TOKENS_BOUNDARY } from './interceptors/anthropic-messages/index.ts';
+import type { AnthropicMessagesBoundaryCtx } from './interceptors/anthropic-messages/types.ts';
+import { COPILOT_OPENAI_CHAT_COMPLETIONS_BOUNDARY } from './interceptors/openai-chat-completions/index.ts';
+import type { OpenAIChatCompletionsBoundaryCtx } from './interceptors/openai-chat-completions/types.ts';
+import { COPILOT_OPENAI_RESPONSES_BOUNDARY } from './interceptors/openai-responses/index.ts';
+import type { OpenAIResponsesBoundaryCtx } from './interceptors/openai-responses/types.ts';
 import { emptyKnownModels, mergeKnownModels, projectKnownModels } from './known-models.ts';
 import { mergeClaudeVariants } from './merge-claude-variants.ts';
 import { copilotPublicModelId } from './model-name.ts';
@@ -17,11 +18,11 @@ import { pricingForCopilotPublicModelId } from './pricing.ts';
 import { readCopilotUpstreamState, type CopilotUpstreamState } from './state.ts';
 import type { CopilotRawModel } from './types.ts';
 import { runInterceptors } from '@floway-dev/interceptor';
-import { parseChatCompletionsStream, type ChatCompletionsPayload, type ChatCompletionsStreamEvent } from '@floway-dev/protocols/chat-completions';
+import { parseAnthropicMessagesStream, type AnthropicMessagesPayload, type AnthropicMessagesStreamEvent } from '@floway-dev/protocols/anthropic-messages';
 import { type ModelEndpointKey, type ModelEndpoints, type ProtocolFrame, kindForEndpoints } from '@floway-dev/protocols/common';
-import { parseAnthropicBetaHeader, parseMessagesStream, type MessagesPayload, type MessagesStreamEvent } from '@floway-dev/protocols/messages';
-import { parseResponsesStream, type CanonicalResponsesPayload, type ResponsesResult } from '@floway-dev/protocols/responses';
-import { COMPACTION_TRIGGER, compactionResponse, eventResult, getProviderRepo, readUpstreamApiError, streamingProviderCall, apiErrorToResponse, resolveEffectiveFlags, type ExecuteResult, type FlagOverrides, type ProviderInstance, type Provider, type ProviderCallResult, type ProviderModel, type ProviderResponsesResult, type ProviderStreamResult, type TelemetryModelIdentity, type UpstreamCallOptions, type UpstreamFetchOptions, type UpstreamRecord } from '@floway-dev/provider';
+import { parseOpenAIChatCompletionsStream, type OpenAIChatCompletionsPayload, type OpenAIChatCompletionsStreamEvent } from '@floway-dev/protocols/openai-chat-completions';
+import { parseOpenAIResponsesStream, type CanonicalOpenAIResponsesPayload, type OpenAIResponsesResult } from '@floway-dev/protocols/openai-responses';
+import { eventResult, getProviderRepo, headersForAnthropicMessagesCall, jsonRequestBody, readUpstreamApiError, streamingProviderCall, apiErrorToResponse, resolveEffectiveFlags, type ExecuteResult, type FetchInit, type FlagOverrides, type HttpHeaderLines, type ProviderInstance, type Provider, type ProviderCallResult, type ProviderModel, type ProviderOpenAIResponsesResult, type ProviderStreamResult, type TelemetryModelIdentity, type UpstreamCallOptions, type UpstreamRecord } from '@floway-dev/provider';
 
 interface CopilotProviderData {
   rawModels: CopilotRawModel[];
@@ -58,22 +59,22 @@ const copilotPathToModelEndpoint = (path: string): ModelEndpointKey | undefined 
   switch (path) {
   case '/chat/completions':
   case '/v1/chat/completions':
-    return 'chatCompletions';
+    return 'openaiChatCompletions';
   case '/responses':
   case '/v1/responses':
-    return 'responses';
+    return 'openaiResponses';
   case '/v1/messages':
   case '/messages':
-    return 'messages';
+    return 'anthropicMessages';
   case '/embeddings':
   case '/v1/embeddings':
-    return 'embeddings';
+    return 'openaiEmbeddings';
   case '/images/generations':
   case '/v1/images/generations':
-    return 'imagesGenerations';
+    return 'openaiImagesGenerations';
   case '/images/edits':
   case '/v1/images/edits':
-    return 'imagesEdits';
+    return 'openaiImagesEdits';
   default:
     return undefined;
   }
@@ -82,44 +83,58 @@ const copilotPathToModelEndpoint = (path: string): ModelEndpointKey | undefined 
 const rawModelSupportsEndpoint = (model: CopilotRawModel, endpoint: ModelEndpointKey): boolean => {
   if ((model.supported_endpoints ?? []).some(path => copilotPathToModelEndpoint(path) === endpoint)) return true;
   // Copilot's Anthropic-family entries have historically under-reported their
-  // native Messages path, so treat claude-* as Messages-capable.
-  if (endpoint === 'messages' && model.id.startsWith('claude-')) return true;
-  if (endpoint === 'chatCompletions') {
+  // native Anthropic Messages path, so treat claude-* as Anthropic-Messages-capable.
+  if (endpoint === 'anthropicMessages' && model.id.startsWith('claude-')) return true;
+  if (endpoint === 'openaiChatCompletions') {
     return model.supported_endpoints === undefined && model.capabilities?.type === 'chat';
   }
-  if (endpoint === 'embeddings') return model.supported_endpoints === undefined && model.capabilities?.type === 'embeddings';
+  if (endpoint === 'openaiEmbeddings') return model.supported_endpoints === undefined && model.capabilities?.type === 'embeddings';
   return false;
 };
 
 const copilotModelEndpoints = (rawModels: readonly CopilotRawModel[]): ModelEndpoints => {
-  if (rawModels.some(model => rawModelSupportsEndpoint(model, 'responses'))) {
-    return { responses: {} };
+  if (rawModels.some(model => rawModelSupportsEndpoint(model, 'openaiResponses'))) {
+    return { openaiResponses: {} };
   }
 
-  if (rawModels.some(model => rawModelSupportsEndpoint(model, 'messages'))) {
-    return { messages: {} };
+  if (rawModels.some(model => rawModelSupportsEndpoint(model, 'anthropicMessages'))) {
+    return { anthropicMessages: {} };
   }
 
-  if (rawModels.some(model => rawModelSupportsEndpoint(model, 'chatCompletions'))) {
-    return { chatCompletions: {} };
+  if (rawModels.some(model => rawModelSupportsEndpoint(model, 'openaiChatCompletions'))) {
+    return { openaiChatCompletions: {} };
   }
 
-  return rawModels.some(model => rawModelSupportsEndpoint(model, 'embeddings')) ? { embeddings: {} } : {};
+  return rawModels.some(model => rawModelSupportsEndpoint(model, 'openaiEmbeddings')) ? { openaiEmbeddings: {} } : {};
 };
 
-const chatReasoningEffort = (body: Omit<ChatCompletionsPayload, 'model'>): string | undefined => (body.reasoning_effort && body.reasoning_effort !== 'none' ? body.reasoning_effort : undefined);
+const chatReasoningEffort = (body: Omit<OpenAIChatCompletionsPayload, 'model'>): string | undefined => (body.reasoning_effort && body.reasoning_effort !== 'none' ? body.reasoning_effort : undefined);
 
-const messagesReasoningEffort = (body: Omit<MessagesPayload, 'model'>): string | undefined => body.output_config?.effort;
+const anthropicMessagesReasoningEffort = (body: Omit<AnthropicMessagesPayload, 'model'>): string | undefined => body.output_config?.effort;
 
-const responsesReasoningEffort = (body: Omit<CanonicalResponsesPayload, 'model'>): string | undefined => (body.reasoning?.effort && body.reasoning.effort !== 'none' ? body.reasoning.effort : undefined);
+const openaiResponsesReasoningEffort = (body: Omit<CanonicalOpenAIResponsesPayload, 'model'>): string | undefined => (body.reasoning?.effort && body.reasoning.effort !== 'none' ? body.reasoning.effort : undefined);
+
+const anthropicMessagesBoundaryContext = (
+  body: Omit<AnthropicMessagesPayload, 'model'>,
+  model: ProviderModel,
+  headers: Headers,
+  anthropicBeta: readonly string[],
+): AnthropicMessagesBoundaryCtx => {
+  return {
+    payload: { ...body, model: model.id },
+    headers: new Headers(headers),
+    anthropicBeta: [...anthropicBeta],
+    model,
+  };
+};
 
 const rejectUnsupported = (capability: string) => (): Promise<never> =>
   Promise.reject(new Error(`Copilot provider does not implement ${capability}`));
 
 const rawModelFor = (model: ProviderModel, endpoint: ModelEndpointKey, hints: ModelSelectionHints = {}): CopilotRawModel => {
   // Copilot exposes one canonical public Claude model id per family. Raw
-  // variant selection is derived from request fields such as reasoning effort
-  // and anthropic-beta, not from the client's original model alias string.
+  // variant selection is derived from request body fields and parsed Anthropic Messages
+  // beta intent, not from the client's original model alias string.
   const rawModels = (model.providerData as CopilotProviderData).rawModels.filter(rawModel => rawModelSupportsEndpoint(rawModel, endpoint));
   if (rawModels.length === 0) {
     throw new Error(`Copilot provider exposed ${endpoint} for ${model.id}, but no raw variant supports that endpoint`);
@@ -127,7 +142,7 @@ const rawModelFor = (model: ProviderModel, endpoint: ModelEndpointKey, hints: Mo
   return resolveCopilotRawModel({ object: 'list', data: rawModels }, model.id, hints) ?? rawModels[0];
 };
 
-const copilotEmbeddingsBody = (body: Record<string, unknown>): Record<string, unknown> => {
+const copilotOpenAIEmbeddingsBody = (body: Record<string, unknown>): Record<string, unknown> => {
   if (typeof body.input !== 'string') return body;
 
   // OpenAI-compatible clients may send scalar string input, but Copilot's
@@ -188,34 +203,34 @@ const finalizeCopilotModels = (
 
 export const createCopilotProvider = (record: UpstreamRecord): Provider => {
   const copilot = assertCopilotUpstreamRecord(record);
-  const upstreamConfig = { id: copilot.id, githubToken: copilot.config.githubToken };
+  const upstreamConfig = { id: copilot.id, githubHost: copilot.config.githubHost, githubToken: copilot.config.githubToken };
 
   const call = async (
-    transport: (config: typeof upstreamConfig, init: RequestInit, options: UpstreamFetchOptions) => Promise<Response>,
+    transport: (config: typeof upstreamConfig, init: FetchInit, options: CopilotDataPlaneFetchOptions) => Promise<Response>,
     body: Record<string, unknown>,
     signal: AbortSignal | undefined,
     rawModel: CopilotRawModel,
-    headers: Headers,
+    headers: HttpHeaderLines,
     opts: UpstreamCallOptions,
   ): Promise<ProviderCallResult> => {
     const response = await transport(
       upstreamConfig,
       {
         method: 'POST',
-        body: JSON.stringify({ ...body, model: rawModel.id }),
+        body: jsonRequestBody({ ...body, model: rawModel.id }),
         signal,
       },
-      { extraHeaders: headers, fetcher: opts.fetcher, wrapUpstreamCall: opts.wrapUpstreamCall },
+      { extraHeaders: headers, fetcher: opts.fetcher, wrapUpstreamCall: opts.wrapUpstreamCall, waitUntil: opts.waitUntil },
     );
     return { response, modelKey: rawModel.id };
   };
 
   const callStreaming = <TEvent>(
-    transport: (config: typeof upstreamConfig, init: RequestInit, options: UpstreamFetchOptions) => Promise<Response>,
+    transport: (config: typeof upstreamConfig, init: FetchInit, options: CopilotDataPlaneFetchOptions) => Promise<Response>,
     body: Record<string, unknown>,
     signal: AbortSignal | undefined,
     rawModel: CopilotRawModel,
-    headers: Headers,
+    headers: HttpHeaderLines,
     parser: Parameters<typeof streamingProviderCall<TEvent>>[1],
     opts: UpstreamCallOptions,
   ) =>
@@ -224,10 +239,10 @@ export const createCopilotProvider = (record: UpstreamRecord): Provider => {
         upstreamConfig,
         {
           method: 'POST',
-          body: JSON.stringify({ ...body, stream: true, model: rawModel.id }),
+          body: jsonRequestBody({ ...body, stream: true, model: rawModel.id }),
           signal,
         },
-        { extraHeaders: headers, fetcher: opts.fetcher, wrapUpstreamCall: opts.wrapUpstreamCall },
+        { extraHeaders: headers, fetcher: opts.fetcher, wrapUpstreamCall: opts.wrapUpstreamCall, waitUntil: opts.waitUntil },
       ),
       parser,
       rawModel.id,
@@ -290,54 +305,50 @@ export const createCopilotProvider = (record: UpstreamRecord): Provider => {
     getProvidedModels: async fetcher => {
       const fresh = await getProviderRepo().upstreams.getById(copilot.id);
       if (!fresh) throw new Error(`Copilot upstream ${copilot.id} disappeared mid-request`);
-      const initialState = readCopilotUpstreamState(fresh.state);
-      const known = initialState.knownModels ?? emptyKnownModels();
+      const known = readCopilotUpstreamState(fresh.state).knownModels ?? emptyKnownModels();
       const response = await fetchCopilotModels(upstreamConfig, fetcher);
       const now = Date.now();
       const merged = mergeKnownModels(known, response, now);
-      // Re-read after the upstream fetch — fetchCopilotModels may have minted a
-      // new Copilot token via the auth path, which persists copilotToken under
-      // its own CAS and advances state_json. Keying this save on the pre-fetch
-      // snapshot would lose deterministically on every token mint (~each
-      // expiry), so the known-models accumulator would never grow. Persistence
-      // is best-effort either way: a losing CAS or thrown error must not
-      // invalidate the response, which the caller is about to use.
-      const latest = await getProviderRepo().upstreams.getById(copilot.id);
-      if (latest) {
-        const latestState = readCopilotUpstreamState(latest.state);
-        try {
-          await getProviderRepo().upstreams.saveState(
-            copilot.id,
-            { ...latestState, knownModels: merged } satisfies CopilotUpstreamState,
-            { expectedState: latest.state },
-          );
-        } catch (err) {
-          console.warn(`Failed to persist Copilot known-models for ${copilot.id}:`, err);
-        }
+      // The accumulator merges into whatever is stored at write time, not into
+      // the snapshot read before the fetch — fetchCopilotModels may have minted
+      // a token and written this same row on the way through. Persistence stays
+      // best-effort: the fetched catalog is what the caller is about to serve,
+      // and a storage failure only costs the next call the entries this one
+      // would have added.
+      try {
+        await getProviderRepo().upstreams.saveState(copilot.id, current => {
+          const state = readCopilotUpstreamState(current);
+          return {
+            ...state,
+            knownModels: mergeKnownModels(state.knownModels ?? emptyKnownModels(), response, now),
+          } satisfies CopilotUpstreamState;
+        });
+      } catch (err) {
+        console.warn(`Failed to persist Copilot known-models for ${copilot.id}:`, err);
       }
       return finalizeCopilotModels(projectKnownModels(merged, now), copilot.flagOverrides);
     },
-    // Copilot's catalog never declares endpoints.completions, so this
+    // Copilot's catalog never declares endpoints.openaiCompletions, so this
     // stub is unreachable; the rejection surfaces a routing bug.
-    callCompletions: rejectUnsupported('callCompletions'),
-    callChatCompletions: async (model, body, signal, opts) => {
-      const rawModel = rawModelFor(model, 'chatCompletions', { reasoningEffort: chatReasoningEffort(body) });
-      const ctx: ChatCompletionsBoundaryCtx = {
+    callOpenAICompletions: rejectUnsupported('callOpenAICompletions'),
+    callOpenAIChatCompletions: async (model, body, signal, opts) => {
+      const rawModel = rawModelFor(model, 'openaiChatCompletions', { reasoningEffort: chatReasoningEffort(body) });
+      const ctx: OpenAIChatCompletionsBoundaryCtx = {
         payload: { ...body, model: model.id },
         headers: new Headers(opts.headers),
         model,
       };
-      const result = await runInterceptors<ChatCompletionsBoundaryCtx, object, ExecuteResult<ProtocolFrame<ChatCompletionsStreamEvent>>>(
-        ctx, {}, COPILOT_CHATCOMPLETIONS_BOUNDARY, async () => {
+      const result = await runInterceptors<OpenAIChatCompletionsBoundaryCtx, object, ExecuteResult<ProtocolFrame<OpenAIChatCompletionsStreamEvent>>>(
+        ctx, {}, COPILOT_OPENAI_CHAT_COMPLETIONS_BOUNDARY, async () => {
           const { model: _ignored, ...wireBody } = ctx.payload;
-          return await liftStream(callStreaming(copilotFetchChatCompletions, wireBody, signal, rawModel, ctx.headers, parseChatCompletionsStream, opts));
+          return await liftStream(callStreaming(copilotFetchOpenAIChatCompletions, wireBody, signal, rawModel, [...ctx.headers], parseOpenAIChatCompletionsStream, opts));
         },
       );
       return lowerToStream(result, rawModel.id);
     },
-    callResponses: async (model, body, action, signal, opts) => {
-      const rawModel = rawModelFor(model, 'responses', { reasoningEffort: responsesReasoningEffort(body) });
-      const ctx: ResponsesBoundaryCtx = {
+    callOpenAIResponses: async (model, body, action, signal, opts) => {
+      const rawModel = rawModelFor(model, 'openaiResponses', { reasoningEffort: openaiResponsesReasoningEffort(body) });
+      const ctx: OpenAIResponsesBoundaryCtx = {
         payload: { ...body, model: model.id },
         headers: new Headers(opts.headers),
         model,
@@ -354,12 +365,12 @@ export const createCopilotProvider = (record: UpstreamRecord): Provider => {
       // compression, vision/initiator headers — applies to both branches
       // identically. The item-id membrane also normalizes the compact value
       // envelope, while the whitespace guard only inspects generate streams.
-      return await runInterceptors<ResponsesBoundaryCtx, object, ProviderResponsesResult>(
-        ctx, {}, COPILOT_RESPONSES_BOUNDARY, async () => {
+      return await runInterceptors<OpenAIResponsesBoundaryCtx, object, ProviderOpenAIResponsesResult>(
+        ctx, {}, COPILOT_OPENAI_RESPONSES_BOUNDARY, async () => {
           const { model: _ignored, ...wireBody } = ctx.payload;
           switch (ctx.action) {
           case 'generate': {
-            const stream = await callStreaming(copilotFetchResponses, wireBody, signal, rawModel, ctx.headers, parseResponsesStream, opts);
+            const stream = await callStreaming(copilotFetchOpenAIResponses, wireBody, signal, rawModel, [...ctx.headers], parseOpenAIResponsesStream, opts);
             return stream.ok
               ? { action: 'generate', ok: true, events: stream.events, modelKey: stream.modelKey, ...(stream.headers ? { headers: stream.headers } : {}) }
               : { action: 'generate', ok: false, response: stream.response, modelKey: stream.modelKey };
@@ -367,23 +378,23 @@ export const createCopilotProvider = (record: UpstreamRecord): Provider => {
           case 'compact': {
             const input = wireBody.input;
             const triggered = { ...wireBody, input: [...input, COMPACTION_TRIGGER], stream: false, model: rawModel.id };
-            const response = await copilotFetchResponses(
+            const response = await copilotFetchOpenAIResponses(
               upstreamConfig,
-              { method: 'POST', body: JSON.stringify(triggered), signal },
-              { extraHeaders: ctx.headers, fetcher: opts.fetcher, wrapUpstreamCall: opts.wrapUpstreamCall },
+              { method: 'POST', body: jsonRequestBody(triggered), signal },
+              { extraHeaders: [...ctx.headers], fetcher: opts.fetcher, wrapUpstreamCall: opts.wrapUpstreamCall, waitUntil: opts.waitUntil },
             );
             if (!response.ok) return { action: 'compact', ok: false, response, modelKey: rawModel.id };
-            const generated = (await response.json()) as ResponsesResult;
+            const generated = (await response.json()) as OpenAIResponsesResult;
             return { action: 'compact', ok: true, result: compactionResponse(input, generated), modelKey: rawModel.id };
           }
           default:
             ctx.action satisfies never;
-            throw new Error(`Unhandled ResponsesAction: ${ctx.action as string}`);
+            throw new Error(`Unhandled OpenAIResponsesAction: ${ctx.action as string}`);
           }
         },
       );
     },
-    callMessages: async (model, body, signal, opts) => {
+    callAnthropicMessages: async (model, body, signal, opts) => {
       // Fast Mode is a hard contract on the request side: Anthropic returns
       // HTTP 400 invalid_request_error when a model does not support it, with
       // no silent fallback to standard speed. We mirror that at the gateway
@@ -415,65 +426,54 @@ export const createCopilotProvider = (record: UpstreamRecord): Provider => {
         }
       }
 
-      // Both the native Messages call and count_tokens select the same raw
+      // Both the native Anthropic Messages call and count_tokens select the same raw
       // `messages` variant; they differ only in the upstream endpoint path.
-      // Variant selection runs BEFORE the boundary chain's allow-list filter
-      // mutates `anthropic-beta` on the wire, so we read the caller's
-      // untouched intent here.
-      const betas = parseAnthropicBetaHeader(opts.headers.get('anthropic-beta'));
-      const rawModel = rawModelFor(model, 'messages', {
-        context1m: betas.includes(CONTEXT_1M_BETA),
-        reasoningEffort: messagesReasoningEffort(body),
+      const ctx = anthropicMessagesBoundaryContext(body, model, opts.headers, opts.anthropicBeta);
+      const rawModel = rawModelFor(model, 'anthropicMessages', {
+        context1m: ctx.anthropicBeta.includes(CONTEXT_1M_BETA),
+        reasoningEffort: anthropicMessagesReasoningEffort(body),
         fast: body.speed === 'fast',
       });
-      const ctx: MessagesBoundaryCtx = {
-        payload: { ...body, model: model.id },
-        headers: new Headers(opts.headers),
-        model,
-      };
-      const result = await runInterceptors<MessagesBoundaryCtx, object, ExecuteResult<ProtocolFrame<MessagesStreamEvent>>>(
-        ctx, {}, COPILOT_MESSAGES_BOUNDARY, async () => {
+      const result = await runInterceptors<AnthropicMessagesBoundaryCtx, object, ExecuteResult<ProtocolFrame<AnthropicMessagesStreamEvent>>>(
+        ctx, {}, COPILOT_ANTHROPIC_MESSAGES_BOUNDARY, async () => {
           const { model: _ignored, ...wireBody } = ctx.payload;
-          return await liftStream(callStreaming(copilotFetchMessages, wireBody, signal, rawModel, ctx.headers, parseMessagesStream, opts));
+          return await liftStream(callStreaming(copilotFetchAnthropicMessages, wireBody, signal, rawModel, headersForAnthropicMessagesCall([...ctx.headers], ctx.anthropicBeta), parseAnthropicMessagesStream, opts));
         },
       );
       return lowerToStream(result, rawModel.id);
     },
-    callMessagesCountTokens: async (model, body, signal, opts) => {
-      const betas = parseAnthropicBetaHeader(opts.headers.get('anthropic-beta'));
-      const rawModel = rawModelFor(model, 'messages', {
-        context1m: betas.includes(CONTEXT_1M_BETA),
-        reasoningEffort: messagesReasoningEffort(body),
+    callAnthropicMessagesCountTokens: async (model, body, signal, opts) => {
+      const ctx = anthropicMessagesBoundaryContext(body, model, opts.headers, opts.anthropicBeta);
+      const rawModel = rawModelFor(model, 'anthropicMessages', {
+        context1m: ctx.anthropicBeta.includes(CONTEXT_1M_BETA),
+        reasoningEffort: anthropicMessagesReasoningEffort(body),
       });
-      const ctx: MessagesCountTokensBoundaryCtx = {
-        payload: { ...body, model: model.id },
-        headers: new Headers(opts.headers),
-        model,
-      };
-      const response = await runInterceptors<MessagesCountTokensBoundaryCtx, object, Response>(
-        ctx, {}, COPILOT_MESSAGES_COUNT_TOKENS_BOUNDARY, async () => {
+      const response = await runInterceptors<AnthropicMessagesBoundaryCtx, object, Response>(
+        ctx, {}, COPILOT_ANTHROPIC_MESSAGES_COUNT_TOKENS_BOUNDARY, async () => {
           const { model: _ignored, ...wireBody } = ctx.payload;
-          const { response } = await call(copilotFetchMessagesCountTokens, wireBody, signal, rawModel, ctx.headers, opts);
+          const { response } = await call(copilotFetchAnthropicMessagesCountTokens, wireBody, signal, rawModel, headersForAnthropicMessagesCall([...ctx.headers], ctx.anthropicBeta), opts);
           return response;
         },
       );
       return { response, modelKey: rawModel.id };
     },
-    callEmbeddings: (model, body, signal, opts) => call(copilotFetchEmbeddings, copilotEmbeddingsBody(body), signal, rawModelFor(model, 'embeddings'), opts.headers, opts),
+    callOpenAIEmbeddings: (model, body, signal, opts) => call(copilotFetchOpenAIEmbeddings, copilotOpenAIEmbeddingsBody(body), signal, rawModelFor(model, 'openaiEmbeddings'), [...opts.headers], opts),
     // Copilot has no /images/* upstream; catalog never emits a kind='image'
     // model, so these stubs are unreachable.
-    callImagesGenerations: rejectUnsupported('callImagesGenerations'),
-    callImagesEdits: rejectUnsupported('callImagesEdits'),
-    callAudioTranscriptions: rejectUnsupported('callAudioTranscriptions'),
+    callOpenAIImagesGenerations: rejectUnsupported('callOpenAIImagesGenerations'),
+    callOpenAIImagesEdits: rejectUnsupported('callOpenAIImagesEdits'),
+    callOpenAIAudioTranscriptions: rejectUnsupported('callOpenAIAudioTranscriptions'),
     callRerank: rejectUnsupported('callRerank'),
   };
 
   return {
-    upstream: copilot.id,
+    upstreamId: copilot.id,
     kind: 'copilot',
     name: copilot.name,
+    inboundHeaderAllowlist: [],
     disabledPublicModelIds: copilot.disabledPublicModelIds,
     modelPrefix: copilot.modelPrefix,
+    modelsCache: copilot.modelsCache,
     instance,
   };
 };

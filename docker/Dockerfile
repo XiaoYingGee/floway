@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1
 
+ARG NODE_VERSION=22.23.1
+
 # `node:22-*-slim` skips riscv64, so we base off Debian directly and drop
 # in the official Node.js tarball keyed on TARGETPLATFORM. `trixie-slim`
 # gives us glibc 2.41, which the sharp riscv64 prebuilt requires.
@@ -7,7 +9,7 @@ FROM debian:trixie-slim AS base
 WORKDIR /app
 
 ARG TARGETPLATFORM
-ARG NODE_VERSION=22.23.1
+ARG NODE_VERSION
 
 ENV PNPM_HOME=/pnpm
 ENV PATH="$PNPM_HOME:/usr/local/bin:$PATH"
@@ -31,9 +33,8 @@ RUN set -eux; \
     rm /tmp/node.tar.xz; \
     corepack enable
 
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json LICENSE ./
 COPY patches ./patches
-COPY scripts ./scripts
 COPY apps ./apps
 COPY packages ./packages
 
@@ -59,15 +60,31 @@ EXPOSE 8788
 
 CMD ["pnpm", "run", "dev:node"]
 
-# The web bundle is compiled with Vite (a devDependency), so this stage
-# takes the full install and only ships the built assets forward.
-FROM base AS web-build
+# The web bundle is platform-independent, while Rolldown and Lightning CSS do
+# not publish riscv64 binaries. This stage therefore starts from a native Node
+# image for BUILDPLATFORM; inheriting `base` would retain its target-platform
+# filesystem and Node binary.
+# https://github.com/rolldown/rolldown/blob/f09947ab017d6df74299f691853dcfc4f4f0f86e/packages/rolldown/package.json#L147-L167
+# https://github.com/parcel-bundler/lightningcss/blob/c6a0c3cebf3395635e61075d2c81a96a710d4910/scripts/build-npm.js#L7-L45
+# https://github.com/docker/docs/blob/cf508182bf559e87e89dfa67052941b092439aea/_vendor/github.com/moby/buildkit/frontend/dockerfile/docs/reference.md#L648-L654
+FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-trixie-slim AS web-build
+WORKDIR /app
+ENV PNPM_HOME=/pnpm
+ENV PATH="$PNPM_HOME:/usr/local/bin:$PATH"
+RUN corepack enable
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json LICENSE ./
+COPY patches ./patches
+COPY apps ./apps
+COPY packages ./packages
+
 RUN pnpm install --frozen-lockfile --ignore-scripts
 RUN pnpm run build:web
 
 FROM nginx:1.27-alpine AS web
 
 COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
-COPY --from=web-build /app/apps/web/dist /usr/share/nginx/html
+COPY LICENSE /usr/share/nginx/html/LICENSE
+COPY --from=web-build /app/apps/web/dist/client /usr/share/nginx/html
 
 EXPOSE 80

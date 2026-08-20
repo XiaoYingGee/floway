@@ -1,7 +1,7 @@
 import type { FlagId, FlagOverrides } from './flags.ts';
 import type { UpstreamChatModelConfig } from './model-config.ts';
 import type { ModelPrefixConfig } from './model-prefix.ts';
-import type { AliasSelection, AliasTarget, ModelKind, ModelEndpoints, ModelPricing, RerankTarget } from '@floway-dev/protocols/common';
+import type { AliasSelection, AliasTarget, ModelKind, ModelEndpoints, ModelPricing, PublicModelLimits, RerankTarget } from '@floway-dev/protocols/common';
 
 export const ALL_PROVIDER_KINDS = ['copilot', 'custom', 'azure', 'codex', 'claude-code', 'ollama'] as const;
 export type UpstreamProviderKind = typeof ALL_PROVIDER_KINDS[number];
@@ -14,47 +14,24 @@ export const assertUpstreamProviderKind = (provider: string): UpstreamProviderKi
   throw new TypeError(`Invalid upstream provider kind: ${provider}`);
 };
 
-// Per-upstream badge color override. `null` inherits the frontend's kind
-// default; a preset key resolves to a static Uno accent class; a `#RRGGBB`
-// string renders via CSS custom properties + color-mix() so any operator hex
-// works without extending the theme.
-export const UPSTREAM_COLOR_PRESETS = ['amber', 'emerald', 'cyan', 'violet', 'rose', 'orange'] as const;
-export type UpstreamColorPreset = typeof UPSTREAM_COLOR_PRESETS[number];
-export type UpstreamColor = UpstreamColorPreset | `#${string}`;
+// The operator-chosen badge hue, as an OKLCH hue angle in degrees. It is the
+// only dimension of the badge an operator picks: the dashboard fixes lightness
+// and chroma, washes the hue to 10% for the fill and 35% for the outline, and
+// solves the label against that fill for a contrast floor, so nothing else in
+// the color would survive being chosen.
+export const UPSTREAM_HUE_DEGREES = 360;
 
-// The frontend resolver (`apps/web/src/components/upstreams/upstream-paint.ts`)
-// disambiguates hex from preset by `raw.startsWith('#')`; a preset that
-// begins with '#' would silently route to the hex renderer and produce
-// invalid CSS. `Extract<>` collects any offending members of the union;
-// the assertion fails to compile if that projection is not `never`. (A
-// naive `T extends \`#${string}\` ? never : true` distributes across the
-// union and collapses to `true`, providing no guard.)
-//
-// If this compile error fires, DO NOT delete the assertion — either
-// rename the offending preset to drop the '#' prefix, or (only if the
-// hex-vs-preset disambiguation gets a different mechanism) update the
-// resolver first and then this guard together.
-type _NoHashPresets = Extract<UpstreamColorPreset, `#${string}`> extends never ? true : never;
-const _noHashPresets: _NoHashPresets = true;
-void _noHashPresets;
-
-// Canonical hex form accepted at every wire boundary. Uppercase-or-lowercase
-// #RRGGBB only; shorthand and 8-digit alpha are rejected so the resolver's
-// `startsWith('#')` disambiguation vs preset keys stays sound.
-export const UPSTREAM_COLOR_HEX_REGEX = /^#[0-9a-fA-F]{6}$/;
-
-// Parse a wire / persisted upstream color into the domain shape. `null`
-// and `undefined` collapse to `null` (inherit). A valid preset key or
-// hex-6 string passes through; anything else throws. Callers that want
-// row-attributed error messages wrap this in a try/catch and re-throw,
-// mirroring the normalize*/parse* split used by every other row
-// hydrator in `packages/gateway/src/repo/sql.ts`.
-export const normalizeUpstreamColor = (value: unknown): UpstreamColor | null => {
-  if (value === null || value === undefined) return null;
-  if (typeof value !== 'string') throw new Error(`upstreamColor must be a string or null, got ${typeof value}`);
-  if (UPSTREAM_COLOR_HEX_REGEX.test(value)) return value as UpstreamColor;
-  if ((UPSTREAM_COLOR_PRESETS as readonly string[]).includes(value)) return value as UpstreamColor;
-  throw new Error(`upstreamColor is invalid: ${JSON.stringify(value)}`);
+// Parse a wire / persisted upstream hue. Integers in `[0, 360)` pass through;
+// everything else throws, including a float, a wrappable angle, and a missing
+// value. Callers that want row-attributed error messages wrap this in a
+// try/catch and re-throw, mirroring the normalize*/parse* split used by every
+// other row hydrator in `packages/gateway/src/repo/sql.ts`.
+export const normalizeUpstreamHue = (value: unknown): number => {
+  if (typeof value !== 'number') throw new Error(`upstreamHue must be a number, got ${typeof value}`);
+  if (!Number.isInteger(value) || value < 0 || value >= UPSTREAM_HUE_DEGREES) {
+    throw new Error(`upstreamHue must be an integer in [0, ${UPSTREAM_HUE_DEGREES}), got ${value}`);
+  }
+  return value;
 };
 
 // One entry in `UpstreamRecord.proxyFallbackList`. `id` is the proxy id from
@@ -70,6 +47,17 @@ export interface ProxyFallbackEntry {
   colos?: string[];
 }
 
+// A cached projection of one upstream's catalog, stored on the upstream row.
+// `revision` is the catalog contract version the entry was written under, so a
+// deploy that changes the projection invalidates older entries; `lastError`
+// annotates a previously-successful entry whose refresh failed.
+export interface UpstreamModelsCache {
+  revision: number;
+  fetchedAt: number;
+  models: ProviderModel[];
+  lastError: { message: string; at: number } | null;
+}
+
 // One upstream's persisted record. `config` is a per-provider opaque payload;
 // `state` is gateway-managed runtime data.
 export interface UpstreamRecord {
@@ -81,14 +69,21 @@ export interface UpstreamRecord {
   createdAt: string;
   updatedAt: string;
   config: unknown;
-  // Runtime state managed by the gateway autonomous flows; null when a
-  // provider has no autonomous state.
+  // Gateway-written state that can change without an operator editing config;
+  // null when a provider has no runtime state.
   state: unknown;
+  // The upstream's cached catalog, read on the same round trip as the row
+  // rather than through a second query. Null until the first successful fetch.
+  // Written only by the catalog refresh path — an operator save leaves it
+  // alone.
+  modelsCache: UpstreamModelsCache | null;
   flagOverrides: FlagOverrides;
-  // Public model ids the operator switched off for this upstream. Orthogonal to
-  // every per-model metadata field and uniform across provider kinds: a disabled
-  // id is hidden from the catalog and unroutable, but its row metadata stays
-  // editable. Entries may reference ids no longer present in the live model list.
+  // Model ids the operator switched off for this upstream, matched against the
+  // provider-emitted id before any model prefix is applied — so one entry hides
+  // both the bare and the prefixed surface. Orthogonal to every per-model
+  // metadata field and uniform across provider kinds: a disabled id is hidden
+  // from the catalog and unroutable, but its row metadata stays editable.
+  // Entries may reference ids no longer present in the live model list.
   disabledPublicModelIds: string[];
   proxyFallbackList: ProxyFallbackEntry[];
   // Per-upstream model name prefix policy. `null` keeps the bare-id behavior
@@ -96,49 +91,10 @@ export interface UpstreamRecord {
   // When set, the registry honors `addressable` and `listed` to expose /
   // accept either form (or both).
   modelPrefix: ModelPrefixConfig | null;
-  // Operator-chosen badge color. `null` falls back to the frontend's kind
-  // default. Otherwise: a preset key from `UPSTREAM_COLOR_PRESETS`, or a raw
-  // `#RRGGBB` string. Wire validation lives in the control-plane Zod schema.
-  color: UpstreamColor | null;
-}
-
-// Model identity attached to every provider result at the provider boundary
-// so the identity is decided once.
-export interface TelemetryModelIdentity {
-  model: string;
-  upstream: string;
-  modelKey: string;
-  pricing: ModelPricing | null;
-}
-
-// `chat`, `text_completion`, and `embeddings` are the OTel `gen_ai.operation.name`
-// well-known values we route; `image_generation`, `image_edit`, `rerank`, and
-// `audio_transcription` are gateway-defined extensions for concrete endpoints
-// not covered by OTel. Extend only when a new route lands — no wildcard string.
-// OTel canonical set:
-// https://github.com/open-telemetry/semantic-conventions/blob/v1.37.0/docs/gen-ai/gen-ai-spans.md#gen_aioperationname
-export const PERFORMANCE_OPERATIONS = [
-  'chat',
-  'text_completion',
-  'embeddings',
-  'image_generation',
-  'image_edit',
-  'rerank',
-  'audio_transcription',
-] as const;
-export type PerformanceOperation = typeof PERFORMANCE_OPERATIONS[number];
-
-export const parsePerformanceOperation = (value: unknown): PerformanceOperation => {
-  if (typeof value === 'string' && (PERFORMANCE_OPERATIONS as readonly string[]).includes(value)) return value as PerformanceOperation;
-  throw new TypeError(`Invalid performance operation: ${JSON.stringify(value)}`);
-};
-
-export interface PerformanceTelemetryContext {
-  keyId: string;
-  model: string;
-  upstream: string;
-  operation: PerformanceOperation;
-  runtimeLocation: string;
+  // The operator-chosen badge hue, an OKLCH hue angle in degrees. Every
+  // upstream carries its own; the dashboard derives the whole badge from it.
+  // Wire validation lives in the control-plane Zod schema.
+  hue: number;
 }
 
 // Public identity + capability surface shared by `InternalModel` (the merged,
@@ -147,24 +103,24 @@ export interface PerformanceTelemetryContext {
 // `endpoints` and recomputes `kind`. Kept internal so callers can only touch
 // the wrapper types — this base has no meaning on its own.
 //
-// `kind` is the high-level endpoint-family discriminator; `endpoints` is the
-// precise per-protocol availability map. They are linked invariants enforced
-// at the producer boundary:
-//   `kind === 'embedding'` ⇔ `endpoints === { embeddings: {} }`
-//   `kind === 'image'`     ⇔ `endpoints ⊂ {imagesGenerations, imagesEdits}`
-//   `kind === 'rerank'`    ⇔ `endpoints === { rerank: {} }`
-//   `kind === 'transcription'` ⇔ `endpoints === { audioTranscriptions: {} }`
-//   `kind === 'chat'`      ⇒ `endpoints ⊂ generation endpoints`.
+// `endpoints` is the precise per-protocol availability map; `kind` is always
+// `kindForEndpoints(endpoints)`, a lossy first-match projection of it onto the
+// endpoint-family discriminator. Only `kind === 'chat'` says anything about the
+// whole map — it means no non-chat family key is present, since each of those
+// short-circuits ahead of it. Every other value says only that its own key is
+// present; the map may carry any other endpoint alongside, and no producer
+// checks otherwise. `data-plane/providers/catalog.ts`'s union merge
+// manufactures exactly such mixed sets on purpose when several upstreams
+// contribute one public id, then recomputes `kind` from the union. Resolution
+// uses this projection as the source-route discriminator before the selected
+// serve path reads its endpoint configuration; `endpoints` remains the
+// catalog's precise capability metadata even for mixed sets.
 interface ModelMetadata {
   id: string;
   display_name?: string;
   owned_by?: string;
   created?: number;
-  limits: {
-    max_output_tokens?: number;
-    max_context_window_tokens?: number;
-    max_prompt_tokens?: number;
-  };
+  limits: PublicModelLimits;
   kind: ModelKind;
   pricing?: ModelPricing;
   chat?: UpstreamChatModelConfig;
@@ -181,8 +137,8 @@ interface ModelMetadata {
 //     dispatch reads the chosen upstream's `ProviderModel` off this map via
 //     `providerModelOf(candidate)`. A per-candidate row (from
 //     `enumerateRealModelCandidates`) narrows the map to the single dispatched
-//     upstream; the merged catalog row from `getModels` aggregates every
-//     contributing upstream.
+//     upstream; the merged catalog row from `getModelsFromProviders`
+//     aggregates every contributing upstream.
 //   • Alias row — carries `aliasedFrom`, the operator-defined alias record.
 //     Alias rows appear in listings but never dispatch directly; the resolver
 //     walks the alias's targets and yields real-row candidates instead.
@@ -211,13 +167,15 @@ export interface InternalAliasedFrom {
 
 // Per-upstream projection returned by every provider's `getProvidedModels` and
 // the shape every provider's `callXxx(model, ...)` takes at dispatch time.
-// Carries the same metadata as `InternalModel` plus `providerData` (the opaque
-// per-provider wire carrier — Copilot's raw variant list, Claude Code's dated
-// upstream id, ...), `enabledFlags` (the effective flag set for the model
-// on the emitting upstream, already resolved through every layer), and
-// `flagOverrides` (optional dashboard-only view of the per-model layer
-// that fed into `enabledFlags`). Providers only ever see their own emission —
-// the surrounding `InternalModel` map is assembled by the registry.
+// Carries the same metadata as `InternalModel` plus `providerData` (opaque
+// provider-private invocation data, not a universal upstream-id field —
+// Copilot uses it for raw variants, Claude Code for a dated wire id, and other
+// providers may omit it or carry a different private shape), `enabledFlags`
+// (the effective flag set for the model on the emitting upstream, already
+// resolved through every layer), and `flagOverrides` (optional dashboard-only
+// view of the per-model layer that fed into `enabledFlags`). Providers only
+// ever see their own emission — the surrounding `InternalModel` map is
+// assembled by the registry.
 export interface ProviderModel extends ModelMetadata {
   providerData?: unknown;
   rerankTarget?: RerankTarget;
@@ -227,7 +185,7 @@ export interface ProviderModel extends ModelMetadata {
   // model. Absent when the provider has no per-model call on this
   // model; when present, the map is non-empty (producers elide empty
   // overlays before emission). Populated only for providers with a
-  // per-model rule (e.g., Copilot's Claude < 4.8 demote clause); other
+  // per-model rule (e.g., Copilot's Claude < 4.8 system-rewrite clause); other
   // providers leave it undefined.
   //
   // The data plane consumes the already-resolved `enabledFlags` and
@@ -236,8 +194,8 @@ export interface ProviderModel extends ModelMetadata {
   // the provider itself calls on this specific model —
   // reshapeModelForDashboard projects it onto the wire as the auto-row
   // counterpart to the operator-authored
-  // `UpstreamModelConfig.flagOverrides` on manual rows. The two
-  // occupy the same layer-3 slot; the source is carried by the
-  // enclosing row type (auto vs manual), not by the field name.
+  // `UpstreamModelConfig.flagOverrides` on manual rows. Both occupy the
+  // same layer-3 slot; which one a row carries follows from where the row
+  // came from, not from anything on the field itself.
   flagOverrides?: FlagOverrides;
 }

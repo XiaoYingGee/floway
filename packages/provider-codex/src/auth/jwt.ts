@@ -2,6 +2,8 @@
 // skipped: the token reached us over TLS from auth.openai.com itself; spending
 // effort on signature-validating a token we just fetched would be theatre.
 
+import { decodeCanonicalBase64url } from '@floway-dev/protocols/common';
+
 export interface CodexIdTokenIdentity {
   email: string;
   chatgptAccountId: string;
@@ -10,17 +12,7 @@ export interface CodexIdTokenIdentity {
 }
 
 export const parseCodexIdTokenClaims = (idToken: string): CodexIdTokenIdentity => {
-  const segments = idToken.split('.');
-  if (segments.length !== 3) throw new Error(`id_token must have 3 segments, got ${segments.length}`);
-
-  let payload: unknown;
-  try {
-    payload = JSON.parse(decodeBase64UrlToUtf8(segments[1]));
-  } catch (cause) {
-    throw new Error('id_token payload is not base64url-encoded JSON', { cause: cause as Error });
-  }
-
-  if (!isObject(payload)) throw new Error('id_token payload is not an object');
+  const payload = parseCodexIdTokenPayload(idToken);
 
   const auth = payload['https://api.openai.com/auth'];
   if (!isObject(auth)) throw new Error('id_token missing https://api.openai.com/auth claim');
@@ -41,13 +33,42 @@ export const parseCodexIdTokenClaims = (idToken: string): CodexIdTokenIdentity =
   };
 };
 
-// atob rejects unpadded base64; OpenAI id_tokens arrive unpadded, so we pad.
+// Refresh responses need only update the capability-relevant plan claim. The
+// account identity was validated at import, and OpenAI may omit unrelated
+// profile claims from a later id_token. Missing plan returns `undefined` so
+// callers can preserve the latest observation or use the import-time identity;
+// malformed present claims still surface.
+export const parseCodexIdTokenPlanType = (idToken: string): string | undefined => {
+  const payload = parseCodexIdTokenPayload(idToken);
+  const auth = payload['https://api.openai.com/auth'];
+  if (auth === undefined) return undefined;
+  if (!isObject(auth)) throw new Error('id_token https://api.openai.com/auth claim is not an object');
+  const planType = auth.chatgpt_plan_type;
+  if (planType === undefined) return undefined;
+  if (typeof planType !== 'string' || planType === '') throw new Error('id_token has malformed chatgpt_plan_type claim');
+  return planType;
+};
+
+const parseCodexIdTokenPayload = (idToken: string): Record<string, unknown> => {
+  const segments = idToken.split('.');
+  if (segments.length !== 3) throw new Error(`id_token must have 3 segments, got ${segments.length}`);
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(decodeBase64UrlToUtf8(segments[1]));
+  } catch (cause) {
+    throw new Error('id_token payload is not base64url-encoded JSON', { cause: cause as Error });
+  }
+
+  if (!isObject(payload)) throw new Error('id_token payload is not an object');
+  return payload;
+};
+
 const decodeBase64UrlToUtf8 = (value: string): string => {
-  const standard = value.replace(/-/g, '+').replace(/_/g, '/');
-  const padded = standard + '='.repeat((4 - (standard.length % 4)) % 4);
-  const binary = atob(padded);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  // JOSE compact serialization uses canonical unpadded Base64URL.
+  // https://www.rfc-editor.org/rfc/rfc7515.html#section-2
+  const bytes = decodeCanonicalBase64url(value);
+  if (bytes === null) throw new TypeError('Invalid canonical Base64URL JWT segment');
   return new TextDecoder().decode(bytes);
 };
 

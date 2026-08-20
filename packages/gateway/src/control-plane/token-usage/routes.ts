@@ -8,7 +8,9 @@ import { aggregateUsageByUserForDisplay, aggregateUsageForDisplay } from './aggr
 import { type CtxWithQuery } from '../../middleware/zod-validator.ts';
 import { getRepo } from '../../repo/index.ts';
 import type { tokenUsageQuery } from '../schemas.ts';
-import { buildKeyToUserMap, resolveTelemetryView } from '../telemetry-view.ts';
+import { buildKeyToUserMap } from '../shared/key-to-user.ts';
+import { resolveUsageView } from '../shared/usage-view.ts';
+import type { TokenUsageByKeyResponse, TokenUsageByUserResponse } from '../usage-types.ts';
 
 export const tokenUsage = async (c: CtxWithQuery<typeof tokenUsageQuery>) => {
   const query = c.req.valid('query');
@@ -17,7 +19,7 @@ export const tokenUsage = async (c: CtxWithQuery<typeof tokenUsageQuery>) => {
   }
   const { start, end } = query;
 
-  const resolved = resolveTelemetryView(c, query.view, query.key_id);
+  const resolved = resolveUsageView(c, query.view, query.key_id);
   if ('error' in resolved) {
     return c.json({ error: resolved.message }, resolved.error === 'forbidden' ? 403 : 400);
   }
@@ -30,13 +32,14 @@ export const tokenUsage = async (c: CtxWithQuery<typeof tokenUsageQuery>) => {
       repo.users.listIncludingDeleted(),
       repo.apiKeys.listIncludingDeleted(),
     ]);
-    const records = aggregateUsageByUserForDisplay(rawRecords, buildKeyToUserMap(keys));
+    const keyToUser = buildKeyToUserMap(keys);
+    const records = aggregateUsageByUserForDisplay(rawRecords, keyToUser);
 
     if (query.include_user_metadata !== '1') return c.json(records);
     const userMetadata = users
       .map(u => ({ id: u.id, username: u.username }))
       .sort((a, b) => a.id - b.id);
-    return c.json({ records, users: userMetadata });
+    return c.json({ view: 'all-by-user', records, users: userMetadata } satisfies TokenUsageByUserResponse);
   }
 
   // Sequential so an invalid key_id short-circuits to 404 before spending the usage.query read.
@@ -47,24 +50,26 @@ export const tokenUsage = async (c: CtxWithQuery<typeof tokenUsageQuery>) => {
     return c.json({ error: 'Unknown key_id' }, 404);
   }
 
-  const rawRecords = await repo.usage.query({ keyId: explicitKeyId, start, end });
-  const filtered = explicitKeyId ? rawRecords : rawRecords.filter(r => ownedSet.has(r.keyId));
-  const records = aggregateUsageForDisplay(filtered);
-
+  const filtered = await repo.usage.query({
+    keyIds: explicitKeyId === undefined ? [...ownedSet] : [explicitKeyId],
+    start,
+    end,
+  });
   const keyMap = new Map(keys.map(k => [k.id, k]));
-  const recordsWithKeyMetadata = records.map(r => {
+  const records = aggregateUsageForDisplay(filtered);
+  const withKeyMetadata = records.map(r => {
     const k = keyMap.get(r.keyId);
     if (!k) throw new Error(`telemetry row references unknown key ${r.keyId} for user ${resolved.scopeUserId}`);
     return { ...r, keyName: k.name, keyCreatedAt: k.createdAt };
   });
-
-  if (query.include_key_metadata !== '1') return c.json(recordsWithKeyMetadata);
+  if (query.include_key_metadata !== '1') return c.json(withKeyMetadata);
 
   const keyMetadata = keys
     .map(k => ({ id: k.id, name: k.name, createdAt: k.createdAt }))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
   return c.json({
-    records: recordsWithKeyMetadata,
+    view: 'self-by-key',
+    records: withKeyMetadata,
     keys: keyMetadata,
-  });
+  } satisfies TokenUsageByKeyResponse);
 };

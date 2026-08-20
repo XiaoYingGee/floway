@@ -1,7 +1,33 @@
 import { isJsonObject } from '../../../../shared/json-helpers.ts';
-import type { WebSearchProviderResult } from '../types.ts';
+import { sleep } from '../../../../shared/sleep.ts';
+import type { WebSearchProviderErrorCode, WebSearchProviderResult } from '../types.ts';
+import { discardUpstreamResponse } from '@floway-dev/provider';
 
 const MAX_WEB_SEARCH_QUERY_LENGTH = 1000;
+const RETRY_DELAYS_MS = [1000, 2000, 4000, 8000] as const;
+const RETRYABLE_HTTP_STATUS: ReadonlySet<number> = new Set([429, 500, 502, 503, 504]);
+
+export const fetchWithRetry = async (
+  doFetch: () => Promise<Response>,
+  signal?: AbortSignal,
+): Promise<Response> => {
+  let attempt = 0;
+  while (true) {
+    const response = await doFetch();
+    if (!RETRYABLE_HTTP_STATUS.has(response.status)) return response;
+    if (attempt >= RETRY_DELAYS_MS.length) return response;
+    await discardUpstreamResponse(response);
+    await sleep(RETRY_DELAYS_MS[attempt], signal);
+    attempt += 1;
+  }
+};
+
+export const httpStatusToErrorCode = (status: number): WebSearchProviderErrorCode => {
+  if (status === 429) return 'too_many_requests';
+  if (status === 413) return 'request_too_large';
+  if (status === 400) return 'invalid_tool_input';
+  return 'unavailable';
+};
 
 export type ValidatedWebSearchQuery = { type: 'ok'; query: string } | { type: 'error'; result: WebSearchProviderResult };
 
@@ -108,6 +134,19 @@ export const extractWebSearchProviderErrorMessage = async (response: Response): 
     }
     if (typeof parsed.message === 'string') {
       return parsed.message;
+    }
+    // Microsoft Web IQ writes the human-readable half of its envelope to `userMessage`
+    // and the diagnostic half to `technicalDetails`, alongside `errorCode`,
+    // `errorCategory`, `requestId`, and `traceId`. Without this rung the whole
+    // envelope reaches the operator as raw JSON. Observed on
+    // POST https://api.microsoft.ai/v3/search/web with an invalid key:
+    // {"errorCode":"AuthInvalidApiKey","errorCategory":"UserError",
+    //  "userMessage":"Invalid API key provided.","technicalDetails":"Invalid API key",…}
+    if (typeof parsed.userMessage === 'string') {
+      return parsed.userMessage;
+    }
+    if (typeof parsed.technicalDetails === 'string') {
+      return parsed.technicalDetails;
     }
   } catch {
     return text;

@@ -23,23 +23,22 @@ import type { Hono } from 'hono';
 
 import type { AuthVars } from '../../middleware/auth.ts';
 import { mountAlphaSearchRoute } from '../alpha-search/routes.ts';
-import { responsesHttp } from '../chat/responses/http.ts';
-import { responsesWebSocket } from '../chat/responses/websocket.ts';
-import { imagesEdits, imagesGenerations } from '../images/serve.ts';
-import { serveModels } from '../models/serve.ts';
-
-const CODEX_BASE_PATH = '/azure-api.codex';
+import { openaiResponsesHttp } from '../chat/openai-responses/http.ts';
+import { openaiResponsesWebSocket } from '../chat/openai-responses/websocket.ts';
+import { serveModels } from '../models/http.ts';
+import { openaiImagesEdits, openaiImagesGenerations } from '../openai-images/http.ts';
+import { mountPublicRoute } from '../public-route.ts';
+import { PUBLIC_DATA_PLANE_ROUTES } from '@floway-dev/protocols/common';
 
 export const mountCodexRoutes = (app: Hono<{ Variables: AuthVars }>) => {
-  // Codex appends `alpha/search` to this special provider base. Keep the path
-  // owned by this namespace while reusing the general data-plane handler.
+  // Register the manifest's Codex-specific search path with the general
+  // alpha-search handler.
   // https://github.com/openai/codex/blob/2e1607ee2fa8099a233df7437adee5f16a741905/codex-rs/codex-api/src/endpoint/search.rs#L31-L47
-  mountAlphaSearchRoute(app, `${CODEX_BASE_PATH}/alpha/search`);
-  app.post(`${CODEX_BASE_PATH}/responses`, responsesHttp.generate);
-  app.post(`${CODEX_BASE_PATH}/responses/compact`, responsesHttp.compact);
-  app.get(`${CODEX_BASE_PATH}/responses`, responsesWebSocket);
-  app.post(`${CODEX_BASE_PATH}/images/generations`, imagesGenerations);
-  app.post(`${CODEX_BASE_PATH}/images/edits`, imagesEdits);
-
-  app.get(`${CODEX_BASE_PATH}/models`, serveModels);
+  mountAlphaSearchRoute(app, PUBLIC_DATA_PLANE_ROUTES.codexAlphaSearch);
+  mountPublicRoute(PUBLIC_DATA_PLANE_ROUTES.codexOpenAIResponses, (method, path) => app.on(method, path, openaiResponsesHttp.generate));
+  mountPublicRoute(PUBLIC_DATA_PLANE_ROUTES.codexOpenAIResponsesCompact, (method, path) => app.on(method, path, openaiResponsesHttp.compact));
+  mountPublicRoute(PUBLIC_DATA_PLANE_ROUTES.codexOpenAIResponsesWebSocket, (method, path) => app.on(method, path, openaiResponsesWebSocket));
+  mountPublicRoute(PUBLIC_DATA_PLANE_ROUTES.codexOpenAIImagesGenerations, (method, path) => app.on(method, path, openaiImagesGenerations));
+  mountPublicRoute(PUBLIC_DATA_PLANE_ROUTES.codexOpenAIImagesEdits, (method, path) => app.on(method, path, openaiImagesEdits));
+  mountPublicRoute(PUBLIC_DATA_PLANE_ROUTES.codexModels, (method, path) => app.on(method, path, serveModels));
 };

@@ -1,10 +1,11 @@
-import { createFetcher, type ProxyEntry } from '../../dial/fetcher.ts';
+import { createFetcher } from '../../dial/fetcher.ts';
 import { createPerRequestFetcher } from '../../dial/per-request.ts';
+import { loadProxyCatalog } from '../../dial/proxy-catalog.ts';
 import { getRepo } from '../../repo/index.ts';
-import { DIRECT_CONNECT_ID, isDirectFallbackId, normalizeProxyFallbackList } from '../../repo/proxy-fallback-list.ts';
-import { getSocketDial } from '@floway-dev/platform';
-import { directFetcher, type Fetcher, type ProxyFallbackEntry } from '@floway-dev/provider';
-import { parseProxyUri, type ProxyUriError, runDirectConnectRequest, runProxiedRequest } from '@floway-dev/proxy';
+import { isDirectFallbackId, normalizeProxyFallbackList } from '../../repo/proxy-fallback-list.ts';
+import { getFetch, getSocketDial } from '@floway-dev/platform';
+import type { Fetcher, ProxyFallbackEntry } from '@floway-dev/provider';
+import { runDirectConnectRequest, runProxiedRequest } from '@floway-dev/proxy';
 
 // Fetcher resolution for control-plane operations that fire from the
 // dashboard edit form, where the in-progress proxy_fallback_list must take
@@ -22,7 +23,10 @@ export const resolveControlPlaneFetcher = async (opts: {
   if (opts.upstreamId !== undefined) {
     return (await createPerRequestFetcher(opts.runtimeLocation))(opts.upstreamId);
   }
-  return directFetcher;
+  // Neither an in-progress edit nor a persisted row to read a policy from.
+  // That is the same "no policy" state an empty list expresses, so route it
+  // through the same builder instead of hard-coding a transport here.
+  return await buildOverrideFetcher([], 'draft', opts.runtimeLocation);
 };
 
 const buildOverrideFetcher = async (
@@ -32,25 +36,9 @@ const buildOverrideFetcher = async (
 ): Promise<Fetcher> => {
   const list = normalizeProxyFallbackList(rawList);
   const referenced = new Set(list.filter(entry => !isDirectFallbackId(entry.id)).map(entry => entry.id));
-  if (referenced.size === 0 && !list.some(entry => entry.id === DIRECT_CONNECT_ID)) {
-    return directFetcher;
-  }
 
   const repo = getRepo();
-  const proxies = await repo.proxies.list();
-  const proxyById = new Map<string, ProxyEntry>();
-  const parseErrors = new Map<string, ProxyUriError>();
-  for (const p of proxies) {
-    if (!referenced.has(p.id)) continue;
-    try {
-      proxyById.set(p.id, {
-        config: parseProxyUri(p.url),
-        dialTimeoutMs: p.dialTimeoutSeconds === null ? null : p.dialTimeoutSeconds * 1000,
-      });
-    } catch (err) {
-      parseErrors.set(p.id, err as ProxyUriError);
-    }
-  }
+  const { proxyById, parseErrors } = await loadProxyCatalog(repo, referenced);
 
   const unknown = list.find(entry => !isDirectFallbackId(entry.id) && !proxyById.has(entry.id) && !parseErrors.has(entry.id));
   if (unknown !== undefined) {
@@ -69,7 +57,7 @@ const buildOverrideFetcher = async (
     runtimeLocation,
     proxyById,
     runProxied: runProxiedRequest,
-    runDirectFetch: directFetcher,
+    runDirectFetch: getFetch(),
     runDirectConnect: runDirectConnectRequest,
     socketDial: getSocketDial,
   });

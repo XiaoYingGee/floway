@@ -1,8 +1,7 @@
-import type { SearchConfig, WebSearchProviderName } from '../shared/web-search-providers.ts';
-export type { SearchConfig } from '../shared/web-search-providers.ts';
+import type { WebSearchConfig, WebSearchProviderName } from '../shared/web-search-providers.ts';
 import type { AgentSetupRepository } from '@floway-dev/agent-setup';
 import type { AliasSelection, AliasTarget, AnnouncedMetadata, BillingMetric, DecimalString, ModelKind, PricingSelector } from '@floway-dev/protocols/common';
-import type { PerformanceTelemetryContext, ProviderModel, UpstreamRecord } from '@floway-dev/provider';
+import type { PerformanceTelemetryContext, UpstreamModelsCache, UpstreamRecord } from '@floway-dev/provider';
 
 export interface ApiKey {
   id: string;
@@ -14,14 +13,16 @@ export interface ApiKey {
   serverSecret: string;
   createdAt: string;
   lastUsedAt?: string;
-  // null = inherit global upstream order; array = whitelist + priority order.
+  // null = inherit the user-level cap; array = whitelist in priority order.
+  // When both levels carry a list the effective list is their intersection
+  // taken in this order, so a key that sets one also decides the priority.
   upstreamIds: string[] | null;
   deletedAt: string | null;
   // null = dump capture disabled; positive integer = seconds of retention.
   dumpRetentionSeconds: number | null;
-  // 0 = durable Stateful Responses disabled; a positive value is seconds in
+  // 0 = durable Stateful OpenAI Responses disabled; a positive value is seconds in
   // whole-day increments. Reuse lifetime is quantized to UTC days.
-  responsesRetentionSeconds: number;
+  openaiResponsesRetentionSeconds: number;
 }
 
 export interface User {
@@ -33,7 +34,9 @@ export interface User {
   passwordHash: string | null;
   isAdmin: boolean;
   // null = unrestricted at the user level; an array intersects with the
-  // per-key whitelist when both are present.
+  // per-key whitelist when both are present. Membership only — the key's
+  // order carries the intersection, so this order applies only to requests
+  // whose key sets no list of its own.
   upstreamIds: string[] | null;
   createdAt: string;
   deletedAt: string | null;
@@ -60,6 +63,45 @@ export interface UsageRecord {
   metrics: UsageMetricRecord[];
 }
 
+export type UsageOverviewGroupBy = 'keyId' | 'userId' | 'model' | 'upstream';
+export type UsageOverviewAxis = UsageOverviewGroupBy | 'none' | 'series';
+
+export interface UsageOverviewRecord {
+  bucket: string;
+  group: string;
+  requests: number;
+  metrics: Array<{ metric: BillingMetric; quantity: DecimalString }>;
+  cost: DecimalString | null;
+}
+
+export interface UsageOverviewFilters {
+  keyIds: readonly string[];
+  userIds: readonly number[];
+  models: readonly string[];
+  upstreams: readonly string[];
+}
+
+export interface UsageOverviewQueryOptions {
+  actorUserId: number;
+  isAdmin: boolean;
+  start: string;
+  end: string;
+  groupBy: UsageOverviewGroupBy;
+  filters: UsageOverviewFilters;
+  bucketForHour: (hour: string) => string;
+}
+
+export interface UsageOverviewResult {
+  series: UsageOverviewRecord[];
+  axes: Record<UsageOverviewGroupBy | 'none', UsageOverviewRecord[]>;
+  dimensionValues: {
+    keyIds: string[];
+    userIds: number[];
+    models: string[];
+    upstreams: string[];
+  };
+}
+
 export interface UsageMetricRecord {
   metric: BillingMetric;
   quantity: DecimalString;
@@ -83,16 +125,18 @@ export interface TokenUsage {
   tier?: string | null;
 }
 
-export type SearchUsageAction = 'search' | 'fetch_page';
+export type WebSearchUsageAction = 'search' | 'fetch_page';
 
-export interface SearchUsageRecord {
+export interface WebSearchUsageRecord {
   provider: WebSearchProviderName;
   keyId: string;
-  action: SearchUsageAction;
+  action: WebSearchUsageAction;
   hour: string;
   requests: number;
 }
 
+// `ttft_ms` is time to first token in milliseconds; `tpot_us` is time per
+// output token in microseconds.
 export type PerformanceMetric = 'ttft_ms' | 'tpot_us';
 
 // A performance-summary row is a `PerformanceTelemetryContext` (the provider-
@@ -145,6 +189,58 @@ export interface PerformanceTelemetryRecord extends PerformanceDimensions {
   buckets: readonly PerformanceBucketRow[];
 }
 
+export type PerformanceGroupBy = 'none' | 'keyId' | 'userId' | 'model' | 'upstream' | 'operation' | 'runtimeLocation';
+export type PerformanceOverviewGroupBy = Exclude<PerformanceGroupBy, 'none'>;
+export type PerformanceOverviewAxis = PerformanceGroupBy | 'series';
+
+export interface PerformanceDisplayRecord {
+  bucket: string;
+  group: string;
+  requests: number;
+  errors: number;
+  ttftSamples: number;
+  tpotSamples: number;
+  neutral: number;
+  ttftMsP50: number | null;
+  ttftMsP95: number | null;
+  ttftMsP99: number | null;
+  tpotUsP50: number | null;
+  tpotUsP95: number | null;
+  tpotUsP99: number | null;
+}
+
+export interface PerformanceOverviewFilters {
+  keyIds: readonly string[];
+  userIds: readonly number[];
+  models: readonly string[];
+  upstreams: readonly string[];
+  operations: readonly string[];
+  runtimeLocations: readonly string[];
+}
+
+export interface PerformanceOverviewQueryOptions {
+  actorUserId: number;
+  isAdmin: boolean;
+  start: string;
+  end: string;
+  groupBy: PerformanceOverviewGroupBy;
+  filters: PerformanceOverviewFilters;
+  bucketForHour: (hour: string) => string;
+}
+
+export interface PerformanceOverviewResult {
+  series: PerformanceDisplayRecord[];
+  axes: Record<PerformanceGroupBy, PerformanceDisplayRecord[]>;
+  dimensionValues: {
+    models: string[];
+    upstreams: string[];
+    operations: string[];
+    runtimeLocations: string[];
+    userIds: number[];
+    keyIds: string[];
+  };
+}
+
 export interface ApiKeyRepo {
   list(): Promise<ApiKey[]>;
   // Includes soft-deleted rows so the user_id behind a historical key stays
@@ -165,7 +261,7 @@ export interface ApiKeyRepo {
 
 export type ApiKeyUpdate = Partial<Pick<
   ApiKey,
-  'name' | 'key' | 'lastUsedAt' | 'upstreamIds' | 'dumpRetentionSeconds' | 'responsesRetentionSeconds'
+  'name' | 'key' | 'lastUsedAt' | 'upstreamIds' | 'dumpRetentionSeconds' | 'openaiResponsesRetentionSeconds'
 >>;
 
 export interface UsersRepo {
@@ -199,18 +295,19 @@ export interface UsageRepo {
   // first write establishes the unit-price snapshot, including an unpriced
   // snapshot; later writes that share the row keep it unchanged.
   record(record: UsageRecord): Promise<void>;
-  query(opts: { keyId?: string; start: string; end: string }): Promise<UsageRecord[]>;
+  query(opts: { keyIds?: readonly string[]; start: string; end: string }): Promise<UsageRecord[]>;
+  queryOverview(opts: UsageOverviewQueryOptions): Promise<UsageOverviewResult>;
   listAll(): Promise<UsageRecord[]>;
   // Replacement upsert: quantities and unit prices are overwritten from the record.
   set(record: UsageRecord): Promise<void>;
   deleteAll(): Promise<void>;
 }
 
-export interface SearchUsageRepo {
-  record(args: { provider: WebSearchProviderName; keyId: string; action: SearchUsageAction; hour: string; requests: number }): Promise<void>;
-  query(opts: { provider?: WebSearchProviderName; keyId?: string; action?: SearchUsageAction; start: string; end: string }): Promise<SearchUsageRecord[]>;
-  listAll(): Promise<SearchUsageRecord[]>;
-  set(record: SearchUsageRecord): Promise<void>;
+export interface WebSearchUsageRepo {
+  record(args: { provider: WebSearchProviderName; keyId: string; action: WebSearchUsageAction; hour: string; requests: number }): Promise<void>;
+  query(opts: { provider?: WebSearchProviderName; keyId?: string; action?: WebSearchUsageAction; start: string; end: string }): Promise<WebSearchUsageRecord[]>;
+  listAll(): Promise<WebSearchUsageRecord[]>;
+  set(record: WebSearchUsageRecord): Promise<void>;
   deleteAll(): Promise<void>;
 }
 
@@ -231,43 +328,42 @@ export interface PerformanceRepo {
   // calls and chat successes that never got a first output token or a real
   // upstream call.
   recordNeutral(dims: PerformanceDimensions): Promise<void>;
-  query(opts: { keyId?: string; start: string; end: string }): Promise<PerformanceTelemetryRecord[]>;
+  queryOverview(opts: PerformanceOverviewQueryOptions): Promise<PerformanceOverviewResult>;
   listAll(): Promise<PerformanceTelemetryRecord[]>;
   // Replacement upsert used by admin restore paths.
   set(record: PerformanceTelemetryRecord): Promise<void>;
   deleteAll(): Promise<void>;
 }
 
-export interface CachedModelsRow {
-  revision: number;
-  fetchedAt: number;
-  models: ProviderModel[];
-  lastError: { message: string; at: number } | null;
-}
-
-export interface ModelsCacheRepo {
-  get(upstreamId: string): Promise<CachedModelsRow | null>;
-  put(upstreamId: string, row: { revision: number; fetchedAt: number; models: ProviderModel[] }): Promise<void>;
-  setLastError(upstreamId: string, error: { message: string; at: number } | null): Promise<void>;
-  delete(upstreamId: string): Promise<void>;
-}
-
-export interface SearchConfigRepo {
+export interface WebSearchConfigRepo {
   get(): Promise<unknown>;
-  save(config: SearchConfig): Promise<void>;
+  save(config: WebSearchConfig): Promise<void>;
 }
 
 export interface UpstreamRepo {
   list(): Promise<UpstreamRecord[]>;
   getById(id: string): Promise<UpstreamRecord | null>;
   save(upstream: UpstreamRecord): Promise<void>;
+  saveClearingModelsCache(upstream: UpstreamRecord): Promise<void>;
   delete(id: string): Promise<boolean>;
   deleteAll(): Promise<void>;
-  // Gateway autonomous state write with optimistic concurrency. Returns
-  // updated:true only if the row's state_json equals the serialized form of
-  // options.expectedState at write time. On updated:false the caller re-reads
-  // and decides whether to retry or drop the update.
-  saveState(id: string, newState: unknown, options: { expectedState: unknown }): Promise<{ updated: boolean }>;
+  // Upstream state write with optimistic concurrency, used both by the
+  // gateway's own token-rotation work and by the operator-triggered OAuth
+  // refresh / probe routes. The repo reads, applies `mutate`, and writes under
+  // a CAS, retrying against the winner when it loses; exhausting the retries
+  // throws. See UpstreamsRepoSlim in @floway-dev/provider for why the change
+  // is a function.
+  saveState(id: string, mutate: (current: unknown) => unknown): Promise<void>;
+  // Catalog-cache writes are conditional on the row generation that started
+  // the fetch. A superseded provider can finish serving its own request, but
+  // cannot publish models or errors under newer credentials/configuration.
+  saveModelsCache(id: string, generation: ModelsCacheGeneration, cache: Omit<UpstreamModelsCache, 'lastError'>): Promise<boolean>;
+  saveModelsCacheError(id: string, generation: ModelsCacheGeneration, error: NonNullable<UpstreamModelsCache['lastError']>): Promise<boolean>;
+}
+
+export interface ModelsCacheGeneration {
+  updatedAt: string;
+  config: unknown;
 }
 
 export interface ProxyRecord {
@@ -324,6 +420,9 @@ export interface ProxyBackoffRepo {
 // is the snake_case projection of this record; conversion lives in
 // control-plane/model-aliases/serialize.ts.
 export interface ModelAliasRecord {
+  // Server-issued row handle. Stable across renames, so it is what the
+  // control-plane routes address; `name` is operator-owned public data.
+  id: string;
   name: string;
   kind: ModelKind;
   selection: AliasSelection;
@@ -349,32 +448,31 @@ export interface ModelAliasRecord {
 
 export interface ModelAliasesRepo {
   list(): Promise<ModelAliasRecord[]>;
+  getById(id: string): Promise<ModelAliasRecord | null>;
   getByName(name: string): Promise<ModelAliasRecord | null>;
-  // Throws on primary-key collision. The thrown Error's message contains
-  // `UNIQUE constraint failed: model_aliases.name` — SQLite's own PK
-  // violation string — so the route layer can match on the message and
-  // surface a 409 without knowing which repo backend fired.
+  // Throws on name collision. The thrown Error's message contains
+  // `UNIQUE constraint failed: model_aliases.name` — SQLite's own
+  // constraint-violation string — so the route layer can match on the
+  // message and surface a 409 without knowing which repo backend fired.
   insert(record: ModelAliasRecord): Promise<void>;
-  // Replaces the row keyed by `oldName`. When oldName === record.name the
-  // call is a plain UPDATE; when they differ this is a rename, executed as
-  // INSERT(new) + DELETE(old) inside one transaction so dependent reads
-  // stay consistent. Throws when `oldName` does not exist, or when the
-  // rename target already collides with a different row (same
+  // Overwrites the row keyed by `record.id`, renames included: `name` is a
+  // plain column now, so a rename is one UPDATE. Throws when the id does not
+  // exist, or when the new name collides with a different row (same
   // `UNIQUE constraint failed: model_aliases.name` message as `insert`).
-  update(oldName: string, record: ModelAliasRecord): Promise<void>;
-  delete(name: string): Promise<boolean>;
+  update(record: ModelAliasRecord): Promise<void>;
+  delete(id: string): Promise<boolean>;
   deleteAll(): Promise<void>;
 }
 
-export interface StoredResponsesItem {
+export interface StoredOpenAIResponsesItem {
   id: string;
   apiKeyId: string;
-  payload: StoredResponsesItemPayload;
+  payload: StoredOpenAIResponsesItemPayload;
   itemHash: string;
   refreshedAt: number;
 }
 
-export interface StoredResponsesItemPayload {
+export interface StoredOpenAIResponsesItemPayload {
   item: unknown;
   // Ancillary state stashed alongside the public `item` body but never sent on
   // the wire: a server-only slot to preserve data a stateless client strips
@@ -383,26 +481,26 @@ export interface StoredResponsesItemPayload {
   private?: unknown;
 }
 
-export interface ResponsesItemsRepo {
-  lookupMany(apiKeyId: string, ids: readonly string[], earliestVisibleCutoff: number): Promise<StoredResponsesItem[]>;
-  lookupManyByItemHash(apiKeyId: string, hashes: readonly string[], earliestVisibleCutoff: number): Promise<StoredResponsesItem[]>;
-  insertMany(items: readonly StoredResponsesItem[], earliestVisibleCutoff: number): Promise<void>;
-  refreshMany(items: readonly StoredResponsesItem[], refreshedAt: number, earliestVisibleCutoff: number): Promise<void>;
+export interface OpenAIResponsesItemsRepo {
+  lookupMany(apiKeyId: string, ids: readonly string[], earliestVisibleCutoff: number): Promise<StoredOpenAIResponsesItem[]>;
+  lookupManyByItemHash(apiKeyId: string, hashes: readonly string[], earliestVisibleCutoff: number): Promise<StoredOpenAIResponsesItem[]>;
+  insertMany(items: readonly StoredOpenAIResponsesItem[], earliestVisibleCutoff: number): Promise<void>;
+  refreshMany(items: readonly StoredOpenAIResponsesItem[], refreshedAt: number, earliestVisibleCutoff: number): Promise<void>;
   deleteExpiredBatch(apiKeyId: string, now: number, limit: number): Promise<number>;
   findOldestRefreshedAt(apiKeyId: string): Promise<number | null>;
   deleteAll(): Promise<void>;
 }
 
-export interface StoredResponsesSnapshot {
+export interface StoredOpenAIResponsesSnapshot {
   id: string;
   apiKeyId: string;
   itemIds: string[];
   refreshedAt: number;
 }
 
-export interface ResponsesSnapshotsRepo {
-  lookup(apiKeyId: string, id: string, earliestVisibleCutoff: number): Promise<StoredResponsesSnapshot | null>;
-  insert(snapshot: StoredResponsesSnapshot): Promise<void>;
+export interface OpenAIResponsesSnapshotsRepo {
+  lookup(apiKeyId: string, id: string, earliestVisibleCutoff: number): Promise<StoredOpenAIResponsesSnapshot | null>;
+  insert(snapshot: StoredOpenAIResponsesSnapshot): Promise<void>;
   deleteExpiredBatch(apiKeyId: string, now: number, limit: number): Promise<number>;
   findOldestRefreshedAt(apiKeyId: string): Promise<number | null>;
   deleteAll(): Promise<void>;
@@ -432,6 +530,12 @@ export interface ExpirationSweepsRepo {
   complete(token: string, expectedRevision: number, completion: ExpirationSweepCompletion): Promise<void>;
 }
 
+export interface ScheduledMaintenanceRepo {
+  tryClaim(token: string, now: number, staleClaimedBefore: number): Promise<boolean>;
+  renew(token: string, now: number): Promise<void>;
+  release(token: string): Promise<void>;
+}
+
 // The Agent Setup lease store. Its shape, record, and mutation discriminants
 // are owned by @floway-dev/agent-setup; the SQL and in-memory implementations
 // here satisfy that contract. Re-exported so the repo layer imports one source.
@@ -442,17 +546,17 @@ export interface Repo {
   users: UsersRepo;
   sessions: SessionsRepo;
   usage: UsageRepo;
-  searchUsage: SearchUsageRepo;
+  webSearchUsage: WebSearchUsageRepo;
   performance: PerformanceRepo;
-  modelsCache: ModelsCacheRepo;
-  searchConfig: SearchConfigRepo;
+  webSearchConfig: WebSearchConfigRepo;
   upstreams: UpstreamRepo;
   proxies: ProxyRepo;
   proxyBackoffs: ProxyBackoffRepo;
   modelAliases: ModelAliasesRepo;
-  responsesItems: ResponsesItemsRepo;
-  responsesSnapshots: ResponsesSnapshotsRepo;
+  openaiResponsesItems: OpenAIResponsesItemsRepo;
+  openaiResponsesSnapshots: OpenAIResponsesSnapshotsRepo;
   spilledFiles: SpilledFilesRepo;
   expirationSweeps: ExpirationSweepsRepo;
+  scheduledMaintenance: ScheduledMaintenanceRepo;
   agentSetup: AgentSetupRepository;
 }

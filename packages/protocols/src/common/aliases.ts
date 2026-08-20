@@ -9,15 +9,22 @@
 // Resolution runs above prefix routing and never re-enters itself, which
 // makes recursive aliasing impossible by construction.
 
-import type { ChatModelInfo, ModelKind, PublicModelLimits } from './models.ts';
+import type { ModelKind } from './endpoints.ts';
+import type { ChatModelInfo, PublicModelLimits } from './models.ts';
 
-// Target-picking strategy applied to the pool of currently-routable targets:
+// Walk order over the alias's configured targets. Nothing is filtered out
+// up front: the resolver takes the raw target list in this order, resolves
+// each one against the live catalog, and flattens the results in target
+// order, so a later target's candidates are the failover pool for an
+// earlier one.
 //
-// - `first-available` — pick the first target in declaration order whose
-//   target_model_id resolves to an enabled upstream binding.
-// - `random` — pick uniformly at random from the same pool.
+// - `first-available` — declaration order.
+// - `random` — a uniform shuffle of the whole configured list, so the walk
+//   distributes evenly across targets.
 //
-// When the pool is empty both strategies surface the same 404 to the caller.
+// When the walk produces no candidate at all the caller sees a 404 only if
+// no target id was known to any upstream; an id that is known but of the
+// wrong kind is model-unsupported, a 400.
 export type AliasSelection = 'random' | 'first-available';
 
 // Discrete reasoning-effort presets understood across upstreams. The literal
@@ -27,7 +34,7 @@ export type AliasSelection = 'random' | 'first-available';
 // can pin any string the upstream understands.
 export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'xhigh' | (string & {});
 
-// Reasoning-summary verbosity hint emitted on the Responses / Chat surface.
+// Reasoning-summary verbosity hint emitted on the OpenAI Responses / OpenAI Chat Completions surface.
 // Same open-literal shape as `ReasoningEffort`.
 export type ReasoningSummary = 'auto' | 'concise' | 'detailed' | 'none' | (string & {});
 
@@ -77,9 +84,11 @@ export interface AliasTarget {
 // entirely, so other limit keys disappear from the announced metadata
 // unless the override re-states them. (The dashboard hides this by
 // seeding the buffer from the full computed snapshot at the moment the
-// "Enable override" switch flips on.) `kind` and the supported endpoint
-// set are not part of this payload; they follow from the alias row
-// (`kind`) and the target union (endpoints).
+// "Enable override" switch flips on.) `kind`, the supported endpoint set,
+// and `pricing` are not part of this payload: `kind` follows from the alias
+// row, endpoints from the target union, and `pricing` is announced only when
+// the alias has exactly one available target, because rates across several
+// targets have no meaningful merge.
 export interface AnnouncedMetadata {
   limits?: PublicModelLimits;
   chat?: ChatModelInfo;
@@ -91,7 +100,14 @@ export interface AnnouncedMetadata {
 // targets + rules at listing time". `kind` picks the endpoint family the
 // alias serves; rules are only meaningful when the kind admits them (today
 // that is `chat`).
+//
+// `id` is the row's opaque, server-issued handle — the only thing the
+// control-plane routes address an alias by. `name` is the public model id
+// clients send on the data plane, and an operator renames it freely; it
+// carries whatever characters a model id carries, `/` included, so it is
+// unfit for a URL path segment.
 export interface ModelAlias {
+  id: string;
   name: string;
   kind: ModelKind;
   selection: AliasSelection;
@@ -105,24 +121,23 @@ export interface ModelAlias {
 }
 
 // One badge per configured rule field, in the canonical order. `field`
-// names the specific rule slot the badge describes so consumers (the
-// dashboard's `ModelInfoBar`, alias-of multi-target collapse) can group
-// by field without parsing the human-readable label. `value` is reserved
-// for callers that want to render a separate value pill alongside the
-// label; today every part already self-describes through `label`, so
-// `value` stays undefined.
-export type AliasRuleBadgeField =
-  | 'reasoning.effort'
-  | 'reasoning.budget_tokens'
-  | 'reasoning.adaptive'
-  | 'reasoning.summary'
-  | 'verbosity'
-  | 'serviceTier';
+// names the specific rule slot and `value` preserves its typed coordinate for
+// localized renderers; `label` remains the canonical English inline form.
+export const ALIAS_RULE_BADGE_FIELDS = [
+  'reasoning.effort',
+  'reasoning.budget_tokens',
+  'reasoning.adaptive',
+  'reasoning.summary',
+  'verbosity',
+  'serviceTier',
+] as const;
+
+export type AliasRuleBadgeField = typeof ALIAS_RULE_BADGE_FIELDS[number];
 
 export interface AliasRuleBadge {
   label: string;
   field: AliasRuleBadgeField;
-  value?: string;
+  value: string | number | boolean;
 }
 
 // Inline-prose parts for an alias's rules, in the canonical field order. The
@@ -134,13 +149,13 @@ export interface AliasRuleBadge {
 // whether the dashboard renders badges or a comma-joined caption.
 const aliasRuleParts = (rules: AliasRules): AliasRuleBadge[] => {
   const parts: AliasRuleBadge[] = [];
-  if (rules.reasoning?.effort !== undefined) parts.push({ field: 'reasoning.effort', label: `${rules.reasoning.effort} effort` });
-  if (rules.reasoning?.budget_tokens !== undefined) parts.push({ field: 'reasoning.budget_tokens', label: `${rules.reasoning.budget_tokens}tok budget` });
-  if (rules.reasoning?.adaptive === true) parts.push({ field: 'reasoning.adaptive', label: 'adaptive' });
-  else if (rules.reasoning?.adaptive === false) parts.push({ field: 'reasoning.adaptive', label: 'non-adaptive' });
-  if (rules.reasoning?.summary !== undefined) parts.push({ field: 'reasoning.summary', label: `summary: ${rules.reasoning.summary}` });
-  if (rules.verbosity !== undefined) parts.push({ field: 'verbosity', label: `${rules.verbosity} verbosity` });
-  if (rules.serviceTier !== undefined) parts.push({ field: 'serviceTier', label: `${rules.serviceTier} tier` });
+  if (rules.reasoning?.effort !== undefined) parts.push({ field: 'reasoning.effort', label: `${rules.reasoning.effort} effort`, value: rules.reasoning.effort });
+  if (rules.reasoning?.budget_tokens !== undefined) parts.push({ field: 'reasoning.budget_tokens', label: `${rules.reasoning.budget_tokens}tok budget`, value: rules.reasoning.budget_tokens });
+  if (rules.reasoning?.adaptive === true) parts.push({ field: 'reasoning.adaptive', label: 'adaptive', value: true });
+  else if (rules.reasoning?.adaptive === false) parts.push({ field: 'reasoning.adaptive', label: 'non-adaptive', value: false });
+  if (rules.reasoning?.summary !== undefined) parts.push({ field: 'reasoning.summary', label: `summary: ${rules.reasoning.summary}`, value: rules.reasoning.summary });
+  if (rules.verbosity !== undefined) parts.push({ field: 'verbosity', label: `${rules.verbosity} verbosity`, value: rules.verbosity });
+  if (rules.serviceTier !== undefined) parts.push({ field: 'serviceTier', label: `${rules.serviceTier} tier`, value: rules.serviceTier });
   return parts;
 };
 

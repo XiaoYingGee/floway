@@ -1,52 +1,28 @@
-import type { ChartConfiguration } from 'chart.js/auto';
+import type { ChartProps } from '@fluentui/react-charts';
 
-export type SeriesSelectionAction = 'all' | 'invert' | 'none';
+import type { ChartSeries } from './series-legends';
 
-export const chartSeriesIds = (config: ChartConfiguration<'line'>): string[] =>
-  config.data.datasets.map(dataset => (dataset as unknown as { seriesId: string }).seriesId);
-
-export const applySeriesSelection = (hidden: Set<string>, ids: readonly string[], action: SeriesSelectionAction) => {
-  if (action === 'all') {
-    hidden.clear();
-    return;
-  }
-  const nextHidden = action === 'none' ? ids : ids.filter(id => !hidden.has(id));
-  hidden.clear();
-  for (const id of nextHidden) hidden.add(id);
+// Hiding a series takes it out of the plot and leaves the chart model whole, so
+// the callout still reports every bucket the model aggregated.
+export const visibleSeriesData = (entries: readonly ChartSeries[], data: ChartProps, hidden: ReadonlySet<string>): ChartProps => {
+  const visible = new Set(entries.filter(entry => !hidden.has(entry.id)).map(entry => entry.legend));
+  return { ...data, lineChartData: data.lineChartData?.filter(series => visible.has(series.legend)) };
 };
 
-export const createSeriesIsolation = () => {
-  let exitCandidate: string | null = null;
-  return {
-    toggle(hidden: Set<string>, id: string) {
-      if (exitCandidate !== id) exitCandidate = null;
-      if (hidden.has(id)) hidden.delete(id);
-      else hidden.add(id);
-    },
-    isolateOrSelectAll(hidden: Set<string>, ids: readonly string[], id: string) {
-      const active = ids.filter(seriesId => !hidden.has(seriesId));
-      if ((active.length === 1 && active[0] === id) || exitCandidate === id) {
-        hidden.clear();
-        exitCandidate = null;
-        return;
-      }
-      hidden.clear();
-      for (const seriesId of ids) if (seriesId !== id) hidden.add(seriesId);
-      exitCandidate = id;
-    },
-  };
+export const toggledSeries = (hidden: ReadonlySet<string>, id: string): Set<string> => {
+  const next = new Set(hidden);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  return next;
 };
 
-type SeriesIsolation = ReturnType<typeof createSeriesIsolation>;
+export const invertedSeries = (ids: readonly string[], hidden: ReadonlySet<string>): Set<string> =>
+  new Set(ids.filter(id => !hidden.has(id)));
 
-export const handleLegendClick = (
-  event: { native?: Event | null },
-  isolation: SeriesIsolation,
-  hidden: Set<string>,
-  ids: readonly string[],
-  id: string,
-) => {
-  const native = event.native;
-  if (native instanceof MouseEvent && native.shiftKey) isolation.isolateOrSelectAll(hidden, ids, id);
-  else isolation.toggle(hidden, id);
+// Isolating the only visible series has nowhere left to go, so the same gesture reverses it.
+export const isolatedSeries = (ids: readonly string[], hidden: ReadonlySet<string>, id: string): Set<string> => {
+  const visible = ids.filter(candidate => !hidden.has(candidate));
+  return visible.length === 1 && visible[0] === id
+    ? new Set()
+    : new Set(ids.filter(candidate => candidate !== id));
 };

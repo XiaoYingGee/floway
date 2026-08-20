@@ -108,6 +108,7 @@ function Write-SetupClaudeSettings {
   Set-SetupProp $document.env 'ANTHROPIC_BASE_URL' $SetupEndpoint
   Set-SetupProp $document.env 'ANTHROPIC_AUTH_TOKEN' $SetupApiKey
   Set-SetupOptionalProp $document.env 'ANTHROPIC_MODEL' $SetupClaudeModel
+  Set-SetupOptionalProp $document.env 'ANTHROPIC_DEFAULT_FABLE_MODEL' $SetupClaudeDefaultFableModel
   Set-SetupOptionalProp $document.env 'ANTHROPIC_DEFAULT_OPUS_MODEL' $SetupClaudeDefaultOpusModel
   Set-SetupOptionalProp $document.env 'ANTHROPIC_DEFAULT_SONNET_MODEL' $SetupClaudeDefaultSonnetModel
   Set-SetupOptionalProp $document.env 'ANTHROPIC_DEFAULT_HAIKU_MODEL' $SetupClaudeDefaultHaikuModel
@@ -115,6 +116,10 @@ function Write-SetupClaudeSettings {
   else { Remove-SetupProp $document.env 'CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY' }
   Set-SetupOptionalProp $document 'effortLevel' $SetupClaudeEffortLevel
   Set-SetupOptionalProp $document 'cleanupPeriodDays' $SetupClaudeCleanupPeriodDays
+  if ($SetupClaudeDisableAutoMemory) { Set-SetupProp $document 'autoMemoryEnabled' $false }
+  else { Remove-SetupProp $document 'autoMemoryEnabled' }
+  if ($SetupClaudeDisableAgentView) { Set-SetupProp $document 'disableAgentView' $true }
+  else { Remove-SetupProp $document 'disableAgentView' }
   if ($SetupClaudeOptOutAiAttribution) {
     if ($document.PSObject.Properties.Name -notcontains 'attribution') {
       $document | Add-Member -NotePropertyName attribution -NotePropertyValue ([PSCustomObject]@{})

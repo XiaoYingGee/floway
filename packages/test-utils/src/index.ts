@@ -1,6 +1,5 @@
 export {
   assert,
-  assertAlmostEquals,
   assertEquals,
   assertExists,
   assertFalse,
@@ -8,5 +7,5 @@ export {
   assertStringIncludes,
   assertThrows,
 } from './assert.ts';
-export { jsonResponse, sseResponse, withMockedFetch } from './mock-fetch.ts';
-export { mockPerfTelemetryContext, noopUpstreamCallOptions, stubInternalModel, stubProvider, stubProviderModel, stubModelCandidate, testTelemetryModelIdentity } from './stubs.ts';
+export { jsonResponse, readJsonRequest, sseResponse, testFetcher, withMockedFetch } from './mock-fetch.ts';
+export { mockPerfTelemetryContext, noopAnthropicMessagesUpstreamCallOptions, noopUpstreamCallOptions, stubInternalModel, stubProvider, stubProviderModel, stubModelCandidate, testTelemetryModelIdentity } from './stubs.ts';

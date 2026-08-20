@@ -1,10 +1,10 @@
 export type {
-  ChatCompletionsInvocation,
-  GeminiInvocation,
+  OpenAIChatCompletionsInvocation,
+  GeminiGenerateContentInvocation,
   ChatTargetApi,
-  MessagesInvocation,
+  AnthropicMessagesInvocation,
   ModelCandidate,
-  ResponsesInvocation,
+  OpenAIResponsesInvocation,
 } from './invocation.ts';
 export { providerModelOf } from './invocation.ts';
 
@@ -22,6 +22,7 @@ export type {
 export {
   apiErrorToResponse,
   decodeApiErrorBody,
+  discardUpstreamResponse,
   eventResult,
   internalErrorResult,
   plainResult,
@@ -31,41 +32,42 @@ export {
 export type {
   InternalAliasedFrom,
   InternalModel,
-  PerformanceOperation,
-  PerformanceTelemetryContext,
   ProviderModel,
   ProxyFallbackEntry,
-  TelemetryModelIdentity,
-  UpstreamColor,
-  UpstreamColorPreset,
+  UpstreamModelsCache,
   UpstreamProviderKind,
   UpstreamRecord,
 } from './model.ts';
-export { ALL_PROVIDER_KINDS, assertUpstreamProviderKind, normalizeUpstreamColor, parsePerformanceOperation, PERFORMANCE_OPERATIONS, UPSTREAM_COLOR_HEX_REGEX, UPSTREAM_COLOR_PRESETS } from './model.ts';
+export { ALL_PROVIDER_KINDS, assertUpstreamProviderKind, normalizeUpstreamHue, UPSTREAM_HUE_DEGREES } from './model.ts';
+export type { PerformanceOperation, PerformanceTelemetryContext, TelemetryModelIdentity } from './telemetry.ts';
+export { parsePerformanceOperation, PERFORMANCE_OPERATIONS } from './telemetry.ts';
 
 export type { AddressableForm, ModelPrefixConfig } from './model-prefix.ts';
 export { MODEL_PREFIX_MAX_LENGTH, MODEL_PREFIX_REGEX, normalizeModelPrefix } from './model-prefix.ts';
 
 export type {
   Provider,
+  InboundHeaderMatcher,
   ProviderInstance,
   ProviderCallResult,
   ProviderRerankCallResult,
   ProviderModule,
-  ProviderResponsesResult,
+  AnthropicMessagesUpstreamCallOptions,
+  ProviderOpenAIResponsesResult,
   ProviderStreamResult,
-  ResponsesAction,
+  OpenAIResponsesAction,
   UpstreamCallOptions,
 } from './provider.ts';
-export type { ImagesEditsRequest, ImagesEditsSource } from './images.ts';
-export { serializeOpenAIImagesEditsRequest } from './images.ts';
-export type { AudioTranscriptionFormEntry, AudioTranscriptionRequest } from './audio.ts';
-export { serializeModelPathAudioTranscriptionRequest, serializeOpenAIAudioTranscriptionRequest } from './audio.ts';
+export { headersForAnthropicMessagesCall } from './anthropic-messages.ts';
+export type { OpenAIImagesEditsRequest, OpenAIImagesEditsSource } from './images.ts';
+export { serializeOpenAIImagesEditsJsonPayload, serializeOpenAIImagesEditsRequest } from './images.ts';
+export type { OpenAIAudioTranscriptionFormEntry, OpenAIAudioTranscriptionRequest } from './audio.ts';
+export { serializeModelFieldOpenAIAudioTranscriptionRequest, serializeModelPathOpenAIAudioTranscriptionRequest } from './audio.ts';
 export type { ProviderStreamParser } from './streaming.ts';
 export { streamingProviderCall } from './streaming.ts';
 
 export type { ProviderRepo, UpstreamsRepoSlim } from './repo.ts';
-export { getProviderRepo, initProviderRepo } from './repo.ts';
+export { getProviderRepo, initProviderRepo, UpstreamGoneError } from './repo.ts';
 
 export {
   ProviderModelsUnavailableError,
@@ -73,26 +75,21 @@ export {
   httpResponseToResponse,
 } from './models-fetch.ts';
 
-export type { Flag, FlagDefaults, FlagId, FlagOverrides } from './flags.ts';
+export type { FlagDefaults, FlagId, FlagOverrides } from './flags.ts';
 export {
-  OPTIONAL_FLAGS,
-  isKnownFlagId,
+  OPTIONAL_FLAG_IDS,
   parseFlagOverridesWire,
   resolveEffectiveFlags,
 } from './flags.ts';
 
 export type {
   UpstreamModelConfig,
-  UpstreamModelLimits,
-  Modality,
   UpstreamChatModelConfig,
 } from './model-config.ts';
 export {
   chatField,
   endpointsField,
-  flagOverridesField,
   isRecord,
-  limitsField,
   modelsField,
   nonEmptyStringField,
   optionalStringField,
@@ -103,16 +100,17 @@ export {
 export type { ValidatePathErr, ValidatePathOk } from './join.ts';
 export { joinBaseAndPath, validateUpstreamPath } from './join.ts';
 
-export type { Fetcher, UpstreamFetchOptions } from './options.ts';
-export { directFetcher, dispatchUpstreamFetch, identityWrapUpstreamCall } from './options.ts';
+export type { Fetcher, FetchInit, HttpHeaderLines, ReplayableBody, UpstreamFetchOptions } from './options.ts';
+export { directFetcher, dispatchUpstreamFetch, identityWrapUpstreamCall, isReplayableBody } from './options.ts';
 
 export { isAbortError } from './abort.ts';
 
-export {
-  isBase64ImageDataUrl,
-  memoizedBase64Compressor,
-  memoizedDataUrlCompressor,
-} from './image-helpers.ts';
+export { jsonRequestBody } from './json-request.ts';
+export { sha256Json, sha256JsonHex } from './json-hash.ts';
 
-export { COMPACTION_TRIGGER, compactionResponse } from './compaction.ts';
-export { uuidV7 } from './ids.ts';
+export {
+  base64ToBytes,
+  bytesToBase64,
+  isBase64ImageDataUrl,
+  parseBase64ImageDataUrl,
+} from './image-helpers.ts';

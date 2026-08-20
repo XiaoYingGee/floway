@@ -1,10 +1,11 @@
 // HTTP/1.1 response-head parser + body-framing decoders + the
 // wire-faithful → Web Response bridge.
 
-import { concat, copy, findDoubleCrlfFrom } from './bytes.ts';
+import { copy } from './bytes.ts';
 import { decodeChunked } from './chunked.ts';
 import { HttpProtocolError } from './errors.ts';
-import { decodeAsciiHeaderSection, STATUS_LINE, TCHAR, trimFieldValueOws, validateFieldValueBytes } from './grammar.ts';
+import { STATUS_LINE, TCHAR, trimFieldValueOws, validateFieldValueBytes } from './grammar.ts';
+import { readHeadSection } from './read-head-section.ts';
 import type { RawHttpResponse } from './types.ts';
 
 /**
@@ -84,6 +85,7 @@ interface ResponseHead {
   status: number;
   statusText: string;
   headers: Headers;
+  headerLines: [string, string][];
   rawContentLengths: string[];
   rawTransferEncodings: string[];
   remainder: Uint8Array;
@@ -93,43 +95,22 @@ const readResponseHead = async (
   reader: ReadableStreamDefaultReader<Uint8Array>,
   preBuffered: Uint8Array,
 ): Promise<ResponseHead> => {
-  let buffer = preBuffered;
-
   // Cap accumulation so a misbehaving upstream that streams headers
   // forever can't exhaust the runtime's heap. 64 KiB is two orders of
   // magnitude over any sane response-header block.
   const HEADER_BUFFER_CAP = 64 * 1024;
-  let headerEnd = findDoubleCrlfFrom(buffer, 0);
-  while (headerEnd < 0) {
-    // Resume from the last position where a partial terminator could have
-    // started straddling the seam — three bytes back covers `CR LF CR ?`
-    // landing across the read boundary. Without this resume index the
-    // per-read scan is O(n) on the whole buffer, turning a 1-byte drip
-    // up to HEADER_BUFFER_CAP into O(n²).
-    const scanFrom = Math.max(0, buffer.byteLength - 3);
-    const { value, done } = await reader.read();
-    if (done) {
-      throw new HttpProtocolError(
-        `unexpected EOF before headers; got ${buffer.byteLength} bytes`,
-        'EOF',
-      );
-    }
-    buffer = concat(buffer, value);
-    headerEnd = findDoubleCrlfFrom(buffer, scanFrom);
-    if (headerEnd < 0 && buffer.byteLength > HEADER_BUFFER_CAP) {
-      throw new HttpProtocolError(
-        `HTTP/1.1 response headers exceeded ${HEADER_BUFFER_CAP} bytes without a terminator`,
-        'HEADER_BUFFER_OVERFLOW',
-      );
-    }
-  }
-
-  const headerBytes = buffer.subarray(0, headerEnd);
-  const remainder = copy(buffer.subarray(headerEnd + 4));
-
-  const headerText = decodeAsciiHeaderSection(headerBytes, 'response headers');
-  const lines = headerText.split('\r\n');
-  const statusLine = lines.shift()!;
+  const { statusLine, lines, remainder } = await readHeadSection(reader, preBuffered, {
+    maxBytes: HEADER_BUFFER_CAP,
+    decodeContext: 'response headers',
+    eofError: receivedBytes => new HttpProtocolError(
+      `unexpected EOF before headers; got ${receivedBytes} bytes`,
+      'EOF',
+    ),
+    overflowError: maxBytes => new HttpProtocolError(
+      `HTTP/1.1 response headers exceeded ${maxBytes} bytes without a terminator`,
+      'HEADER_BUFFER_OVERFLOW',
+    ),
+  });
   // RFC 9112 §4: status-line = HTTP-version SP status-code SP reason-phrase.
   // Two distinct issues to call out separately for a useful error message:
   // (1) the line MUST start with HTTP/1.0 or HTTP/1.1 — llhttp dispatches
@@ -165,6 +146,9 @@ const readResponseHead = async (
   const statusText = m[2]!.replace(/[ \t]+$/, '');
 
   const respHeaders = new Headers();
+  // Every field line in wire order. `Headers` merges a repeated name into one
+  // value, so this is the only lossless view of what the upstream sent.
+  const headerLines: [string, string][] = [];
   // Track raw header lines so we can validate framing-related fields off
   // the unmerged values. `Headers.get('content-length')` collapses two
   // separate `Content-Length` headers into `5, 5` and `parseInt` then
@@ -221,16 +205,17 @@ const readResponseHead = async (
     if (lower === 'content-length') rawContentLengths.push(value);
     else if (lower === 'transfer-encoding') rawTransferEncodings.push(value);
     respHeaders.append(name, value);
+    headerLines.push([name, value]);
   }
 
-  return { status, statusText, headers: respHeaders, rawContentLengths, rawTransferEncodings, remainder };
+  return { status, statusText, headers: respHeaders, headerLines, rawContentLengths, rawTransferEncodings, remainder };
 };
 
 const finalizeResponse = (
   reader: ReadableStreamDefaultReader<Uint8Array>,
   head: ResponseHead,
 ): RawHttpResponse => {
-  const { status, statusText, headers, rawContentLengths, rawTransferEncodings, remainder } = head;
+  const { status, statusText, headers, headerLines, rawContentLengths, rawTransferEncodings, remainder } = head;
 
   // RFC 9112 §6.3: a message with both Transfer-Encoding and
   // Content-Length is an error (the sender is broken or actively
@@ -277,9 +262,13 @@ const finalizeResponse = (
   const contentLength = rawContentLengths[0] ?? null;
 
   let body: ReadableStream<Uint8Array>;
+  // The decoded body no longer carries the coding, so the field describing it
+  // leaves both views together.
+  let lines: [string, string][] = headerLines;
   if (teIsChunked) {
     body = decodeChunked(reader, remainder);
     headers.delete('transfer-encoding');
+    lines = headerLines.filter(([name]) => name.toLowerCase() !== 'transfer-encoding');
   } else if (contentLength !== null) {
     const total = parseInt(contentLength, 10);
     if (!Number.isFinite(total) || total < 0 || String(total) !== contentLength) {
@@ -294,7 +283,7 @@ const finalizeResponse = (
     body = untilEofBody(reader, remainder);
   }
 
-  return { status, statusText, headers, body };
+  return { status, statusText, headers, headerLines: lines, body };
 };
 
 // Body framing — Content-Length. Frames the body to exactly `total` bytes:
